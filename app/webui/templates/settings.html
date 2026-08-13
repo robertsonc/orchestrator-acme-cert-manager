@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Settings · Orchestrator ACME Cert Manager</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <div class="wrap headbar">
+      <div>
+        <h1>Orchestrator <span>ACME Cert Manager</span></h1>
+        <div class="meta">EdgeConnect Orchestrator &middot; TLS lifecycle &middot; {{ now }}</div>
+      </div>
+      <nav class="nav">
+        <a href="{{ url_for('index') }}">Dashboard</a>
+        <a href="{{ url_for('settings') }}" class="active">Settings</a>
+        {% if current_user %}
+        <span class="nav-user">{{ current_user }}</span>
+        <a href="{{ url_for('logout') }}">Log out</a>
+        {% endif %}
+      </nav>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <div class="section-head">
+      <h2>Servers</h2>
+      <a class="btn-link" href="{{ url_for('settings_new') }}">+ Add server</a>
+    </div>
+
+    {% if not servers %}
+      <p class="empty">No servers configured yet. <a href="{{ url_for('settings_new') }}">Add one</a> to get started.</p>
+    {% else %}
+    <table>
+      <thead>
+        <tr><th>Name</th><th>Host</th><th>CA</th><th>Key</th><th>Secrets</th><th class="right">Actions</th></tr>
+      </thead>
+      <tbody>
+        {% for s in servers %}
+        <tr>
+          <td>
+            <strong>{{ s.name }}</strong>
+            <div class="muted small mono">{{ s.id }}</div>
+          </td>
+          <td class="small">{{ s.orchestrator_host }}</td>
+          <td>
+            {% if s.acme_ca == 'letsencrypt' %}
+              <span class="pill ok">production</span>
+            {% else %}
+              <span class="pill warn">staging</span>
+            {% endif %}
+          </td>
+          <td class="small mono">{{ s.key_type }}</td>
+          <td>
+            {% if s.dns_api_token and s.api_key %}
+              <span class="pill ok" title="Cloudflare token and API key stored in config">in config</span>
+            {% elif s.dns_api_token or s.api_key %}
+              <span class="pill warn" title="One secret stored, the other from the environment">partial</span>
+            {% else %}
+              <span class="pill none" title="Both secrets read from environment variables">env</span>
+            {% endif %}
+          </td>
+          <td class="right nowrap">
+            <a class="btn-sm" href="{{ url_for('settings_edit', server_id=s.id) }}">Edit</a>
+            <form method="post" action="{{ url_for('settings_delete', server_id=s.id) }}"
+                  class="inline" onsubmit="return confirm('Delete server &quot;{{ s.name }}&quot;? This only removes it from the config; issued certs on disk are left alone.');">
+              <button type="submit" class="btn-sm danger">Delete</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="muted small note-inline">Changes here take effect on the next run &mdash; no rebuild or restart needed.</p>
+    {% endif %}
+  </main>
+
+  <footer class="wrap">
+    <span>orchestrator-acme-cert-manager</span>
+    <span class="muted">Internal lab/training use</span>
+  </footer>
+</body>
+</html>

@@ -1,0 +1,26 @@
+{
+  "servers": [
+    {
+      "id": "orch-lab",
+      "name": "Lab Orchestrator",
+      "orchestrator_host": "orchestrator.example.com",
+      "domain": "orchestrator.example.com",
+      "api_key_env": "ORCH_API_KEY",
+      "verify_ssl": false,
+      "acme": {
+        "ca": "letsencrypt",
+        "email": "you@example.com",
+        "key_type": "rsa2048"
+      },
+      "dns": {
+        "provider": "cloudflare"
+      },
+      "ssh": {
+        "user": "user",
+        "key_path": "/data/ssh/orch_restart",
+        "port": 22,
+        "restart_command": "/usr/sbin/service gms restart"
+      }
+    }
+  ]
+}

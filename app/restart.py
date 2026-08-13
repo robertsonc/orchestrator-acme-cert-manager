@@ -1,0 +1,214 @@
+"""Activate the deployed cert (nginx reload) and verify it's actually served,
+with rollback to the last-known-good certificate on failure.
+(Phase 4/5 — pinned-key SSH, served-cert verification, rollback.)
+
+Key facts learned in the lab:
+  * The httpsCertificate API updates gms's keystore, but nginx terminates TLS on
+    :443 and caches the cert in memory — it must be reloaded to serve the new file.
+  * Because nginx never goes down during a gms restart, "is :443 answering" always
+    passes. Readiness = the serial served on :443 matches the deployed serial.
+  * On activation failure, we re-deploy the last-known-good cert (same validated
+    API path) and reload again, so a bad run leaves the PREVIOUS working cert live.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import ssl
+import time
+from pathlib import Path
+
+import paramiko
+from cryptography import x509
+
+from . import config, deploy
+from .models import ServerConfig, StepResult
+
+log = logging.getLogger("restart")
+
+STEP = "restart"
+_SSH_TIMEOUT = 20
+_CMD_TIMEOUT = 180
+_POLL_TIMEOUT = 300
+_POLL_INTERVAL = 10
+_ROLLBACK_POLL_TIMEOUT = 120
+
+
+def restart(server: ServerConfig) -> StepResult:
+    """Reload so the new cert is served; verify; roll back to last-good on failure."""
+    try:
+        want_serial = _deployed_serial(server)
+    except (FileNotFoundError, ValueError) as exc:
+        return StepResult(STEP, ok=False,
+                          message=f"cannot read deployed cert to verify against: {exc}")
+
+    # Apply: optional gms restart + nginx reload.
+    applied = _apply(server)
+    if not applied.ok:
+        # A failed nginx reload leaves the old cert running (safe), so no rollback needed.
+        return applied
+
+    # Verify the served cert is the one we deployed.
+    ok, waited = _wait_for_served_serial(server, want_serial, _POLL_TIMEOUT)
+    if ok:
+        _promote_known_good(server)   # this cert is now the rollback target
+        return StepResult(STEP, ok=True,
+                          message=f"New certificate live on {server.orchestrator_host} "
+                                  f"after ~{waited}s.",
+                          detail={"serial": format(want_serial, "x"), "wait_seconds": waited})
+
+    # Activation did not verify -> try to restore the last-known-good cert.
+    return _attempt_rollback(server, want_serial)
+
+
+# --------------------------------------------------------------------------- apply / ssh
+
+def _apply(server: ServerConfig) -> StepResult:
+    client, err = _open(server)
+    if err:
+        return err
+    try:
+        if server.restart_command:
+            rc, out, e = _run(client, server.restart_command)
+            if rc != 0:
+                return StepResult(STEP, ok=False, message=f"restart command exited {rc}",
+                                  detail={"stderr": e[:2000], "stdout": out[:2000]})
+        if server.nginx_reload_command:
+            rc, out, e = _run(client, server.nginx_reload_command)
+            if rc != 0:
+                return StepResult(STEP, ok=False, message=f"nginx reload exited {rc}",
+                                  detail={"stderr": e[:2000], "stdout": out[:2000]})
+    finally:
+        client.close()
+    return StepResult(STEP, ok=True, message="applied")
+
+
+def _reload_nginx(server: ServerConfig) -> StepResult:
+    if not server.nginx_reload_command:
+        return StepResult(STEP, ok=True, message="no nginx reload configured")
+    client, err = _open(server)
+    if err:
+        return err
+    try:
+        rc, out, e = _run(client, server.nginx_reload_command)
+    finally:
+        client.close()
+    if rc != 0:
+        return StepResult(STEP, ok=False, message=f"nginx reload exited {rc}",
+                          detail={"stderr": e[:2000]})
+    return StepResult(STEP, ok=True, message="reloaded")
+
+
+def _open(server: ServerConfig):
+    """Return (client, None) or (None, StepResult-error)."""
+    known_hosts = getattr(server, "ssh_known_hosts", "") or "/data/ssh/known_hosts"
+    client = paramiko.SSHClient()
+    try:
+        client.load_host_keys(known_hosts)
+    except (FileNotFoundError, OSError) as exc:
+        return None, StepResult(STEP, ok=False,
+                                message=f"known_hosts not found at {known_hosts}: {exc}")
+    client.set_missing_host_key_policy(paramiko.RejectPolicy())
+    try:
+        client.connect(hostname=server.orchestrator_host, port=server.ssh_port,
+                       username=server.ssh_user, key_filename=server.ssh_key_path,
+                       timeout=_SSH_TIMEOUT, allow_agent=False, look_for_keys=False)
+    except paramiko.SSHException as exc:
+        return None, StepResult(STEP, ok=False, message=f"SSH connect/host-key failure: {exc}")
+    except OSError as exc:
+        return None, StepResult(STEP, ok=False, message=f"SSH connection failed: {exc}")
+    return client, None
+
+
+def _run(client: paramiko.SSHClient, cmd: str):
+    log.info("restart: running %r", cmd)
+    stdin, stdout, stderr = client.exec_command(cmd, timeout=_CMD_TIMEOUT)
+    rc = stdout.channel.recv_exit_status()
+    return rc, stdout.read().decode(errors="replace").strip(), stderr.read().decode(errors="replace").strip()
+
+
+# --------------------------------------------------------------------------- rollback
+
+def _rollback_dir(server: ServerConfig) -> Path:
+    return config.cert_dir_for(server) / "rollback"
+
+
+def _rollback_files(server: ServerConfig):
+    d = _rollback_dir(server)
+    return d / f"{server.domain}.cer", d / f"{server.domain}.key", d / "ca.cer"
+
+
+def _promote_known_good(server: ServerConfig) -> None:
+    """Copy the just-verified cert into rollback/ as the new last-known-good."""
+    src = config.cert_dir_for(server)
+    d = _rollback_dir(server)
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copyfile(src / f"{server.domain}.cer", d / f"{server.domain}.cer")
+        shutil.copyfile(src / f"{server.domain}.key", d / f"{server.domain}.key")
+        shutil.copyfile(src / "ca.cer", d / "ca.cer")
+        os.chmod(d / f"{server.domain}.key", 0o600)
+    except OSError as exc:
+        log.warning("could not save known-good cert for %s: %s", server.id, exc)
+
+
+def _attempt_rollback(server: ServerConfig, failed_serial: int) -> StepResult:
+    cert, key, ca = _rollback_files(server)
+    if not (cert.exists() and key.exists() and ca.exists()):
+        return StepResult(STEP, ok=False,
+                          message="activation failed and no previous certificate exists to roll back to",
+                          detail={"rolled_back": False, "reason": "no known-good snapshot",
+                                  "failed_serial": format(failed_serial, "x")})
+
+    log.warning("restart(%s): activation failed — rolling back to last-known-good", server.id)
+    dres = deploy.deploy_paths(server, cert, key, ca)
+    if not dres.ok:
+        return StepResult(STEP, ok=False,
+                          message=f"activation failed; rollback re-deploy failed: {dres.message}",
+                          detail={"rolled_back": False})
+
+    rel = _reload_nginx(server)
+    if not rel.ok:
+        return StepResult(STEP, ok=False,
+                          message=f"activation failed; rollback reload failed: {rel.message}",
+                          detail={"rolled_back": False})
+
+    prev_serial = _deployed_serial_from(cert)
+    ok, _ = _wait_for_served_serial(server, prev_serial, _ROLLBACK_POLL_TIMEOUT)
+    return StepResult(STEP, ok=False,
+                      message=("activation verification failed — rolled back to previous certificate"
+                               if ok else
+                               "activation failed and rollback did not verify"),
+                      detail={"rolled_back": ok,
+                              "restored_serial": format(prev_serial, "x"),
+                              "failed_serial": format(failed_serial, "x")})
+
+
+# --------------------------------------------------------------------------- cert helpers
+
+def _deployed_serial(server: ServerConfig) -> int:
+    return _deployed_serial_from(config.cert_dir_for(server) / f"{server.domain}.cer")
+
+
+def _deployed_serial_from(leaf_path: Path) -> int:
+    return x509.load_pem_x509_certificate(Path(leaf_path).read_bytes()).serial_number
+
+
+def _served_serial(host: str, port: int = 443, timeout: int = 10) -> int:
+    pem = ssl.get_server_certificate((host, port), timeout=timeout)
+    return x509.load_pem_x509_certificate(pem.encode()).serial_number
+
+
+def _wait_for_served_serial(server: ServerConfig, want_serial: int, poll_timeout: int) -> tuple[bool, int]:
+    deadline = time.time() + poll_timeout
+    waited = 0
+    while time.time() < deadline:
+        try:
+            if _served_serial(server.orchestrator_host) == want_serial:
+                return True, waited
+        except (ssl.SSLError, OSError):
+            pass
+        time.sleep(_POLL_INTERVAL)
+        waited += _POLL_INTERVAL
+    return False, waited

@@ -1,0 +1,11 @@
+# Copy to docker-compose.override.yml for local tweaks (git-ignored by default).
+services:
+  orchestrator-acme-cert-manager:
+    environment:
+      # Force issuance/deploy on next start regardless of expiry (testing only).
+      FORCE_RENEW: "false"
+      LOG_LEVEL: "INFO"
+    # If the Orchestrator is only reachable by a private IP that DNS doesn't
+    # resolve, map the FQDN here (parallels the ClearPass extra_hosts fix):
+    # extra_hosts:
+    #   - "orchestrator.example.com:x.x.x.x"

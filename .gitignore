@@ -1,0 +1,26 @@
+# Secrets & runtime data — never commit
+.env
+data/
+config/servers.json
+*.key
+*.pem
+*.pfx
+*.p12
+id_*
+known_hosts
+config/admin.json
+config/session.secret
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+.venv/
+venv/
+.idea/
+
+# Editor / OS
+.DS_Store
+*.swp
+config/servers.json.bak
+.env.bak

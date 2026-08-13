@@ -1,0 +1,4 @@
+# supercronic crontab — renewal checks twice daily (02:00 and 14:00 container-local)
+# renew-all issues/renews when <= 30 days remain, then deploys + restarts.
+0 2  * * * cd /app && python -m app.cli renew-all >> /data/logs/renew.log 2>&1
+0 14 * * * cd /app && python -m app.cli renew-all >> /data/logs/renew.log 2>&1

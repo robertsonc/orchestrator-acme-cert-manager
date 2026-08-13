@@ -1,0 +1,14 @@
+services:
+  orchestrator-acme-cert-manager:
+    build: .
+    image: orchestrator-acme-cert-manager:latest
+    container_name: orchestrator-acme-cert-manager
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8090:8080"   # bind to localhost only; reach via SSH tunnel
+    volumes:
+      - ./config:/config
+      - ./data/certs:/data/certs
+      - ./data/logs:/data/logs
+      - ./data/ssh:/data/ssh:ro

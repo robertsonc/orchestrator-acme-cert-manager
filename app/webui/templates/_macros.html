@@ -1,0 +1,54 @@
+{% macro status(state, label) -%}
+  {%- set glyph = {'ok': '●', 'warning': '▲', 'critical': '✕', 'unknown': '?', 'none': '○', 'working': ''}[state] -%}
+  <span class="status {{ state }}"><span class="g" aria-hidden="true">{{ glyph }}</span>{{ label }}</span>
+{%- endmacro %}
+
+{% macro env_pill(env) -%}
+  {%- if env == 'staging' %}<span class="pill staging">staging</span>
+  {%- elif env == 'production' %}<span class="pill prod">production</span>
+  {%- else %}<span class="pill quiet">—</span>{% endif -%}
+{%- endmacro %}
+
+{% macro serial(s) -%}
+  {%- if s %}<span class="mono" title="{{ s }}">{{ s[:6] }}…{{ s[-6:] }}</span>{% else %}<span class="muted">—</span>{% endif -%}
+{%- endmacro %}
+
+{% macro outcome(h) -%}
+  {%- if h.rolled_back %}<span class="pill bad">rolled back</span>
+  {%- else %}<span class="dot {{ h.outcome }}"></span>{{ h.outcome }}{% endif -%}
+{%- endmacro %}
+
+{% macro diag(d, key) -%}
+<details class="diag" data-key="{{ key }}">
+  <summary>Diagnostics</summary>
+  <dl class="diag-kv">
+    {% if d.phase %}<dt>Phase</dt><dd>{{ d.phase }}{% if d.kind %} · {{ d.kind }}{% endif %}</dd>{% endif %}
+    {% if d.endpoint %}<dt>Endpoint</dt><dd class="mono">{{ d.endpoint }}</dd>{% endif %}
+    {% if d.status is defined and d.status is not none %}<dt>HTTP</dt><dd>{{ d.status }}</dd>{% endif %}
+    {% if d.attempts %}<dt>Attempt</dt><dd>{{ d.attempt }} of {{ d.attempts }}</dd>{% endif %}
+    {% if d.elapsed_ms is defined %}<dt>Elapsed</dt><dd>{{ d.elapsed_ms }} ms</dd>{% endif %}
+    {% if d.request_id %}<dt>Request ID</dt><dd class="mono">{{ d.request_id }}</dd>{% endif %}
+    {% if d.command %}<dt>Command</dt><dd class="mono">{{ d.command }}</dd>{% endif %}
+    {% if d.exit is defined and d.exit is not none %}<dt>Exit</dt><dd>{{ d.exit }}</dd>{% endif %}
+    {% if d.response_excerpt %}<dt>Response</dt><dd class="mono">{{ d.response_excerpt }}</dd>{% endif %}
+    {% if d.stderr %}<dt>stderr</dt><dd class="mono">{{ d.stderr }}</dd>{% endif %}
+    {% if d.problems %}<dt>Problems</dt><dd>{% for p in d.problems %}{{ p }}<br>{% endfor %}</dd>{% endif %}
+    {% if d.restored_serial %}<dt>Restored</dt><dd class="mono">{{ d.restored_serial }}</dd>{% endif %}
+    {% if d.next_action %}<dt>Next</dt><dd>{{ d.next_action }}</dd>{% endif %}
+  </dl>
+</details>
+{%- endmacro %}
+
+{% macro action_buttons(r, origin, size='') -%}
+  <form method="post" action="{{ url_for('renew', server_id=r.id) }}"
+        data-confirm="Force renew contacts the ACME CA and issues a new certificate for {{ r.domain }}. This counts against Let's Encrypt rate limits. Continue?">
+    <input type="hidden" name="return" value="{{ origin }}">
+    <button type="submit" class="btn {{ size }}" {% if r.renewing %}disabled{% endif %}
+            title="Issue from the ACME CA, then deploy and activate.">Force renew</button>
+  </form>
+  <form method="post" action="{{ url_for('force_deploy', server_id=r.id) }}">
+    <input type="hidden" name="return" value="{{ origin }}">
+    <button type="submit" class="btn secondary {{ size }}" {% if r.renewing or not r.cert.present %}disabled{% endif %}
+            title="Re-push the certificate already on disk and activate. No CA contact.">Force deploy</button>
+  </form>
+{%- endmacro %}

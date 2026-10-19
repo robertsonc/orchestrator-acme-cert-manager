@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import time
 from pathlib import Path
 
 from cryptography import x509
@@ -15,6 +16,15 @@ log = logging.getLogger("renew")
 
 def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+def _timed(fn, server: ServerConfig) -> dict:
+    """Run a pipeline step and return its dict with elapsed_s added."""
+    t0 = time.monotonic()
+    res = fn(server)
+    d = res.as_dict()
+    d["elapsed_s"] = round(time.monotonic() - t0, 1)
+    return d
 
 
 def _leaf_meta(leaf: Path) -> tuple[str | None, str | None]:
@@ -39,28 +49,29 @@ def renew_server(server: ServerConfig, force: bool = False) -> RenewalRecord:
     """
     steps = []
     outcome = "success"
+    t_start = time.monotonic()
 
-    r_issue = issue.issue_or_renew(server, force=force)
-    steps.append(r_issue.as_dict())
-    not_after = r_issue.detail.get("expiry")
-    serial = r_issue.detail.get("serial")
+    s_issue = _timed(lambda s: issue.issue_or_renew(s, force=force), server)
+    steps.append(s_issue)
+    not_after = s_issue["detail"].get("expiry")
+    serial = s_issue["detail"].get("serial")
 
-    if not r_issue.ok:
+    if not s_issue["ok"]:
         outcome = "failed"
-    elif not force and not r_issue.detail.get("renewed", True):
+    elif not force and not s_issue["detail"].get("renewed", True):
         outcome = "skipped"
         log.info("renew_server(%s): skipped (cert still valid)", server.id)
 
     if outcome == "success":
-        r_deploy = deploy.deploy(server)
-        steps.append(r_deploy.as_dict())
-        if not r_deploy.ok:
+        s_deploy = _timed(deploy.deploy, server)
+        steps.append(s_deploy)
+        if not s_deploy["ok"]:
             outcome = "failed"
 
     if outcome == "success":
-        r_restart = restart.restart(server)
-        steps.append(r_restart.as_dict())
-        if not r_restart.ok:
+        s_restart = _timed(restart.restart, server)
+        steps.append(s_restart)
+        if not s_restart["ok"]:
             outcome = "failed"
 
     record = RenewalRecord(
@@ -70,6 +81,8 @@ def renew_server(server: ServerConfig, force: bool = False) -> RenewalRecord:
         steps=steps,
         not_after=not_after,
         serial=serial,
+        kind="renew" if force else "scheduled",
+        elapsed_s=round(time.monotonic() - t_start, 1),
     )
     store.add_record(record)
     notify.send(record)
@@ -95,7 +108,7 @@ def redeploy_server(server: ServerConfig) -> RenewalRecord:
             message="no certificate on disk yet -- run Force renew first",
         )
         record = RenewalRecord(server_id=server.id, timestamp=_now(), outcome="failed",
-                               steps=[r.as_dict()], not_after=None, serial=None)
+                               steps=[r.as_dict()], not_after=None, serial=None, kind="redeploy")
         store.add_record(record)
         notify.send(record)
         log.info("redeploy_server(%s): no cert on disk", server.id)
@@ -103,16 +116,17 @@ def redeploy_server(server: ServerConfig) -> RenewalRecord:
 
     steps = []
     outcome = "success"
+    t_start = time.monotonic()
 
-    r_deploy = deploy.deploy(server)
-    steps.append(r_deploy.as_dict())
-    if not r_deploy.ok:
+    s_deploy = _timed(deploy.deploy, server)
+    steps.append(s_deploy)
+    if not s_deploy["ok"]:
         outcome = "failed"
 
     if outcome == "success":
-        r_restart = restart.restart(server)
-        steps.append(r_restart.as_dict())
-        if not r_restart.ok:
+        s_restart = _timed(restart.restart, server)
+        steps.append(s_restart)
+        if not s_restart["ok"]:
             outcome = "failed"
 
     record = RenewalRecord(
@@ -122,6 +136,8 @@ def redeploy_server(server: ServerConfig) -> RenewalRecord:
         steps=steps,
         not_after=not_after,
         serial=serial,
+        kind="redeploy",
+        elapsed_s=round(time.monotonic() - t_start, 1),
     )
     store.add_record(record)
     notify.send(record)

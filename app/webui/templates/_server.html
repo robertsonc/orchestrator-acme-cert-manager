@@ -1,0 +1,147 @@
+{% import "_macros.html" as m %}
+<div data-busy="{{ '1' if busy else '0' }}">
+  {% set c = r.cert %}{% set sv = r.served %}{% set lc = r.lifecycle %}{% set h = r.health %}
+  <div class="crumbs"><a href="{{ url_for('index') }}">Fleet</a> / {{ r.id }}</div>
+  <div class="detail-head">
+    <div>
+      <h1>{{ r.name }}</h1>
+      <div class="sub mono">{{ r.host }}{% if r.domain != r.host %} · cert for {{ r.domain }}{% endif %} · {{ m.env_pill(r.ca_env) }}</div>
+      <div style="margin-top:8px">{{ m.status(h.state, h.label) }}</div>
+      <ul class="reasons">{% for reason in h.reasons %}<li>{{ reason }}</li>{% endfor %}</ul>
+    </div>
+    <div class="actions">
+      {{ m.action_buttons(r, 'server') }}
+      <form method="post" action="{{ url_for('server_test_ssh', server_id=r.id) }}">
+        <button type="submit" class="btn secondary" title="Authenticate over SSH and check sudo authorization. Restarts nothing.">Test SSH</button>
+      </form>
+      <a class="btn secondary" href="{{ url_for('settings_edit', server_id=r.id) }}">Edit</a>
+    </div>
+  </div>
+
+  <div class="state-grid">
+    <div class="state-card">
+      <h3>Issued <span>{{ m.env_pill(c.environment) if c.present else '' }}</span></h3>
+      {% if c.present %}
+        <div class="big">{{ c.serial }}</div>
+        <dl class="kv">
+          <dt>Expires</dt><dd>{{ c.not_after }} {% if c.days_left is not none %}<span class="muted">({% if c.days_left < 0 %}expired{% else %}{{ c.days_left }} days{% endif %})</span>{% endif %}</dd>
+          <dt>Issuer</dt><dd class="mono">{{ c.issuer }}</dd>
+        </dl>
+        {% if c.days_left is not none %}
+          {% set pct = [0, [100, (c.days_left / 90 * 100)|round|int]|min]|max %}
+          <div class="meter {{ 'm-crit' if c.days_left <= 7 else ('m-warn' if c.days_left <= 30 else 'm-good') }}" title="lifetime remaining (90-day certificate)"><span style="width: {{ pct }}%"></span></div>
+        {% endif %}
+      {% else %}
+        <p class="muted">No certificate on disk yet. Run <strong>Force renew</strong>.</p>
+      {% endif %}
+    </div>
+    <div class="state-card">
+      <h3>Served on :443 <span>{{ m.env_pill(sv.environment) if sv.present else '' }}</span></h3>
+      {% if sv.present %}
+        <div class="big">{{ sv.serial }}</div>
+        <dl class="kv">
+          <dt>Expires</dt><dd>{{ sv.not_after }}{% if sv.days_left is not none %} <span class="muted">({{ sv.days_left }} days)</span>{% endif %}</dd>
+          <dt>Issuer</dt><dd class="mono">{{ sv.issuer }}</dd>
+        </dl>
+      {% else %}
+        <p class="muted">Could not read the served certificate{% if sv.error %}: <span class="mono">{{ sv.error }}</span>{% endif %}</p>
+      {% endif %}
+    </div>
+    <div class="state-card">
+      <h3>Activation</h3>
+      <div style="margin:8px 0 6px">
+        {% if lc.state == 'live' %}{{ m.status('ok', 'live — served serial matches issued') }}
+        {% elif lc.state == 'pending' %}{{ m.status('warning', 'pending — served serial differs') }}
+        {% elif lc.state == 'unknown' %}{{ m.status('unknown', 'unknown — :443 not readable') }}
+        {% else %}{{ m.status('none', 'nothing to activate') }}{% endif %}
+      </div>
+      <p class="small" style="color:var(--ink-2);margin:0">{{ lc.message }}</p>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-head"><h2>Last run</h2>
+      {% if r.renewing %}{{ m.status('working', 'working') }}
+      {% elif r.last %}<span class="small muted">{{ r.last.kind }} · {{ r.last.ago }}{% if r.last.elapsed_s %} · {{ r.last.elapsed_s }}s total{% endif %} · <span title="{{ r.last.timestamp }}">{{ r.last.timestamp[:19]|replace('T',' ') }}</span></span>{% endif %}
+    </div>
+    {% if r.renewing and not r.last %}
+      <div class="pipeline">{% for name in ['issue','deploy','restart'] %}<div class="step s-run"><div class="step-head"><span class="step-name">{{ name }}</span>{{ m.status('working', '') }}</div></div>{% endfor %}</div>
+    {% elif r.last %}
+      {% set steps = r.last.steps %}
+      {% set names = ['issue','deploy','restart'] if r.last.kind != 'redeploy' else ['deploy','restart'] %}
+      <div class="pipeline" style="grid-template-columns: repeat({{ names|length }}, 1fr)">
+        {% for name in names %}
+          {% set st = (steps|selectattr('step','equalto',name)|list|first) %}
+          {% if st %}
+            <div class="step {{ 's-ok' if st.ok else 's-fail' }}">
+              <div class="step-head"><span class="step-name">{{ name }}</span>
+                <span class="step-meta">{% if st.elapsed_s is defined and st.elapsed_s is not none %}{{ st.elapsed_s }}s · {% endif %}{{ m.status('ok','ok') if st.ok else m.status('critical','failed') }}</span></div>
+              <div class="step-msg">{{ st.message }}</div>
+              {% if not st.ok and st.detail %}{{ m.diag(st.detail, 'step-' ~ name) }}{% endif %}
+              {% if st.ok and st.detail and st.detail.rolled_back is defined %}<div class="small muted">rollback: {{ st.detail.rolled_back }}</div>{% endif %}
+            </div>
+          {% else %}
+            <div class="step s-skip"><div class="step-head"><span class="step-name">{{ name }}</span><span class="step-meta">not reached</span></div></div>
+          {% endif %}
+        {% endfor %}
+      </div>
+      {% if r.last.rolled_back %}<div class="alert a-warn" style="margin-top:10px"><strong>Rolled back</strong> Activation did not verify; the previous known-good certificate was re-deployed.</div>{% endif %}
+    {% else %}
+      <div class="panel"><p class="empty">This server has not run yet.</p></div>
+    {% endif %}
+  </div>
+
+  <div class="section cols-2">
+    <div class="panel panel-body">
+      <h2>Activation (SSH)</h2>
+      {% if r.ssh_problems %}
+        <div class="alert a-crit"><strong>Activation will fail</strong><ul>{% for p in r.ssh_problems %}<li>{{ p }}</li>{% endfor %}</ul></div>
+      {% else %}
+        <p class="small"><span class="check good"><span class="g">●</span>settings valid</span> <span class="muted">— press Test SSH to verify authentication and sudo on the appliance.</span></p>
+      {% endif %}
+      <dl class="kv">
+        <dt>Target</dt><dd class="mono">{{ r.ssh_user or '?' }}@{{ r.host }}:{{ r.ssh_port }}</dd>
+        <dt>Key</dt><dd class="mono">{{ r.ssh_key_path or '— not set —' }}</dd>
+        <dt>Known hosts</dt><dd class="mono">{{ r.ssh_known_hosts }}</dd>
+        <dt>Restart</dt><dd class="mono">{{ r.restart_command }}</dd>
+        <dt>Reload</dt><dd class="mono">{{ r.nginx_reload_command }}</dd>
+      </dl>
+    </div>
+    <div class="panel panel-body">
+      <h2>API &amp; issuance</h2>
+      <dl class="kv">
+        <dt>API TLS</dt><dd>{% if r.verify_ssl %}<span class="check good"><span class="g">●</span>verified{% if r.ca_bundle %} · <span class="mono">{{ r.ca_bundle }}</span>{% endif %}</span>
+          {% else %}<span class="check warn"><span class="g">▲</span>unverified</span> <span class="muted">— enable after the production certificate is live</span>{% endif %}</dd>
+        <dt>API key</dt><dd>{{ 'stored in config' if r.secrets.api_inline else 'from env ' ~ r.secrets.api_key_env }}</dd>
+        <dt>DNS token</dt><dd>{{ 'stored in config' if r.secrets.cf_inline else 'from env CF_DNS_API_TOKEN' }}</dd>
+        <dt>CA</dt><dd>{{ r.ca }} {{ m.env_pill(r.ca_env) }}</dd>
+        <dt>Account</dt><dd>{{ r.acme_email }}</dd>
+        <dt>Key type</dt><dd class="mono">{{ r.key_type }}</dd>
+        <dt>Schedule</dt><dd>twice daily; renews when ≤ 30 days remain</dd>
+      </dl>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-head"><h2>History</h2></div>
+    <div class="panel table-wrap">
+      {% if not history %}<p class="empty">No runs yet.</p>{% else %}
+      <table class="grid">
+        <thead><tr><th>When</th><th>Kind</th><th>Outcome</th><th>Steps</th><th>Result</th></tr></thead>
+        <tbody>
+        {% for hrec in history %}
+          <tr>
+            <td class="nowrap"><span title="{{ hrec.timestamp }}">{{ hrec.ago }}</span><div class="secondary">{{ hrec.timestamp[:16]|replace('T',' ') }}</div></td>
+            <td><span class="pill quiet">{{ hrec.kind }}</span></td>
+            <td class="nowrap">{{ m.outcome(hrec) }}{% if hrec.elapsed_s %}<span class="secondary"> · {{ hrec.elapsed_s }}s</span>{% endif %}</td>
+            <td class="mono small nowrap">{% for st in hrec.steps %}<span class="{{ 'check good' if st.ok else 'check bad' }}">{{ st.step }}</span>{% if not loop.last %} → {% endif %}{% endfor %}</td>
+            <td class="msg small">{{ hrec.message or '—' }}
+              {% if hrec.failed_step and hrec.failed_step.detail %}{{ m.diag(hrec.failed_step.detail, 'hist-' ~ loop.index) }}{% endif %}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% endif %}
+    </div>
+  </div>
+</div>

@@ -1,14 +1,28 @@
 services:
   orchestrator-acme-cert-manager:
     build: .
-    image: orchestrator-acme-cert-manager:latest
+    image: orchestrator-acme-cert-manager:1.1.0
     container_name: orchestrator-acme-cert-manager
     restart: unless-stopped
     env_file: .env
+    environment:
+      # The server list, admin credential, session secret and renewal history
+      # all live in /config, which is bind-mounted below so UI changes survive
+      # `docker compose down` / image rebuilds. Preflight refuses to start if
+      # this path is not on a mount (STRICT_STARTUP=false downgrades to a warning).
+      CONFIG_DIR: /config
+      SERVERS_FILE: /config/servers.json
+      DATA_DIR: /data
     ports:
       - "127.0.0.1:8090:8080"   # bind to localhost only; reach via SSH tunnel
     volumes:
-      - ./config:/config
+      - ./config:/config              # writable directory mount (never a single file, never :ro)
       - ./data/certs:/data/certs
       - ./data/logs:/data/logs
-      - ./data/ssh:/data/ssh:ro
+      - ./data/ssh:/data/ssh:ro       # private key + pinned known_hosts, read-only in the container
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=5).status == 200 else 1)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

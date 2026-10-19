@@ -1,14 +1,28 @@
 """Deploy the cert to Orchestrator via the httpsCertificate REST API.
-(Phase 3 — port of the validated deploy_orchestrator.sh.)
 
 deploy(server) uploads the current flattened cert from cert_dir_for(server).
 deploy_paths(...) uploads a specific cert/key/chain — used by the rollback path
 to re-install the last-known-good certificate.
+
+Two API calls, in order, each reported with phase/status/attempt/elapsed:
+
+  validation  POST .../httpsCertificate/validation   idempotent; retried with
+              backoff on transport errors and HTTP 502/503/504 (a GMS backend
+              that is restarting answers 502 through its reverse proxy).
+  install     POST .../httpsCertificate              NOT retried: the appliance
+              may have applied the upload even when the response was lost.
+
+Nothing here ever contacts the ACME CA, so a retry can never spend an issuance.
+Response bodies are kept in the step detail after redaction of key material,
+PEM blocks and data: URIs.
 """
 from __future__ import annotations
 
 import base64
 import logging
+import os
+import re
+import time
 from pathlib import Path
 
 import requests
@@ -22,7 +36,29 @@ log = logging.getLogger("deploy")
 STEP = "deploy"
 _CERT_MEDIA = "application/x-x509-ca-cert"
 _KEY_MEDIA = "application/octet-stream"
-_TIMEOUT = 30
+_TIMEOUT = int(os.environ.get("DEPLOY_HTTP_TIMEOUT", "30"))
+VALIDATION_ATTEMPTS = max(1, int(os.environ.get("DEPLOY_VALIDATION_ATTEMPTS", "3")))
+RETRY_BACKOFF_S = float(os.environ.get("DEPLOY_RETRY_BACKOFF", "5"))
+TRANSIENT_STATUSES = {502, 503, 504}
+_EXCERPT_LEN = 600
+
+_PEM_RE = re.compile(r"-----BEGIN [A-Z ]+-----.*?-----END [A-Z ]+-----", re.S)
+_DATA_URI_RE = re.compile(r"data:[\w/+.-]+;base64,[A-Za-z0-9+/=]+")
+_LONG_B64_RE = re.compile(r"[A-Za-z0-9+/=]{48,}")
+_SECRET_FIELD_RE = re.compile(r'("(?:password|passPhrase|keyData|certificateData|'
+                              r'intermediateCertFileContent|token|apiKey)"\s*:\s*)"[^"]*"', re.I)
+
+
+def redact(text: str, limit: int = _EXCERPT_LEN) -> str:
+    """Strip anything that could be key material or a credential, then truncate."""
+    if not text:
+        return ""
+    t = _PEM_RE.sub("<pem-redacted>", text)
+    t = _DATA_URI_RE.sub("<data-uri-redacted>", t)
+    t = _SECRET_FIELD_RE.sub(r'\1"<redacted>"', t)
+    t = _LONG_B64_RE.sub("<b64-redacted>", t)
+    t = " ".join(t.split())
+    return t[:limit] + ("…" if len(t) > limit else "")
 
 
 def deploy(server: ServerConfig) -> StepResult:
@@ -41,12 +77,13 @@ def deploy_paths(server: ServerConfig, cert_file: Path, key_file: Path, ca_file:
     for f in (cert_file, key_file, ca_file):
         if not Path(f).exists():
             return StepResult(STEP, ok=False,
-                              message=f"missing file for deploy: {Path(f).name}")
+                              message=f"missing file for deploy: {Path(f).name}",
+                              detail={"phase": "prepare", "kind": "local"})
 
     try:
         api_key = config.api_key_for(server)
     except config.ConfigError as exc:
-        return StepResult(STEP, ok=False, message=str(exc))
+        return StepResult(STEP, ok=False, message=str(exc), detail={"phase": "prepare", "kind": "config"})
 
     payload = {
         "certificateData": _data_uri(Path(cert_file).read_bytes(), _CERT_MEDIA),
@@ -55,45 +92,126 @@ def deploy_paths(server: ServerConfig, cert_file: Path, key_file: Path, ca_file:
     }
     headers = {"Content-Type": "application/json", "X-Auth-Token": api_key}
     base_url = server.base_url
+    verify = server.requests_verify
 
-    if not server.verify_ssl:
+    if verify is False:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        log.warning("deploy(%s): verify_ssl is off — the Orchestrator API certificate is not "
+                    "checked. Enable it once the production certificate is live.", server.id)
 
-    r_val = _post(f"{base_url}/validation", payload, headers, server.verify_ssl)
-    if r_val is None:
-        return StepResult(STEP, ok=False, message="validation request failed to connect")
+    r_val = _call(server, "validation", f"{base_url}/validation", payload, headers, verify,
+                  attempts=VALIDATION_ATTEMPTS)
     if not r_val.ok:
-        return StepResult(STEP, ok=False,
-                          message=f"validation rejected (HTTP {r_val.status_code})",
-                          detail={"phase": "validation", "status": r_val.status_code,
-                                  "body": r_val.text[:2000]})
+        return r_val
 
-    r_ins = _post(base_url, payload, headers, server.verify_ssl)
-    if r_ins is None:
-        return StepResult(STEP, ok=False, message="install request failed to connect")
+    r_ins = _call(server, "install", base_url, payload, headers, verify, attempts=1)
     if not r_ins.ok:
-        return StepResult(STEP, ok=False,
-                          message=f"install rejected (HTTP {r_ins.status_code})",
-                          detail={"phase": "install", "status": r_ins.status_code,
-                                  "body": r_ins.text[:2000]})
+        return r_ins
 
-    log.info("deploy(%s): uploaded (validation %s, install %s)",
-             server.id, r_val.status_code, r_ins.status_code)
+    v_status = r_val.detail["status"]
+    i_status = r_ins.detail["status"]
+    log.info("deploy(%s): uploaded (validation %s, install %s)", server.id, v_status, i_status)
     return StepResult(STEP, ok=True,
                       message=(f"Certificate uploaded to {server.orchestrator_host} "
-                               f"(validation {r_val.status_code}, install {r_ins.status_code})."),
-                      detail={"validation_status": r_val.status_code,
-                              "install_status": r_ins.status_code})
+                               f"(validation {v_status}, install {i_status})."),
+                      detail={"validation_status": v_status, "install_status": i_status,
+                              "validation_attempts": r_val.detail["attempts"],
+                              "validation_response": r_val.detail.get("response_excerpt", "")})
+
+
+# --------------------------------------------------------------------------- http
+
+def _call(server: ServerConfig, phase: str, url: str, payload: dict, headers: dict,
+          verify, attempts: int) -> StepResult:
+    """POST once (install) or with bounded retries (validation); classify the outcome."""
+    endpoint = "/httpsCertificate" + ("/validation" if phase == "validation" else "")
+    started = time.monotonic()
+    last: StepResult | None = None
+
+    for attempt in range(1, attempts + 1):
+        t0 = time.monotonic()
+        try:
+            resp = requests.post(url, json=payload, headers=headers, verify=verify, timeout=_TIMEOUT)
+        except requests.RequestException as exc:
+            elapsed = int((time.monotonic() - t0) * 1000)
+            kind = "transport"
+            last = _failure(server, phase, endpoint, kind, None, attempt, attempts, elapsed,
+                            excerpt=redact(str(exc)))
+            retryable = attempts > 1
+        else:
+            elapsed = int((time.monotonic() - t0) * 1000)
+            status = resp.status_code
+            if resp.ok:
+                log.info("deploy(%s): %s HTTP %s in %dms (attempt %d/%d)",
+                         server.id, phase, status, elapsed, attempt, attempts)
+                return StepResult(STEP, ok=True, message=f"{phase} HTTP {status}",
+                                  detail={"phase": phase, "status": status, "attempts": attempt,
+                                          "elapsed_ms": elapsed,
+                                          "response_excerpt": redact(resp.text)})
+            kind = "transient" if status in TRANSIENT_STATUSES else ("rejected" if status < 500 else "http")
+            last = _failure(server, phase, endpoint, kind, status, attempt, attempts, elapsed,
+                            excerpt=redact(resp.text), request_id=resp.headers.get("X-Request-Id"))
+            retryable = kind == "transient" and attempts > 1
+
+        if retryable and attempt < attempts:
+            delay = RETRY_BACKOFF_S * (2 ** (attempt - 1))
+            log.warning("deploy(%s): %s attempt %d/%d failed (%s); retrying in %.0fs",
+                        server.id, phase, attempt, attempts, last.message, delay)
+            time.sleep(delay)
+            continue
+        break
+
+    assert last is not None
+    last.detail["total_elapsed_ms"] = int((time.monotonic() - started) * 1000)
+    log.error("deploy(%s): %s", server.id, last.message)
+    return last
+
+
+def _failure(server: ServerConfig, phase: str, endpoint: str, kind: str, status: int | None,
+             attempt: int, attempts: int, elapsed_ms: int, excerpt: str,
+             request_id: str | None = None) -> StepResult:
+    status_txt = f"HTTP {status}" if status is not None else "no HTTP response"
+    if phase == "validation":
+        if kind == "transient":
+            explain = ("transient gateway error from the Orchestrator reverse proxy — the GMS "
+                       "backend is probably restarting or overloaded")
+            nxt = ("retry with Force deploy (reuses the issued certificate; no CA contact)"
+                   if attempt >= attempts else "retrying after backoff")
+        elif kind == "rejected":
+            explain = "the Orchestrator rejected the certificate/key/chain payload"
+            nxt = "check the response excerpt; verify the key matches the certificate and the chain is complete"
+        elif kind == "transport":
+            explain = "could not reach the Orchestrator API"
+            nxt = "check reachability, DNS, and TLS settings (verify_ssl / ca_bundle)"
+        else:
+            explain = "the Orchestrator API returned a server error"
+            nxt = "inspect the appliance logs; retry with Force deploy"
+        headline = "Certificate validation failed"
+    else:
+        headline = "Certificate install failed"
+        if kind == "transport":
+            explain = ("the install request did not complete — the appliance may or may not have "
+                       "applied it")
+            nxt = "do not re-issue; run Force deploy to re-validate and re-install, then verify the served serial"
+        elif kind == "rejected":
+            explain = "the Orchestrator rejected the install request"
+            nxt = "check the response excerpt and the API key's role"
+        else:
+            explain = "the Orchestrator returned a server error during install"
+            nxt = "run Force deploy once the appliance is healthy; no certificate was activated"
+
+    message = (f"{headline} on {server.id}: {status_txt} ({kind}) on {endpoint}, "
+               f"attempt {attempt} of {attempts} — {explain}. Next: {nxt}.")
+    detail = {
+        "phase": phase, "kind": kind, "endpoint": endpoint, "status": status,
+        "attempt": attempt, "attempts": attempts, "elapsed_ms": elapsed_ms,
+        "response_excerpt": excerpt, "next_action": nxt,
+        "server_id": server.id, "host": server.orchestrator_host,
+    }
+    if request_id:
+        detail["request_id"] = request_id
+    return StepResult(STEP, ok=False, message=message, detail=detail)
 
 
 def _data_uri(raw: bytes, media_type: str) -> str:
     return f"data:{media_type};base64,{base64.b64encode(raw).decode('ascii')}"
-
-
-def _post(url: str, payload: dict, headers: dict, verify_ssl: bool):
-    try:
-        return requests.post(url, json=payload, headers=headers,
-                             verify=verify_ssl, timeout=_TIMEOUT)
-    except requests.RequestException as exc:
-        log.error("deploy POST %s failed: %s", url, exc)
-        return None

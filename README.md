@@ -6,7 +6,7 @@ This tool issues, deploys, activates, and renews a publicly trusted HTTPS certif
 
 It is the Orchestrator counterpart to the [ClearPass ACME Certificate Manager](https://github.com/sinemad/cppm-acme-cert-manager); the two tools share a design and can run side by side on the same host.
 
-> **Scope / status:** built and validated in a lab against production Let's Encrypt. It is intended for internal/lab use behind a trusted network boundary. Read the [Security Considerations](#security-considerations) before running it anywhere less private.
+> **Scope / status:** built and validated in a lab against Let's Encrypt staging and production. It is intended for internal/lab use behind a trusted network boundary. Read the [Security Considerations](#security-considerations) before running it anywhere less private.
 
 ---
 
@@ -16,13 +16,18 @@ It is the Orchestrator counterpart to the [ClearPass ACME Certificate Manager](h
 - [Prerequisites](#prerequisites)
 - [Directory Structure](#directory-structure)
 - [Initial Setup](#initial-setup)
+- [Configure SSH key authentication](#configure-ssh-key-authentication)
+- [Configuration persistence](#configuration-persistence)
 - [How It Works](#how-it-works)
+- [Staging to production](#staging-to-production)
 - [Configuration Reference](#configuration-reference)
 - [Web UI](#web-ui)
+- [CLI](#cli)
 - [Maintenance](#maintenance)
 - [Troubleshooting](#troubleshooting)
 - [Security Considerations](#security-considerations)
 - [Orchestrator API Reference](#orchestrator-api-reference)
+- [Development](#development)
 - [License](#license)
 
 ---
@@ -34,7 +39,11 @@ It is the Orchestrator counterpart to the [ClearPass ACME Certificate Manager](h
 - **Verified activation**: after reloading the web service, the tool reads the certificate the appliance is *actually serving* and confirms its serial matches what was installed. "Port is up" is not treated as success.
 - **Automatic rollback**: if activation can't be verified, the previous working certificate is re‑deployed and re‑verified, so a bad renewal never takes the appliance offline.
 - **Rate‑limit‑safe re‑deploy**: a **Force deploy** action re‑pushes the certificate already on disk without contacting the CA, so you can recover a deployment without spending a Let's Encrypt issuance.
-- **Web dashboard**: certificate status, expiry, days‑left, and renewal history at a glance; add/edit/delete servers; toggle staging↔production; manage secrets.
+- **Guided host setup**: `setup.sh` installs Docker if needed, generates a dedicated SSH key, pins the Orchestrator host key, installs the public key, checks the `sudo` rule, and verifies the whole SSH path before the container ever starts.
+- **Preflight checks**: the container refuses to start on a configuration that would silently lose changes; SSH settings are validated when saved and before every activation; a **Test SSH** button verifies authentication and `sudo` authorization without restarting anything.
+- **Deployment diagnostics**: every API failure records the phase (validation / install), HTTP status, attempt count, elapsed time and a redacted response excerpt; transient `502/503/504` answers to the validation call are retried with backoff, without ever re‑issuing.
+- **Lifecycle visibility**: the dashboard shows the **issued** certificate (local), the **served** certificate (what clients get on `:443`), whether each is **staging** or **production**, and an **activation** state (live / pending / unknown).
+- **Web dashboard**: certificate status, expiry, days‑left, serials, and renewal history at a glance; add/edit/delete servers; toggle staging↔production; manage secrets.
 - **Per‑server secrets with env fallback**: the Cloudflare token and Orchestrator API key can be stored per server (never echoed back to the browser) or supplied via environment variables.
 - **Authentication**: a first‑run Setup flow and a login gate protect the dashboard and settings.
 - **Failure alerts**: a webhook (email, Slack, etc.) fires when a renewal fails.
@@ -43,11 +52,11 @@ It is the Orchestrator counterpart to the [ClearPass ACME Certificate Manager](h
 
 ## Prerequisites
 
-- **Docker** and **Docker Compose** on a Linux host that can reach the internet and the Orchestrator.
+- A **Linux host** (Ubuntu/Debian or a RHEL‑family distribution) that can reach the internet and the Orchestrator. `setup.sh` installs **Docker Engine + Compose plugin** from Docker's official repository if they are missing.
 - A **domain in Cloudflare** for the appliance's hostname, plus a **Cloudflare API token** scoped to *Edit zone DNS* for that zone.
 - An **EdgeConnect Orchestrator** with:
   - a **Read‑Write API key** (Orchestrator → *Users & Authentication → API Keys*), and
-  - **SSH access** for the activation restart, using key authentication (the restart user needs passwordless `sudo` scoped to the service restart and the `nginx` reload).
+  - an account you can **SSH into with a public key**, with passwordless `sudo` scoped to the service restart and the `nginx` reload (see [Configure SSH key authentication](#configure-ssh-key-authentication)).
 - A **DNS A record** for the appliance hostname pointing at the Orchestrator (DNS‑only, not proxied).
 - Recommended: run the container on a host that reaches the Orchestrator over its management address, and reach the web UI over an **SSH tunnel** (the UI binds to localhost by default).
 
@@ -58,34 +67,44 @@ It is the Orchestrator counterpart to the [ClearPass ACME Certificate Manager](h
 ```
 orchestrator-acme-cert-manager/
 ├── app/
-│   ├── cli.py                 # CLI entry (renew-all) run by the scheduler
-│   ├── config.py              # load/save servers.json; secret resolution (inline → env)
+│   ├── cli.py                 # CLI: list / check / ssh-test / issue / deploy / restart / renew / redeploy
+│   ├── config.py              # load/save servers.json; path resolution; secret resolution (inline → env)
+│   ├── preflight.py           # startup checks: config persistence, legacy files, SSH settings, credentials
+│   ├── sshcheck.py            # SSH settings validation, pinned-host-key client, sudo authorization probe
 │   ├── issue.py               # stage 1 — Lego ACME issuance (DNS-01 / Cloudflare)
-│   ├── deploy.py              # stage 2 — upload via Orchestrator httpsCertificate API
+│   ├── deploy.py              # stage 2 — upload via Orchestrator httpsCertificate API (retries, diagnostics)
 │   ├── restart.py             # stage 3 — SSH restart + served-cert verify + rollback
 │   ├── renew.py               # orchestrates the three stages; records history; alerts
 │   ├── store.py               # renewal history persistence (history.json)
 │   ├── notify.py              # webhook failure alerts
 │   ├── models.py              # ServerConfig, StepResult, RenewalRecord
-│   ├── entrypoint.sh          # starts supercronic + the web server
+│   ├── entrypoint.sh          # runs preflight, then supercronic + the web server
 │   └── webui/
-│       ├── server.py          # Flask app: dashboard, API, settings CRUD, auth
+│       ├── server.py          # Flask app: dashboard, lifecycle state, settings CRUD, Test SSH, auth
 │       ├── auth.py            # PBKDF2 login + HMAC-signed sessions
 │       ├── templates/         # index, settings, server_form, login, setup
 │       └── static/style.css
-├── config/
+├── config/                    # PERSISTENT, bind-mounted at /config (gitignored contents)
 │   ├── crontab                # supercronic schedule (02:00 / 14:00)
-│   └── servers.example.json   # copy → servers.json (or manage via the web UI)
-├── data/                      # runtime state (gitignored): certs, logs, ssh, history.json
+│   ├── servers.example.json   # template for servers.json
+│   ├── servers.json           # the live server list (created by setup.sh or the web UI)
+│   ├── history.json           # renewal history
+│   ├── admin.json             # web UI admin credential
+│   └── session.secret         # cookie signing key
+├── data/                      # runtime state (gitignored)
+│   ├── certs/<domain>/        # issued certs, Lego account, rollback snapshot
+│   ├── logs/
+│   └── ssh/                   # orch_restart (private key), orch_restart.pub, known_hosts
+├── tests/                     # pytest suite
 ├── Dockerfile
 ├── docker-compose.yml
 ├── docker-compose.override.yml.example
-├── .env.example               # copy → .env
-├── requirements.txt
-└── setup.sh
+├── .env.example               # copy → .env (setup.sh does this)
+├── requirements.txt / requirements-dev.txt
+└── setup.sh                   # host preparation (Docker, key, host key, sudo check)
 ```
 
-`config/` and `data/` are **bind‑mounted** into the container so state survives rebuilds. `config/` must be mounted as a **directory** (not a single file) and must be **writable**; the web UI writes `servers.json` there. See [Troubleshooting](#the-web-ui-returns-500-on-save-readonly-file-system).
+`config/` and `data/` are **bind‑mounted** into the container so state survives rebuilds. `config/` must be mounted as a **directory** (not a single file) and must be **writable**; the web UI writes `servers.json` there. See [Configuration persistence](#configuration-persistence).
 
 ---
 
@@ -98,67 +117,221 @@ git clone https://github.com/<you>/orchestrator-acme-cert-manager.git
 cd orchestrator-acme-cert-manager
 ```
 
-### 2. Host preparation
-
-Create the runtime directories and drop in the SSH key used for the activation restart:
+### 2. Run the setup script
 
 ```bash
-mkdir -p data/certs data/logs data/ssh
-cp /path/to/orch_restart_key data/ssh/orch_restart
-chmod 600 data/ssh/orch_restart
+./setup.sh --host orchestrator.example.com --ssh-user admin --email you@example.com
 ```
 
-### 3. Configure environment (optional but recommended)
+The script is idempotent and safe to re‑run. In order it:
 
-```bash
-cp .env.example .env
-```
+| Step | What it does | Touches the Orchestrator? |
+|---|---|---|
+| Docker | Installs Docker Engine + the Compose plugin from Docker's official repository if `docker compose` is missing (Ubuntu/Debian/RHEL‑family), enables the service, adds you to the `docker` group. | No |
+| Directories | Creates `data/{certs,logs,ssh}` and `config/` with restrictive permissions. | No |
+| SSH key | Generates `data/ssh/orch_restart` (RSA‑4096, no passphrase) if absent. | No |
+| `.env` / `servers.json` | Creates both from the examples with your host, user, port and email. The CA starts as **staging**. | No |
+| Host key | Runs `ssh-keyscan`, **shows the fingerprints and asks you to confirm** them against a trusted reference, then pins them in `data/ssh/known_hosts`. | Read only |
+| Public key | If key auth does not work yet, offers to install the public key via `ssh-copy-id` (the appliance prompts for the account password once). | Appends one line to `~/.ssh/authorized_keys` |
+| `sudo` rule | Probes `sudo -n -l` for both activation commands. If not permitted, prints the exact `sudoers` line an administrator must add. With `--install-sudoers` it offers to write that drop‑in itself, after confirmation and `visudo` validation. | Only with `--install-sudoers` |
+| Final test | Key authentication + `sudo -n -l` for both commands. Nothing is restarted. | Read only |
 
-Edit `.env`. At minimum, it should contain:
+Useful flags: `--non-interactive` (no prompts; anything that needs a human is reported and skipped), `--trust-host-key` (pin without the prompt, only after you verified the fingerprint), `--skip-docker`, `--skip-remote` (print the manual steps instead), `--start` (run `docker compose up -d --build` at the end), `--ssh-port`, `--server-id`, `--key-type ed25519`. Run `./setup.sh --help` for the full list. Every option also has an environment variable (`ORCH_HOST`, `ORCH_SSH_USER`, `ACME_EMAIL`, …) for scripted use.
 
-```dotenv
-SERVERS_FILE=/config/servers.json
-# Fallbacks used when a server has no inline secret set in the web UI:
-CF_DNS_API_TOKEN=your-cloudflare-token
-ORCH_API_KEY=your-orchestrator-api-key
-# Optional failure webhook:
-NOTIFY_WEBHOOK_URL=
-```
+If you prefer to do the SSH steps by hand, follow [Configure SSH key authentication](#configure-ssh-key-authentication) and run `./setup.sh --skip-remote`.
 
-> **Notes:** keep values **unquoted**. If you edited `.env` on Windows, strip carriage returns: `sed -i 's/\r$//' .env`. You can leave `CF_DNS_API_TOKEN`/`ORCH_API_KEY` blank and enter them per server in the web UI instead. The inline value wins, the env var is the fallback.
+### 3. Add the secrets
 
-### 4. Configure the server (or do it in the UI after first run)
+Edit `.env` and set `CF_DNS_API_TOKEN` and `ORCH_API_KEY`, **or** leave them blank and enter them per server in the web UI later (the inline value wins; the env var is the fallback). Keep values unquoted; if you edited the file on Windows, strip carriage returns with `sed -i 's/\r$//' .env`.
 
-```bash
-cp config/servers.example.json config/servers.json
-```
-
-Edit `config/servers.json` (see the [Configuration Reference](#configuration-reference)), **or** skip this and add the server from the web UI after the container is up.
-
-### 5. Build and start
+### 4. Build and start
 
 ```bash
 docker compose up -d --build
-docker compose ps        # container should read "Up (a few seconds ago)"
+docker compose logs --tail 50
 ```
 
-### 6. Create the admin account
-
-The web UI binds to `127.0.0.1:8090` by default. Open an SSH tunnel from your workstation:
+The container runs a **preflight** on start and exits with an explanation if the configuration path is not persistently mounted or a legacy `/data/servers.json` would be ignored (see [Configuration persistence](#configuration-persistence)). Confirm the checks and the SSH path from inside the container:
 
 ```bash
-ssh -i /path/to/key -L 8090:localhost:8090 <user>@<docker-host>
+docker compose exec -T orchestrator-acme-cert-manager python -m app.cli check
+docker compose exec -T orchestrator-acme-cert-manager python -m app.cli ssh-test <server-id>
 ```
 
-Then browse to **http://localhost:8090**. On first run you'll be sent to a **Setup** page — create the single administrator account (password ≥ 8 characters). You'll land on the dashboard, signed in.
+Expected from `ssh-test`:
 
-### 7. Add / verify the server and issue the first certificate
+```text
+<server-id> ssh-test: OK — SSH key authentication to admin@orchestrator.example.com succeeded and sudo permits the activation commands without a password.
+  [ok ] sudo /bin/systemctl restart --no-block gms.service
+  [ok ] sudo /bin/systemctl reload nginx
+```
 
-In the web UI, open **Settings**, add or confirm your Orchestrator, and set its **CA to *Let's Encrypt (staging)*** for the first run. On the dashboard, click **Force renew**.
+### 5. Create the admin account
 
-- A **staging** run proves the pipeline end to end without spending production rate limits; the resulting cert chains to an untrusted staging root, so browsers will still warn; that's expected.
-- Once staging is green (issue → deploy → activate), switch the CA to **production** and Force renew again for the real, trusted certificate.
-- Verify from a device **outside** your network (e.g. a phone on cellular): browse to `https://<appliance-host>` and confirm a clean padlock.
+The web UI binds to `127.0.0.1:8090`. Open an SSH tunnel from your workstation:
+
+```bash
+ssh -L 8090:localhost:8090 <user>@<docker-host>
+```
+
+Browse to **http://localhost:8090**. On first run you'll be sent to a **Setup** page — create the single administrator account (password ≥ 8 characters).
+
+### 6. Staging run, then production
+
+On the dashboard click **Force renew** with the CA set to **staging** (the default written by `setup.sh`). Watch the card: the run must reach **Activation: live** with the **Served** serial equal to the **Issued** serial. Then open **Settings → Edit → CA → Let's Encrypt (production)**, save, and **Force renew** again. See [Staging to production](#staging-to-production) for what each state means and how to recover.
+
+---
+
+## Configure SSH key authentication
+
+`setup.sh` automates this section. Read it to understand what the script does, or to do it by hand on an appliance where the script cannot be used.
+
+### Purpose
+
+The certificate manager uses SSH to activate an uploaded TLS certificate on Orchestrator. After uploading the certificate through the REST API, it connects to the appliance and runs:
+
+```bash
+sudo /bin/systemctl restart --no-block gms.service
+sudo /bin/systemctl reload nginx
+```
+
+The restart is non‑blocking so the SSH command returns while GMS restarts. The application then verifies the certificate served on TCP/443. SSH must use **public‑key authentication**; there is no interactive password prompt. The connection uses Paramiko with a **strict host‑key policy**: unknown or changed host keys are rejected.
+
+### Step 1 — Generate a dedicated key
+
+On the Docker host, from the repository directory:
+
+```bash
+mkdir -p data/ssh && chmod 700 data/ssh
+ssh-keygen -t rsa -b 4096 -f data/ssh/orch_restart -C "orchestrator-acme-cert-manager" -N ""
+chmod 600 data/ssh/orch_restart
+chmod 644 data/ssh/orch_restart.pub
+```
+
+RSA‑4096 was used successfully in the tested environment; the tested Orchestrator did not accept an Ed25519 key. Use a dedicated key for this application and protect the private key: it has no passphrase because the unattended service must use it without a prompt.
+
+### Step 2 — Install the public key on Orchestrator
+
+Log in to Orchestrator as the account the tool will use (for example `admin`) and append the contents of `data/ssh/orch_restart.pub` to that account's `~/.ssh/authorized_keys`:
+
+```bash
+umask 077; mkdir -p ~/.ssh
+echo '<contents of data/ssh/orch_restart.pub>' >> ~/.ssh/authorized_keys
+chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys
+```
+
+Only the public key belongs on the appliance. If the appliance restricts shell‑level SSH configuration, use the supported administrative method for that Orchestrator version.
+
+### Step 3 — Configure restricted passwordless `sudo`
+
+The SSH account must run exactly the two activation commands without a password. An administrator adds a scoped rule with `visudo` (for example as `/etc/sudoers.d/orchestrator-acme-cert-manager`, mode `0440`):
+
+```sudoers
+admin ALL=(root) NOPASSWD: /bin/systemctl restart --no-block gms.service, /bin/systemctl reload nginx
+```
+
+Verify the `systemctl` path on the appliance (`command -v systemctl`) and adjust if it differs. Do not grant unrestricted passwordless `sudo`. Check authorization without restarting anything:
+
+```bash
+sudo -n -l /bin/systemctl restart --no-block gms.service
+sudo -n -l /bin/systemctl reload nginx
+```
+
+Each prints the fully qualified command when permitted and exits non‑zero otherwise.
+
+### Step 4 — Pin the Orchestrator host key
+
+```bash
+ssh-keyscan -t rsa,ecdsa,ed25519 orchestrator.example.com > data/ssh/known_hosts
+ssh-keygen -lf data/ssh/known_hosts      # show the fingerprints
+chmod 644 data/ssh/known_hosts
+```
+
+**Security requirement:** `ssh-keyscan` retrieves keys but does not authenticate the server. Compare the fingerprints with a reference obtained from the Orchestrator console or an administrator before trusting them. The entry must match the exact hostname (or address) the tool connects to; for a non‑default port use `ssh-keyscan -p <port>`, which writes the `[host]:port` form the tool expects. Never disable host‑key verification to work around a mismatch.
+
+### Step 5 — Test from the Docker host
+
+```bash
+ssh -i data/ssh/orch_restart -o BatchMode=yes -o IdentitiesOnly=yes \
+    -o UserKnownHostsFile=data/ssh/known_hosts -o StrictHostKeyChecking=yes \
+    admin@orchestrator.example.com 'sudo -n -l /bin/systemctl reload nginx'
+```
+
+Expected output: `/bin/systemctl reload nginx`. This proves key authentication and `sudo` authorization without a password prompt.
+
+### Step 6 — Configure the certificate manager
+
+In `config/servers.json` or the web UI:
+
+```json
+"ssh": {
+  "user": "admin",
+  "key_path": "/data/ssh/orch_restart",
+  "known_hosts": "/data/ssh/known_hosts",
+  "port": 22,
+  "restart_command": "sudo /bin/systemctl restart --no-block gms.service",
+  "nginx_reload_command": "sudo /bin/systemctl reload nginx"
+}
+```
+
+These paths are **inside the container**. `docker-compose.yml` mounts `./data/ssh` read‑only at `/data/ssh`. The web UI validates the key (exists, readable, parseable, no passphrase) and the `known_hosts` entry when you save, and the activation step re‑validates them before connecting.
+
+### Step 7 — Verify from inside the container
+
+```bash
+docker compose exec -T orchestrator-acme-cert-manager python -m app.cli check
+docker compose exec -T orchestrator-acme-cert-manager python -m app.cli ssh-test <server-id>
+```
+
+or press **Test SSH** on the Settings page. Both authenticate and run `sudo -n -l` for each command; neither restarts a service.
+
+### Step 8 — Validate activation
+
+After a deployment, the dashboard compares the **Issued** and **Served** serials. To check by hand:
+
+```bash
+echo | openssl s_client -connect orchestrator.example.com:443 -servername orchestrator.example.com 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates -serial
+```
+
+The serial must match `data/certs/<domain>/<domain>.cer`. A successful API upload alone does not mean the certificate is active.
+
+---
+
+## Configuration persistence
+
+The server list, the admin credential, the cookie‑signing secret and the renewal history all live in **`/config`** inside the container, which `docker-compose.yml` bind‑mounts from `./config`. `SERVERS_FILE=/config/servers.json` is set explicitly in the Compose file and in the image, so a missing `.env` entry can no longer redirect the application to an unmounted path.
+
+On start the preflight:
+
+- logs the active configuration path (also shown on the dashboard's **System** panel and `/api/status`);
+- **refuses to start** if that path is not on a mount (the container would silently lose UI changes), or if a server list exists only at the legacy `/data/servers.json`;
+- **warns** if both `/data/servers.json` and `/config/servers.json` exist and differ (only `/config` is used).
+
+Set `STRICT_STARTUP=false` to downgrade the fatal findings to warnings for one‑off recovery work.
+
+### Migrating from `/data/servers.json`
+
+Releases before 1.1 defaulted to `/data/servers.json` when `SERVERS_FILE` was not set. That path is **not** covered by the documented bind mounts, so the running container may hold a server list (with inline secrets) that exists nowhere on the host. Do **not** recreate the container before you have copied it out.
+
+```bash
+# 1. Copy the active config out of the running container (the container must still exist).
+docker compose exec -T orchestrator-acme-cert-manager sh -c 'cat /data/servers.json' > config/servers.from-container.json
+docker compose exec -T orchestrator-acme-cert-manager sh -c 'cat /data/history.json 2>/dev/null' > config/history.from-container.json
+
+# 2. Compare with whatever is already in config/ — both may contain different secrets or newer settings.
+diff <(python3 -m json.tool config/servers.from-container.json) <(python3 -m json.tool config/servers.json)
+
+# 3. Merge by hand into config/servers.json, then lock it down.
+chmod 600 config/servers.json
+rm config/servers.from-container.json
+
+# 4. Recreate with the new image (the preflight now verifies the path is persistent).
+docker compose down && docker compose up -d --build
+docker compose exec -T orchestrator-acme-cert-manager python -m app.cli check
+```
+
+Acceptance: a server added in the UI appears in `config/servers.json` on the host; settings survive `docker compose down && up`; `python -m app.cli check` reports no `legacy-*` findings.
 
 ---
 
@@ -168,19 +341,23 @@ In the web UI, open **Settings**, add or confirm your Orchestrator, and set its 
 
 Each renewal runs three stages in order and **stops on the first failure**, so a half‑finished renewal never reaches the appliance:
 
-1. **Issue** (`issue.py`) — runs the [Lego](https://go-acme.github.io/lego/) ACME client: `lego run` with a Cloudflare DNS‑01 challenge against Let's Encrypt. The tool injects the resolved Cloudflare token into Lego's environment, requests (or renews) the certificate, and flattens Lego's output into three canonical files: `<domain>.cer` (leaf), `<domain>.key` (private key), and `ca.cer` (issuer chain). `--ari-disable` is passed to avoid a renewal‑info mismatch when a certificate from the *other* environment is present on disk (see [Troubleshooting](#lego-fails-with-an-ari-replaces--404-error)).
-2. **Deploy** (`deploy.py`) — uploads the certificate to the Orchestrator `httpsCertificate` REST API as a base64 data‑URI JSON payload, authenticating with the API key (`X-Auth-Token`): first a validation call, then the install.
-3. **Activate + verify** (`restart.py`) — over SSH, restarts the Orchestrator service and reloads `nginx`, then polls the appliance on `:443` and compares the **served certificate's serial** to the one just deployed. On success the certificate is snapshotted as the new known‑good; on failure the tool re‑deploys the previous known‑good certificate and re‑verifies.
+1. **Issue** (`issue.py`) — runs the [Lego](https://go-acme.github.io/lego/) ACME client: `lego run` with a Cloudflare DNS‑01 challenge against Let's Encrypt. The tool injects the resolved Cloudflare token into Lego's environment, requests (or renews) the certificate, and flattens Lego's output into three canonical files: `<domain>.cer` (leaf), `<domain>.key` (private key), and `ca.cer` (issuer chain). `--ari-disable` is passed to avoid a renewal‑info mismatch when a certificate from the *other* environment is present on disk.
+2. **Deploy** (`deploy.py`) — uploads the certificate to the Orchestrator `httpsCertificate` REST API as a base64 data‑URI JSON payload, authenticating with the API key (`X-Auth-Token`): first a **validation** call, then the **install**.
+   - The validation call is idempotent and is retried up to `DEPLOY_VALIDATION_ATTEMPTS` (default 3) times with exponential backoff (`DEPLOY_RETRY_BACKOFF`, default 5 s) on transport errors and on HTTP **502/503/504**, which the appliance's reverse proxy returns while the GMS backend is restarting.
+   - The install call is **never** retried automatically: the appliance may have applied it even if the response was lost. The recorded message says so and points at **Force deploy**.
+   - A 4xx is a rejection and is not retried. Every failure records phase, kind (`transient` / `rejected` / `http` / `transport`), status, attempt, elapsed time, endpoint, and a redacted response excerpt; the dashboard shows them under **Diagnostics**. Key material, PEM blocks, data URIs and credential‑looking fields are stripped before anything is stored.
+   - Nothing in this stage talks to the ACME CA, so retries never consume an issuance.
+3. **Activate + verify** (`restart.py`) — validates the SSH settings (`sshcheck.validate`), connects with the pinned host key, runs the restart and `nginx` reload, then polls the appliance on `:443` and compares the **served certificate's serial** to the one just deployed. On success the certificate is snapshotted as the new known‑good; on failure the tool re‑deploys the previous known‑good certificate and re‑verifies.
 
-`renew.py` coordinates the stages, writes a record of every run to the history store, and sends a failure alert. It also exposes **`redeploy_server()`** (the *Force deploy* path) which runs **deploy → activate only**, skipping issuance entirely (and therefore never contacting the CA).
+`renew.py` coordinates the stages, writes a record of every run (including the failed step's full diagnostic detail) to the history store, and sends a failure alert. It also exposes **`redeploy_server()`** (the *Force deploy* path) which runs **deploy → activate only**.
 
 ### Scheduled renewal
 
-`supercronic` reads `config/crontab` and triggers a renewal at **02:00 and 14:00**. Each scheduled run only renews a certificate that is within its renewal window (≈30 days of expiry); otherwise it does nothing, so running twice a day is safe and cheap.
+`supercronic` reads `config/crontab` and triggers a renewal at **02:00 and 14:00**. Each scheduled run only renews a certificate that is within its renewal window (≈30 days of expiry); otherwise it does nothing.
 
 ### Authentication
 
-The web UI uses a single admin account. Passwords are hashed with PBKDF2‑SHA256; sessions are HMAC‑signed cookies with an 8‑hour lifetime. The credential (`admin.json`) and signing key (`session.secret`) are written `chmod 600` into the `/config` volume, so logins survive rebuilds. Until an admin exists, every route redirects to the Setup page.
+The web UI uses a single admin account. Passwords are hashed with PBKDF2‑SHA256; sessions are HMAC‑signed cookies with an 8‑hour lifetime. The credential and signing key are written `chmod 600` into `/config`.
 
 ### Certificate files
 
@@ -196,11 +373,32 @@ For each server, under `data/certs/<domain>/`:
 
 ---
 
+## Staging to production
+
+The dashboard tracks three things separately, because they fail separately:
+
+| Field | Meaning |
+|---|---|
+| **Issued** | the certificate stored locally in `data/certs/<domain>/`, with a **staging** / **production** badge derived from its issuer |
+| **Served** | the certificate the appliance presents on TCP/443 right now (read live, cached for 60 s) |
+| **Activation** | `live` when Served = Issued; `pending` when they differ; `unknown` when `:443` could not be read; `none` before the first issuance |
+
+A typical transition: staging run green (`live`, staging badge) → CA switched to production → **Force renew**. If issuance succeeds but deployment or activation fails, the card shows:
+
+```text
+Production certificate issued (serial …). Orchestrator is still serving staging certificate (serial …).
+Deployment or activation is pending — use Force deploy (no CA contact).
+```
+
+and the run is recorded as **failed**, never as a successful renewal. **Force deploy** re‑runs deploy → activate with the production certificate already on disk, so recovering from a transient `502` or an SSH problem costs no production issuance. The **Force renew** button is for a new issuance only.
+
+If the Issued badge says **staging** while the server is configured for production (or vice versa), the card says so; run **Force renew** to issue from the configured CA.
+
+---
+
 ## Configuration Reference
 
 ### `config/servers.json`
-
-A JSON object with a `servers` array. One entry per Orchestrator:
 
 ```json
 {
@@ -211,22 +409,16 @@ A JSON object with a `servers` array. One entry per Orchestrator:
       "orchestrator_host": "orchestrator.example.com",
       "domain": "orchestrator.example.com",
       "verify_ssl": false,
-      "acme": {
-        "ca": "letsencrypt_test",
-        "email": "you@example.com",
-        "key_type": "rsa2048"
-      },
-      "dns": {
-        "provider": "cloudflare",
-        "api_token": ""
-      },
+      "ca_bundle": "",
+      "acme": { "ca": "letsencrypt_test", "email": "you@example.com", "key_type": "rsa2048" },
+      "dns": { "provider": "cloudflare", "api_token": "" },
       "ssh": {
         "user": "admin",
         "key_path": "/data/ssh/orch_restart",
         "known_hosts": "/data/ssh/known_hosts",
         "port": 22,
-        "restart_command": "sudo systemctl restart --no-block gms.service",
-        "nginx_reload_command": "sudo systemctl reload nginx"
+        "restart_command": "sudo /bin/systemctl restart --no-block gms.service",
+        "nginx_reload_command": "sudo /bin/systemctl reload nginx"
       },
       "api_key_env": "ORCH_API_KEY",
       "api_key": ""
@@ -239,43 +431,57 @@ A JSON object with a `servers` array. One entry per Orchestrator:
 |---------------------|-----------------------------------------------------------------------------------------------------------|
 | `id`                | Unique slug (letters, numbers, `-`, `_`). Permanent, can't be renamed.                                    |
 | `name`              | Display name shown in the dashboard.                                                                      |
-| `orchestrator_host` | FQDN the API calls and SSH target.                                                                        |
+| `orchestrator_host` | Hostname used for the API, SSH, and the served‑certificate check. Use the FQDN on the certificate when `verify_ssl` is on. |
 | `domain`            | Hostname the certificate is issued for (defaults to the host).                                            |
-| `verify_ssl`        | Verify the Orchestrator's own TLS cert on API calls. Leave `false` for a self‑signed/pre‑replacement box. |
+| `verify_ssl`        | Verify the Orchestrator's own TLS cert on API calls. Leave `false` only while the appliance still serves its factory self‑signed certificate; enable once production is live. |
+| `ca_bundle`         | Optional PEM bundle (path inside the container) used for API verification when the appliance chains to a private CA. |
 | `acme.ca`           | `letsencrypt` (production) or `letsencrypt_test` (staging). A full ACME directory URL is also accepted.   |
 | `acme.email`        | Account email for Let's Encrypt (required).                                                               |
 | `acme.key_type`     | `rsa2048`, `rsa3072`, or `rsa4096`. Orchestrator serves a single RSA cert.                                |
 | `dns.provider`      | Only `cloudflare` is wired up today.                                                                      |
 | `dns.api_token`     | Inline Cloudflare token. Blank → fall back to `CF_DNS_API_TOKEN`.                                         |
-| `ssh.*`             | SSH user/key/port and the restart + nginx‑reload commands run to activate.                                |
+| `ssh.user`          | Orchestrator account used for activation (required).                                                      |
+| `ssh.key_path`      | Private key path inside the container (required; validated on save and before activation).                |
+| `ssh.known_hosts`   | Pinned host keys (default `/data/ssh/known_hosts`); must contain an entry for the host (and port).         |
+| `ssh.port`          | SSH port (default 22).                                                                                    |
+| `ssh.restart_command`, `ssh.nginx_reload_command` | Commands run to activate. Their `sudo` authorization is what **Test SSH** probes. |
 | `api_key_env`       | Name of the env var holding the Orchestrator API key when `api_key` is blank.                             |
 | `api_key`           | Inline Orchestrator API key. Blank → fall back to the env var above.                                      |
 
 > Secrets (`dns.api_token`, `api_key`) are optional. Set them in the web UI or here; either way the file is written `chmod 600`. **`config/servers.json` is gitignored** and must never be committed.
 
-### Environment (`.env`)
+### Environment (`.env` and Compose)
 
-| Variable             | Purpose                                                                     |
-|----------------------|-----------------------------------------------------------------------------|
-| `SERVERS_FILE`       | Path to the config inside the container. **Set to `/config/servers.json`.** |
-| `CF_DNS_API_TOKEN`   | Cloudflare token fallback (used when a server has no inline token).         |
-| `ORCH_API_KEY`       | Orchestrator API key fallback.                                              |
-| `NOTIFY_WEBHOOK_URL` | Optional Slack‑compatible webhook for failure alerts.                       |
-| `RENEW_WINDOW_DAYS`  | Days‑before‑expiry to renew on the scheduled path (default 30).             |
+| Variable                     | Purpose                                                                                     |
+|------------------------------|---------------------------------------------------------------------------------------------|
+| `SERVERS_FILE`               | Path to the server list inside the container. Compose sets `/config/servers.json`.          |
+| `CONFIG_DIR` / `DATA_DIR`    | Persistent config directory (`/config`) and runtime data root (`/data`).                    |
+| `HISTORY_FILE`               | Renewal history (default `<CONFIG_DIR>/history.json`).                                      |
+| `STRICT_STARTUP`             | `true` (default): fail start on an unmounted config path or legacy‑only config. `false`: warn. |
+| `CF_DNS_API_TOKEN`           | Cloudflare token fallback (used when a server has no inline token).                         |
+| `ORCH_API_KEY`               | Orchestrator API key fallback.                                                              |
+| `NOTIFY_WEBHOOK_URL`, `NOTIFY_ON` | Optional Slack‑compatible webhook for alerts; `failed` (default) or `all`.             |
+| `RENEW_WINDOW_DAYS`          | Days‑before‑expiry to renew on the scheduled path (default 30).                             |
+| `DEPLOY_VALIDATION_ATTEMPTS` | Attempts for the validation call on transient failures (default 3).                         |
+| `DEPLOY_RETRY_BACKOFF`       | Base backoff in seconds between validation attempts, doubled each time (default 5).         |
+| `DEPLOY_HTTP_TIMEOUT`        | Per‑request timeout for the Orchestrator API (default 30).                                  |
+| `LOG_LEVEL`, `TZ`            | Logging verbosity; container timezone (affects cron and logs).                              |
 
 ### Volumes (`docker-compose.yml`)
 
 ```yaml
+    environment:
+      CONFIG_DIR: /config
+      SERVERS_FILE: /config/servers.json
+      DATA_DIR: /data
     ports:
       - "127.0.0.1:8090:8080"   # localhost only; reach via SSH tunnel
     volumes:
-      - ./config:/config        # writable directory mount — holds servers.json, admin.json, session.secret
+      - ./config:/config        # writable directory mount — servers.json, history.json, admin.json, session.secret
       - ./data/certs:/data/certs
       - ./data/logs:/data/logs
-      - ./data/ssh:/data/ssh:ro
+      - ./data/ssh:/data/ssh:ro # private key + known_hosts, read-only in the container
 ```
-
-> `config/` **must** be a directory mount, not a single‑file mount, and must not be read‑only. See the [500 on save](#the-web-ui-returns-500-on-save-readonly-file-system) troubleshooting entry.
 
 ---
 
@@ -283,15 +489,28 @@ A JSON object with a `servers` array. One entry per Orchestrator:
 
 Reached at `http://localhost:8090` over the SSH tunnel.
 
-### Pages
-
-- **Dashboard** (`/`) — a card per server showing CA, expiry, days‑left, serial, and last‑run outcome, plus a renewal‑history table. Two actions per server: **Force renew** (full pipeline) and **Force deploy** (re‑push the on‑disk cert, no CA call).
-- **Settings** (`/settings`) — list, **add**, **edit**, and **delete** servers. The edit form includes the **CA staging↔production** dropdown and the two secret fields (Cloudflare token, API key). Stored secrets are never displayed back; leave a secret field blank to keep the existing value, or type a new one to replace it.
+- **Dashboard** (`/`) — a card per server showing CA, expiry, **Issued** and **Served** serials with staging/production badges, **Activation** state, last‑run outcome, a **Diagnostics** disclosure for failed runs (phase, status, attempt, elapsed, redacted response, next action), SSH configuration problems, and a note when API TLS verification is off. Two actions per server: **Force renew** (full pipeline, contacts the CA) and **Force deploy** (deploy → activate from the on‑disk cert, no CA contact). A **System** panel shows the active configuration path and whether it is bind‑mounted, plus any preflight warnings.
+- **Settings** (`/settings`) — list, **add**, **edit**, and **delete** servers; a **Test SSH** button per server that authenticates and probes `sudo -n -l` for both activation commands without restarting anything. The edit form includes the CA dropdown, TLS verification + CA bundle, the secret fields (never echoed back), and the SSH settings, which are **validated on save** (empty user/key path, missing/unreadable/unparseable/passphrase‑protected key, missing `known_hosts` entry).
 - **Setup / Login** — first‑run admin creation, then a login gate on everything else.
+- `/api/servers`, `/api/history`, `/api/status` — JSON views of the above (behind the login); `/healthz` is open.
 
-### Live configuration
+Configuration is read on every request, so UI changes take effect on the next run with no restart.
 
-Because `config.py` reads `servers.json` on every request, **changes made in the UI take effect on the next run. No rebuild or restart.** (Deploying new *code* still requires an image rebuild.)
+---
+
+## CLI
+
+All commands run inside the container: `docker compose exec -T orchestrator-acme-cert-manager python -m app.cli <command>`.
+
+| Command | Purpose |
+|---|---|
+| `list` | Configured servers, their CA and last outcome, plus the active configuration path. |
+| `check [--json] [--lenient]` | Preflight: configuration path and persistence, legacy‑file detection, per‑server SSH validation, credential presence. Exit 1 on fatal findings. |
+| `ssh-test <id>` | Connect with the pinned host key and probe `sudo -n -l` for both activation commands. Restarts nothing. |
+| `issue <id>` / `deploy <id>` / `restart <id>` | Run a single stage. |
+| `renew <id> [--force]` | Full pipeline for one server (contacts the CA). |
+| `redeploy <id>` | Deploy → activate from the certificate already on disk (no CA contact). |
+| `renew-all [--force]` | What the scheduler runs. |
 
 ---
 
@@ -300,24 +519,23 @@ Because `config.py` reads `servers.json` on every request, **changes made in the
 ### View logs
 
 ```bash
-# Web dashboard (easiest) — renewal history is on the main page
-# Scheduled-run log:
-tail -n 100 data/logs/renew.log
-# Container output (includes web + scheduler):
-docker compose logs -f --tail 100
+tail -n 100 data/logs/renew.log           # scheduled runs
+docker compose logs -f --tail 100         # web + scheduler + preflight
 ```
 
 ### Force a renewal or re‑deploy
 
-Use the dashboard buttons: **Force renew** (contacts the CA) or **Force deploy** (re‑pushes the existing cert, rate‑limit‑immune). Force deploy is the right choice after an appliance rebuild or to recover a deployment without spending an issuance.
+Use the dashboard buttons or the CLI. **Force deploy** / `redeploy` is the right choice after an appliance rebuild, a transient `502` during validation, or an SSH fix: it never spends an issuance.
 
 ### Switch staging ↔ production
 
-**Settings → edit the server → CA dropdown → Save.** No rebuild needed. Remember staging certs are browser‑untrusted; production is the resting state.
+**Settings → edit the server → CA dropdown → Save**, then **Force renew**. See [Staging to production](#staging-to-production).
+
+### Enable API TLS verification after bootstrap
+
+Once the dashboard shows **Activation: live** with a production certificate, edit the server, make sure `orchestrator_host` is a name on that certificate, tick **Verify the Orchestrator's TLS cert**, save, and press **Force deploy** to confirm the API still answers. For a private CA, set the **CA bundle** path (mount it under `./data/ssh` or another mounted directory). SSH host‑key verification is independent of this setting and is always strict.
 
 ### Reset the admin account
-
-If the password is lost, remove the credential and reload. The tool drops back into Setup:
 
 ```bash
 rm config/admin.json
@@ -325,95 +543,84 @@ rm config/admin.json
 
 ### Rebuild the image (state preserved)
 
-Application code is baked into the image, so **code changes require a rebuild**:
-
 ```bash
 docker compose up -d --build
-# or, if a change isn't picked up:
-docker compose down && docker compose build --no-cache && docker compose up -d
 ```
 
-Certificates, history, and config live in the mounted volumes and are preserved across rebuilds. A volume or `.env`/compose change requires `docker compose down && up -d` (not just `--build`).
+Certificates, history, and config live in the mounted volumes. A volume, `.env` or Compose change requires `docker compose down && docker compose up -d`.
 
 ---
 
 ## Troubleshooting
 
-Failures are recorded in the dashboard history with the underlying error message. For anything not obvious there, `docker compose logs -f` shows the full output.
+Failures are recorded in the dashboard history with the underlying message and a **details** disclosure. `docker compose logs -f` shows the full output.
+
+### Activation fails: `SSH configuration invalid … ssh.key_path is empty`
+
+The server entry has no private key path (or it points at a missing/unreadable/encrypted file, or `known_hosts` has no entry for the host). The message lists every problem. Fix them in **Settings → Edit** (the form refuses to save an invalid SSH block) and confirm with **Test SSH** or `python -m app.cli ssh-test <id>`. If you corrected the file by hand, make sure you edited the **active** path shown on the dashboard's System panel.
+
+### `Certificate validation failed … HTTP 502 (transient)`
+
+The Orchestrator reverse proxy answered before the GMS backend was ready (typically right after a restart). The validation call is retried automatically (3 attempts with backoff). If all attempts fail, the run stops **before** install and is recorded as failed; nothing was changed on the appliance. Wait for the appliance to settle and press **Force deploy**. The same certificate is reused; no issuance is spent.
+
+### `Certificate validation failed … HTTP 400 (rejected)`
+
+The appliance rejected the payload. Check the response excerpt under Diagnostics; typical causes are a key that does not match the certificate or an incomplete chain. This is not retried.
+
+### Container exits at start with `preflight FAILED`
+
+Read the `[FATAL]` lines:
+
+- `config-not-mounted` — `SERVERS_FILE` points somewhere that is not a bind mount or volume. Use the shipped `docker-compose.yml` (mounts `./config:/config`) and do not override `SERVERS_FILE` in `.env` with another path.
+- `legacy-config-only` — a server list exists at `/data/servers.json` but not at `/config/servers.json`. Follow [Migrating from `/data/servers.json`](#migrating-from-dataserversjson).
+
+`STRICT_STARTUP=false` turns both into warnings if you need the container up to extract files.
+
+### SSH: `host key … does not match the pinned entry`
+
+The appliance's host key changed (rebuild, reinstall) or `known_hosts` has the wrong entry. Obtain the new fingerprint from a trusted source, remove the stale line from `data/ssh/known_hosts`, and re‑run `./setup.sh` (it re‑scans and asks you to confirm). Do not disable host‑key checking.
+
+### SSH: `authentication failed … not in that account's authorized_keys`
+
+The public key is not installed for that user, or the account disallows public‑key login. Re‑run `./setup.sh` (it offers `ssh-copy-id`) or follow [Step 2](#step-2--install-the-public-key-on-orchestrator). The tested Orchestrator required an RSA key.
+
+### `Test SSH`: authentication OK but `sudo` fails for a command
+
+`sudoers` does not permit that exact command string for that user, or requires a password. Add the scoped `NOPASSWD` rule from [Step 3](#step-3--configure-restricted-passwordless-sudo). The command in `sudoers` must match the configured command character for character (including `--no-block`).
+
+### Dashboard shows `Activation: pending` after a successful‑looking run
+
+The served serial differs from the issued one: `nginx` still holds the old certificate or the restart has not completed. Press **Force deploy**; the activation stage reloads `nginx` and waits for the served serial to match. If it never matches, check that the reload command succeeds over SSH (Test SSH) and that `orchestrator_host` resolves to the appliance you expect.
+
+### Dashboard shows `Activation: unknown`
+
+The container could not read a certificate from `orchestrator_host:443` (unreachable, firewall, wrong host). Issuance and deployment are unaffected, but verification needs this path to work.
+
+### `lego … failed` with an empty error, ARI `replaces` errors, HTTP 429
+
+Unchanged from earlier releases: Lego writes some errors to stdout (captured); `--ari-disable` is passed so a cert from the other environment on disk does not break issuance; production rate limits are recovered with **Force deploy** or by iterating on **staging**.
 
 ### The web UI returns 500 on save ("Read‑only file system")
 
-`config/servers.json` is mounted read‑only or as a single file. Docker won't let the app write a single‑file bind mount, and a `:ro` flag makes it read‑only. **Mount the directory, writable**, and point the app at it:
+`config/` is mounted read‑only or as a single file. Mount the directory, writable (the shipped Compose file does), and keep `SERVERS_FILE=/config/servers.json`.
 
-```yaml
-    volumes:
-      - ./config:/config        # NOT  ./config/servers.json:/data/servers.json:ro
-```
-```dotenv
-SERVERS_FILE=/config/servers.json
-```
+### `curl http://localhost:8090/api/...` redirects to `/login`
 
-Recreate the container (`docker compose down && up -d`) and confirm it's writable:
-```bash
-docker compose exec <service> sh -lc 'touch /config/.w && echo WRITABLE && rm /config/.w'
-```
-
-### `lego issue failed (exit 1)` with an empty error
-
-Lego writes some errors to **stdout**, not stderr; the tool captures both, so the dashboard message should show the real last line. Common causes:
-
-- **No Cloudflare token in the container**: the fastest failure (dies in well under a second at startup). Set the token per server in the UI, or put `CF_DNS_API_TOKEN` in `.env` and `docker compose up -d --force-recreate`. Verify: `docker compose exec <service> sh -lc 'env | grep CF_DNS_API_TOKEN'`.
-- **Wrong Lego flag layout**: this build is Lego 5.3.1: everything is a `run` flag, there is no `renew` subcommand, and forcing uses `--renew-force`. Check with `lego run --help`.
-- **Rate limit**: see below.
-
-### Lego fails with an ARI `replaces` / 404 error
-
-`Could not validate ARI 'replaces' field … Authority Key Identifier that did not match a known issuer` happens when a certificate issued by the **other** environment (e.g. a staging cert) is on disk and you're now issuing against **production** (or vice versa). The tool passes `--ari-disable` to prevent this. If you still hit it after switching environments, clear the stale cert so the next run is a fresh issue:
-
-```bash
-docker compose exec <service> sh -lc \
-  'cd /data/certs/<domain> && mkdir -p _old && mv <domain>.* ca.cer certificates/_old/ 2>/dev/null; ls'
-```
-
-### Let's Encrypt rate limit (HTTP 429)
-
-Production allows only a limited number of duplicate certificates per week. To recover without re‑issuing, use **Force deploy** (re‑pushes the on‑disk cert, no CA contact). For iterating, use the **staging** CA, which has far higher limits. Then wait out the window before the next production issue.
-
-### Certificate installed but the appliance still serves the old one
-
-`nginx` caches the certificate in memory, so a reload is required to serve a new one, which is why the activate stage reloads `nginx` and then verifies the served serial. If verification keeps failing, confirm the restart user can actually run the reload command over SSH and that the reload succeeds.
-
-### SSH restart hangs the run
-
-Use a **non‑blocking** service restart (`systemctl restart --no-block gms.service`) so the SSH session returns immediately, and ensure the restart user has **passwordless `sudo`** scoped to both the service restart and the `nginx` reload.
-
-### Config changes or code changes "don't take"
-
-- **Config** (servers, CA, secrets) is read live from `servers.json`. No rebuild needed, provided the mount is writable (above).
-- **Code** is copied into the image at build time, you must `docker compose up -d --build` (or `--no-cache`). Confirm the running container has the new code: `docker compose exec <service> grep -c <a-new-string> /app/app/<file>`.
-
-### `curl http://localhost:8090/api/...` now redirects to `/login`
-
-Expected — the API is behind auth. Use the unauthenticated health check, or log in first:
-
-```bash
-curl -s http://localhost:8090/healthz                      # {"status":"ok"}
-curl -c jar -d 'username=admin&password=…' http://localhost:8090/login
-curl -b jar http://localhost:8090/api/servers
-```
-
-### Container exits immediately
-
-Check `docker compose logs`. Usual causes: a malformed `servers.json` (validate with `python3 -c "import json;json.load(open('config/servers.json'))"`), a bad `.env` (CRLF or quoted values), or `SERVERS_FILE` pointing somewhere unmounted.
+Expected — the API is behind auth. Use `/healthz`, or log in first with a cookie jar.
 
 ---
 
 ## Security Considerations
 
 - **Secrets at rest**: With inline secrets, `servers.json` (and its `.bak`) contain a Cloudflare token and Orchestrator API key. They're written `chmod 600`. `config/servers.json`, `.env`, `config/admin.json`, and `config/session.secret` are gitignored; never commit them. Anyone with file access to the host can read them. A secrets vault is the recommended hardening step.
-- **Network exposure**: The UI binds to `127.0.0.1` and is intended to be reached over an SSH tunnel. Do not publish port 8090. Auth is a second layer, not a substitute for keeping the port private.
-- **Least privilege**: Scope the Cloudflare token to *Edit zone DNS* on the single zone. Use an Orchestrator API key with the minimum role that can install a certificate. The SSH restart key should be dedicated and its user's `sudo` scoped to just the restart/reload commands.
-- **Private key handling**: Keys are generated on the automation host and pushed to the appliance. For stricter environments, prefer on‑appliance key generation and per‑renewal key rotation.
+- **SSH private key**: `data/ssh/orch_restart` has no passphrase. The directory is `0700`, the key `0600`, and the container mounts it read‑only. Use a dedicated key and account; revoke the key on the appliance when the tool is decommissioned.
+- **Host‑key pinning**: Paramiko runs with `RejectPolicy`; the only trusted keys are those in `known_hosts`. `setup.sh` shows the scanned fingerprints and requires a confirmation (or an explicit `--trust-host-key`), because `ssh-keyscan` alone cannot authenticate the appliance.
+- **Scoped `sudo`**: the `sudoers` rule grants exactly two commands. `Test SSH` and `ssh-test` only ever run `sudo -n -l`, which checks authorization and runs nothing.
+- **API TLS verification**: `verify_ssl` is off by default because the appliance serves a self‑signed certificate until the first deployment succeeds. The dashboard and the logs say so on every run; enable it once production is live.
+- **Diagnostics redaction**: response excerpts stored in history have PEM blocks, data URIs, long base64 runs and credential‑looking JSON fields removed. API keys are sent only in request headers and are never logged.
+- **Network exposure**: The UI binds to `127.0.0.1` and is intended to be reached over an SSH tunnel. Do not publish port 8090.
+- **Least privilege**: Scope the Cloudflare token to *Edit zone DNS* on the single zone. Use an Orchestrator API key with the minimum role that can install a certificate.
+- **Private key handling**: Certificate keys are generated on the automation host and pushed to the appliance. For stricter environments, prefer on‑appliance key generation and per‑renewal key rotation.
 
 ---
 
@@ -421,12 +628,25 @@ Check `docker compose logs`. Usual causes: a malformed `servers.json` (validate 
 
 The deploy stage uses the Orchestrator `httpsCertificate` REST API, authenticating with `X-Auth-Token: <api-key>`:
 
-| Call                                              | Purpose                                                    |
-|---------------------------------------------------|------------------------------------------------------------|
-| `POST …/gms/rest/gms/httpsCertificate/validation` | Validate the certificate/key/chain payload before install. |
-| `POST …/gms/rest/gms/httpsCertificate`            | Install the validated certificate.                         |
+| Call                                              | Purpose                                                    | Retried? |
+|---------------------------------------------------|------------------------------------------------------------|----------|
+| `POST …/gms/rest/gms/httpsCertificate/validation` | Validate the certificate/key/chain payload before install. | On transport errors and 502/503/504, bounded |
+| `POST …/gms/rest/gms/httpsCertificate`            | Install the validated certificate.                         | Never    |
 
 The payload is a JSON object carrying the leaf certificate, private key, and intermediate chain as base64 `data:` URIs (`certificateData`, `keyData`, `intermediateCertFileContent`). Activation is **not** an API call, it's an SSH service restart plus `nginx` reload, followed by a served‑certificate check on `:443`.
+
+---
+
+## Development
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest -q
+shellcheck -S warning setup.sh
+```
+
+The test suite covers configuration path resolution and legacy detection, every SSH misconfiguration class (empty/missing/unreadable/invalid/passphrase‑protected key, missing `known_hosts` entry, port syntax), the sudo probe, deployment retry/no‑retry behaviour for 502/503/504, 400, transport errors and install, the "Force deploy never contacts the CA" guarantee, lifecycle state derivation, and the web UI's save‑time validation.
 
 ---
 

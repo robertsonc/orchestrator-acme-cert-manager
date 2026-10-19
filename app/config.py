@@ -1,4 +1,17 @@
-"""Load, validate, and persist server configuration in JSON."""
+"""Load, validate, and persist server configuration in JSON.
+
+Path resolution (all overridable through the environment):
+
+    CONFIG_DIR     persistent, writable directory (default /config). Holds
+                   servers.json, admin.json, session.secret and history.json.
+    DATA_DIR       runtime data root (default /data). Holds certs/, logs/, ssh/.
+    SERVERS_FILE   explicit path to the server list (default CONFIG_DIR/servers.json).
+
+Earlier releases defaulted SERVERS_FILE to DATA_DIR/servers.json, which is
+*not* covered by the documented bind mounts, so UI edits were lost when the
+container was recreated. LEGACY_SERVERS_FILE is kept only so preflight can
+detect that situation and tell the operator how to migrate.
+"""
 from __future__ import annotations
 
 import json
@@ -8,9 +21,17 @@ from pathlib import Path
 from .models import ServerConfig
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
-SERVERS_FILE = Path(os.environ.get("SERVERS_FILE", str(DATA_DIR / "servers.json")))
+CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", "/config"))
+SERVERS_FILE = Path(os.environ.get("SERVERS_FILE") or (CONFIG_DIR / "servers.json"))
+LEGACY_SERVERS_FILE = DATA_DIR / "servers.json"
 CERTS_DIR = DATA_DIR / "certs"
 LOGS_DIR = DATA_DIR / "logs"
+SSH_DIR = DATA_DIR / "ssh"
+
+DEFAULT_SSH_KEY = str(SSH_DIR / "orch_restart")
+DEFAULT_KNOWN_HOSTS = str(SSH_DIR / "known_hosts")
+DEFAULT_RESTART_COMMAND = "sudo /bin/systemctl restart --no-block gms.service"
+DEFAULT_NGINX_RELOAD_COMMAND = "sudo /bin/systemctl reload nginx"
 
 CF_TOKEN_ENV = "CF_DNS_API_TOKEN"  # env var Lego reads for the Cloudflare DNS-01 challenge
 
@@ -21,9 +42,9 @@ class ConfigError(Exception):
 
 def _one(s: dict) -> ServerConfig:
     try:
-        acme = s.get("acme", {})
-        dns = s.get("dns", {})
-        ssh = s.get("ssh", {})
+        acme = s.get("acme", {}) or {}
+        dns = s.get("dns", {}) or {}
+        ssh = s.get("ssh", {}) or {}
         return ServerConfig(
             id=s["id"],
             name=s.get("name", s["id"]),
@@ -34,18 +55,21 @@ def _one(s: dict) -> ServerConfig:
             key_type=acme.get("key_type", "rsa2048"),
             dns_provider=dns.get("provider", "cloudflare"),
             dns_api_token=dns.get("api_token", ""),
-            ssh_user=ssh.get("user", ""),
-            ssh_key_path=ssh.get("key_path", ""),
-            ssh_known_hosts=ssh.get("known_hosts", str(DATA_DIR / "ssh" / "known_hosts")),
-            ssh_port=int(ssh.get("port", 22)),
-            restart_command=ssh.get("restart_command", "sudo systemctl restart --no-block gms.service"),
-            nginx_reload_command=ssh.get("nginx_reload_command", "sudo systemctl reload nginx"),
+            ssh_user=(ssh.get("user") or "").strip(),
+            ssh_key_path=(ssh.get("key_path") or "").strip(),
+            ssh_known_hosts=(ssh.get("known_hosts") or DEFAULT_KNOWN_HOSTS).strip(),
+            ssh_port=int(ssh.get("port") or 22),
+            restart_command=ssh.get("restart_command", DEFAULT_RESTART_COMMAND),
+            nginx_reload_command=ssh.get("nginx_reload_command", DEFAULT_NGINX_RELOAD_COMMAND),
             api_key_env=s.get("api_key_env", "ORCH_API_KEY"),
             api_key=s.get("api_key", ""),
             verify_ssl=bool(s.get("verify_ssl", False)),
+            ca_bundle=(s.get("ca_bundle") or "").strip(),
         )
     except KeyError as exc:
         raise ConfigError(f"server entry missing required field: {exc}") from exc
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"server entry {s.get('id', '?')!r} has an invalid value: {exc}") from exc
 
 
 def _to_dict(s: ServerConfig) -> dict:
@@ -58,6 +82,7 @@ def _to_dict(s: ServerConfig) -> dict:
         "api_key_env": s.api_key_env,
         "api_key": s.api_key,
         "verify_ssl": s.verify_ssl,
+        "ca_bundle": s.ca_bundle,
         "acme": {"ca": s.acme_ca, "email": s.acme_email, "key_type": s.key_type},
         "dns": {"provider": s.dns_provider, "api_token": s.dns_api_token},
         "ssh": {
@@ -76,12 +101,24 @@ def server_from_dict(s: dict) -> ServerConfig:
     return _one(s)
 
 
-def load_servers() -> list[ServerConfig]:
-    if not SERVERS_FILE.exists():
-        return []
-    raw = json.loads(SERVERS_FILE.read_text())
+def _parse_servers_file(path: Path) -> list[dict]:
+    try:
+        raw = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"{path} is not valid JSON: {exc}") from exc
+    except OSError as exc:
+        raise ConfigError(f"cannot read {path}: {exc}") from exc
     entries = raw.get("servers", []) if isinstance(raw, dict) else raw
-    return [_one(s) for s in entries]
+    if not isinstance(entries, list):
+        raise ConfigError(f"{path}: expected a 'servers' list")
+    return entries
+
+
+def load_servers(path: Path | None = None) -> list[ServerConfig]:
+    path = path or SERVERS_FILE
+    if not path.exists():
+        return []
+    return [_one(s) for s in _parse_servers_file(path)]
 
 
 def get_server(server_id: str) -> ServerConfig:
@@ -164,3 +201,13 @@ def cert_dir_for(server: ServerConfig) -> Path:
     d = CERTS_DIR / server.domain
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def leaf_path_for(server: ServerConfig) -> Path:
+    """The flattened leaf certificate for this server (may not exist yet)."""
+    return CERTS_DIR / server.domain / f"{server.domain}.cer"
+
+
+def is_staging_ca(acme_ca: str) -> bool:
+    ca = (acme_ca or "").strip().lower()
+    return ca == "letsencrypt_test" or "staging" in ca

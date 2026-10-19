@@ -1,190 +1,129 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{ 'Add' if is_new else 'Edit' }} server · Orchestrator ACME Cert Manager</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-</head>
-<body>
-  <header>
-    <div class="wrap headbar">
-      <div>
-        <h1>Orchestrator <span>ACME Cert Manager</span></h1>
-        <div class="meta">EdgeConnect Orchestrator &middot; TLS lifecycle &middot; {{ now }}</div>
-      </div>
-      <nav class="nav">
-        <a href="{{ url_for('index') }}">Dashboard</a>
-        <a href="{{ url_for('settings') }}" class="active">Settings</a>
-        {% if current_user %}
-        <span class="nav-user">{{ current_user }}</span>
-        <a href="{{ url_for('logout') }}">Log out</a>
-        {% endif %}
-      </nav>
-    </div>
-  </header>
+{% extends "base.html" %}
+{% set nav = 'settings' %}
+{% block title %}{{ 'Add' if is_new else 'Edit' }} server · Orchestrator ACME Cert Manager{% endblock %}
+{% block pageclass %}narrow{% endblock %}
+{% block content %}
+  <div class="crumbs"><a href="{{ url_for('settings') }}">Settings</a> / {{ 'new server' if is_new else form.id }}</div>
+  <div class="section-head" style="margin-top:0"><h1 style="font-size:20px">{{ 'Add server' if is_new else 'Edit ' + form.name }}</h1></div>
 
-  <main class="wrap narrow">
-    <div class="section-head">
-      <h2>{{ 'Add server' if is_new else 'Edit ' + form.name }}</h2>
-      <a class="btn-link ghost" href="{{ url_for('settings') }}">&larr; Back</a>
-    </div>
+  {% if errors %}
+    <div class="errors"><strong>Please fix the following:</strong>
+      <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul></div>
+  {% endif %}
 
-    {% if errors %}
-      <div class="errors">
-        <strong>Please fix the following:</strong>
-        <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
-      </div>
-    {% endif %}
+  <form method="post" action="{{ url_for('settings_save') }}" class="cfg-form" autocomplete="off">
+    {% if not is_new %}<input type="hidden" name="original_id" value="{{ form.id }}">{% endif %}
 
-    <form method="post" action="{{ url_for('settings_save') }}" class="cfg-form" autocomplete="off">
-      {% if not is_new %}<input type="hidden" name="original_id" value="{{ form.id }}">{% endif %}
-
-      <fieldset>
-        <legend>Identity</legend>
+    <fieldset>
+      <legend>Identity</legend>
+      <div class="grid2">
         <div class="field">
           <label for="id">Server ID</label>
-          <input id="id" name="id" value="{{ form.id }}"
-                 {% if not is_new %}readonly class="ro"{% endif %} placeholder="orch-lab">
-          <p class="hint">{% if is_new %}Lowercase letters, numbers, hyphens, underscores. Cannot be changed later.{% else %}IDs are fixed once created.{% endif %}</p>
+          <input id="id" name="id" value="{{ form.id }}" {% if not is_new %}readonly class="ro"{% endif %} placeholder="orch-lab">
+          <p class="hint">{% if is_new %}Letters, numbers, hyphens, underscores. Cannot be changed later.{% else %}IDs are fixed once created.{% endif %}</p>
         </div>
         <div class="field">
           <label for="name">Display name</label>
           <input id="name" name="name" value="{{ form.name }}" placeholder="Lab Orchestrator">
         </div>
-      </fieldset>
+      </div>
+    </fieldset>
 
-      <fieldset>
-        <legend>Target</legend>
-        <div class="field">
-          <label for="orchestrator_host">Orchestrator host</label>
-          <input id="orchestrator_host" name="orchestrator_host" value="{{ form.orchestrator_host }}"
-                 placeholder="orchestrator.example.com">
-        </div>
-        <div class="field">
-          <label for="domain">Certificate domain</label>
-          <input id="domain" name="domain" value="{{ form.domain }}" placeholder="defaults to the host above">
-          <p class="hint">The hostname the certificate is issued for. Leave blank to match the host.</p>
-        </div>
-        <div class="field check">
-          <label><input type="checkbox" name="verify_ssl" {% if form.verify_ssl %}checked{% endif %}> Verify the Orchestrator's TLS cert on API calls</label>
-          <p class="hint">Leave off only while the appliance still serves its factory self-signed certificate. Turn on once the production certificate is live; the host above must then match a name on that certificate.</p>
-        </div>
-        <div class="field">
-          <label for="ca_bundle">CA bundle (optional)</label>
-          <input id="ca_bundle" name="ca_bundle" value="{{ form.ca_bundle }}" placeholder="/data/ssh/orchestrator-ca.pem">
-          <p class="hint">PEM bundle used for API verification when the appliance certificate chains to a private CA. Path inside the container.</p>
-        </div>
-      </fieldset>
+    <fieldset>
+      <legend>Target</legend>
+      <div class="field">
+        <label for="orchestrator_host">Orchestrator host</label>
+        <input id="orchestrator_host" name="orchestrator_host" value="{{ form.orchestrator_host }}" placeholder="orchestrator.example.com">
+        <p class="hint">Used for the API, SSH and the served-certificate check. Use the FQDN on the certificate when TLS verification is on.</p>
+      </div>
+      <div class="field">
+        <label for="domain">Certificate domain</label>
+        <input id="domain" name="domain" value="{{ form.domain }}" placeholder="defaults to the host above">
+      </div>
+      <div class="field check">
+        <label><input type="checkbox" name="verify_ssl" {% if form.verify_ssl %}checked{% endif %}> Verify the Orchestrator's TLS certificate on API calls</label>
+        <p class="hint">Leave off only while the appliance still serves its factory self-signed certificate. Turn on once the production certificate is live.</p>
+      </div>
+      <div class="field">
+        <label for="ca_bundle">CA bundle (optional)</label>
+        <input id="ca_bundle" name="ca_bundle" value="{{ form.ca_bundle }}" placeholder="/data/ssh/orchestrator-ca.pem">
+        <p class="hint">PEM bundle for API verification when the appliance chains to a private CA. Path inside the container.</p>
+      </div>
+    </fieldset>
 
-      <fieldset>
-        <legend>Certificate authority</legend>
+    <fieldset>
+      <legend>Certificate authority</legend>
+      <div class="grid2">
         <div class="field">
           <label for="acme_ca">CA</label>
           <select id="acme_ca" name="acme_ca">
-            {% for value, label in ca_choices %}
-            <option value="{{ value }}" {% if form.acme_ca == value %}selected{% endif %}>{{ label }}</option>
-            {% endfor %}
+            {% for value, label in ca_choices %}<option value="{{ value }}" {% if form.acme_ca == value %}selected{% endif %}>{{ label }}</option>{% endfor %}
           </select>
-          <p class="hint">Staging has high rate limits but issues browser-untrusted certs &mdash; use it to test, then switch to production.</p>
-        </div>
-        <div class="field">
-          <label for="acme_email">ACME email</label>
-          <input id="acme_email" name="acme_email" type="email" value="{{ form.acme_email }}"
-                 placeholder="you@example.com">
+          <p class="hint">Staging has high rate limits but issues browser-untrusted certs. Test there, then switch to production.</p>
         </div>
         <div class="field">
           <label for="key_type">Key type</label>
           <select id="key_type" name="key_type">
-            {% for k in key_choices %}
-            <option value="{{ k }}" {% if form.key_type == k %}selected{% endif %}>{{ k }}</option>
-            {% endfor %}
+            {% for k in key_choices %}<option value="{{ k }}" {% if form.key_type == k %}selected{% endif %}>{{ k }}</option>{% endfor %}
           </select>
-          <p class="hint">Orchestrator serves a single RSA certificate.</p>
         </div>
-      </fieldset>
-
-      <fieldset>
-        <legend>DNS (Cloudflare)</legend>
-        <div class="field">
-          <label for="dns_provider">DNS provider</label>
-          <input id="dns_provider" name="dns_provider" value="{{ form.dns_provider }}">
-          <p class="hint">Only <code>cloudflare</code> is wired up today.</p>
-        </div>
-        <div class="field">
-          <label for="dns_api_token">Cloudflare API token</label>
-          <input id="dns_api_token" name="dns_api_token" type="password" autocomplete="new-password" value="">
-          <p class="hint">
-            {% if cf_token_set %}<span class="stored">A token is stored.</span> Leave blank to keep it, or type a new one to replace it.
-            {% else %}Scoped to edit DNS on the zone. Leave blank to fall back to the <code>CF_DNS_API_TOKEN</code> env var.{% endif %}
-          </p>
-        </div>
-      </fieldset>
-
-      <fieldset>
-        <legend>Orchestrator API</legend>
-        <div class="field">
-          <label for="api_key">API key</label>
-          <input id="api_key" name="api_key" type="password" autocomplete="new-password" value="">
-          <p class="hint">
-            {% if api_key_set %}<span class="stored">A key is stored.</span> Leave blank to keep it, or type a new one to replace it.
-            {% else %}Read-Write Orchestrator API key. Leave blank to fall back to the env var named below.{% endif %}
-          </p>
-        </div>
-        <div class="field">
-          <label for="api_key_env">API key env var (fallback)</label>
-          <input id="api_key_env" name="api_key_env" value="{{ form.api_key_env }}">
-          <p class="hint">Used only when the API key above is left blank.</p>
-        </div>
-      </fieldset>
-
-      <fieldset>
-        <legend>SSH (activation restart)</legend>
-        <p class="hint">Public-key authentication only. The user needs passwordless <code>sudo</code> scoped to the two commands below. See the README section <em>Configure SSH key authentication</em>, or run <code>./setup.sh</code>.</p>
-        <div class="grid2">
-          <div class="field">
-            <label for="ssh_user">SSH user</label>
-            <input id="ssh_user" name="ssh_user" value="{{ form.ssh_user }}">
-          </div>
-          <div class="field">
-            <label for="ssh_port">SSH port</label>
-            <input id="ssh_port" name="ssh_port" value="{{ form.ssh_port }}">
-          </div>
-        </div>
-        <div class="field">
-          <label for="ssh_key_path">SSH key path</label>
-          <input id="ssh_key_path" name="ssh_key_path" value="{{ form.ssh_key_path }}"
-                 placeholder="{{ default_key }}">
-          <p class="hint">Path <strong>inside the container</strong>. <code>./data/ssh</code> on the host is mounted read-only at <code>/data/ssh</code>; <code>setup.sh</code> generates <code>{{ default_key }}</code>. The key is validated when you save.</p>
-        </div>
-        <details class="advanced">
-          <summary>Advanced</summary>
-          <div class="field">
-            <label for="ssh_known_hosts">Known hosts path</label>
-            <input id="ssh_known_hosts" name="ssh_known_hosts" value="{{ form.ssh_known_hosts }}" placeholder="{{ default_known_hosts }}">
-            <p class="hint">Pinned host key for the Orchestrator (strict checking; unknown keys are rejected). Must contain an entry for the host above.</p>
-          </div>
-          <div class="field">
-            <label for="restart_command">Restart command</label>
-            <input id="restart_command" name="restart_command" value="{{ form.restart_command }}">
-          </div>
-          <div class="field">
-            <label for="nginx_reload_command">Nginx reload command</label>
-            <input id="nginx_reload_command" name="nginx_reload_command" value="{{ form.nginx_reload_command }}">
-          </div>
-        </details>
-      </fieldset>
-
-      <div class="form-actions">
-        <button type="submit">{{ 'Create server' if is_new else 'Save changes' }}</button>
-        <a class="btn-link ghost" href="{{ url_for('settings') }}">Cancel</a>
       </div>
-    </form>
-  </main>
+      <div class="field">
+        <label for="acme_email">ACME email</label>
+        <input id="acme_email" name="acme_email" type="email" value="{{ form.acme_email }}" placeholder="you@example.com">
+      </div>
+    </fieldset>
 
-  <footer class="wrap">
-    <span>orchestrator-acme-cert-manager</span>
-    <span class="muted">Internal lab/training use</span>
-  </footer>
-</body>
-</html>
+    <fieldset>
+      <legend>Secrets</legend>
+      <div class="field">
+        <label for="dns_api_token">Cloudflare API token</label>
+        <input id="dns_api_token" name="dns_api_token" type="password" autocomplete="new-password" value="">
+        <p class="hint">{% if cf_token_set %}<span class="stored">A token is stored.</span> Leave blank to keep it, or type a new one to replace it.
+          {% else %}Scoped to edit DNS on the zone. Blank falls back to the <code>CF_DNS_API_TOKEN</code> env var.{% endif %}</p>
+      </div>
+      <div class="grid2">
+        <div class="field">
+          <label for="api_key">Orchestrator API key</label>
+          <input id="api_key" name="api_key" type="password" autocomplete="new-password" value="">
+          <p class="hint">{% if api_key_set %}<span class="stored">A key is stored.</span> Leave blank to keep it, or type a new one to replace it.
+            {% else %}Read-Write key. Blank falls back to the env var on the right.{% endif %}</p>
+        </div>
+        <div class="field">
+          <label for="api_key_env">API key env var</label>
+          <input id="api_key_env" name="api_key_env" value="{{ form.api_key_env }}">
+        </div>
+      </div>
+      <input type="hidden" name="dns_provider" value="{{ form.dns_provider or 'cloudflare' }}">
+    </fieldset>
+
+    <fieldset>
+      <legend>SSH (activation)</legend>
+      <p class="hint" style="margin-top:4px">Public-key authentication only. The user needs passwordless <code>sudo</code> scoped to the two commands below. <code>./setup.sh</code> prepares all of this; the settings are validated when you save.</p>
+      <div class="grid2">
+        <div class="field"><label for="ssh_user">SSH user</label><input id="ssh_user" name="ssh_user" value="{{ form.ssh_user }}"></div>
+        <div class="field"><label for="ssh_port">SSH port</label><input id="ssh_port" name="ssh_port" value="{{ form.ssh_port }}"></div>
+      </div>
+      <div class="field">
+        <label for="ssh_key_path">Private key path</label>
+        <input id="ssh_key_path" name="ssh_key_path" value="{{ form.ssh_key_path }}" placeholder="{{ default_key }}">
+        <p class="hint">Path <strong>inside the container</strong>; <code>./data/ssh</code> on the host is mounted read-only at <code>/data/ssh</code>.</p>
+      </div>
+      <div class="field">
+        <label for="ssh_known_hosts">Known hosts path</label>
+        <input id="ssh_known_hosts" name="ssh_known_hosts" value="{{ form.ssh_known_hosts }}" placeholder="{{ default_known_hosts }}">
+        <p class="hint">Pinned Orchestrator host key (strict checking). Must contain an entry for the host above.</p>
+      </div>
+      <details class="advanced">
+        <summary>Activation commands</summary>
+        <div class="field"><label for="restart_command">Restart command</label><input id="restart_command" name="restart_command" value="{{ form.restart_command }}"></div>
+        <div class="field"><label for="nginx_reload_command">Nginx reload command</label><input id="nginx_reload_command" name="nginx_reload_command" value="{{ form.nginx_reload_command }}"></div>
+      </details>
+    </fieldset>
+
+    <div class="form-actions">
+      <button type="submit" class="btn">{{ 'Create server' if is_new else 'Save changes' }}</button>
+      <a class="btn ghost" href="{{ url_for('settings') }}">Cancel</a>
+    </div>
+  </form>
+{% endblock %}

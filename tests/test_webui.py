@@ -58,9 +58,15 @@ def test_dashboard_shows_config_path_and_ssh_problems(layout, known_hosts, monke
     c = _client(layout, monkeypatch)
     html = c.get("/").get_data(as_text=True)
     assert str(config.SERVERS_FILE) in html
-    assert "SSH activation will fail" in html
-    assert "key_path is empty" in html
-    assert "API TLS verification is" in html
+    assert "SSH configuration invalid" in html          # health reason on the fleet row
+    assert "attention" in html
+    detail = c.get("/server/orch-test").get_data(as_text=True)
+    assert "Activation will fail" in detail
+    assert "key_path is empty" in detail
+    assert "unverified" in detail                       # API TLS verification is off
+    frag = c.get("/partials/fleet").get_data(as_text=True)
+    assert frag.lstrip().startswith("<div data-busy=")
+    assert c.get("/server/does-not-exist").status_code == 404
 
 
 def test_settings_save_rejects_empty_key_path(layout, known_hosts, monkeypatch):
@@ -101,3 +107,52 @@ def test_login_next_cannot_be_offsite(layout, monkeypatch):
     c = web.app.test_client()
     r = c.post("/login", data={"username": "admin", "password": "password123", "next": "//evil.example"})
     assert r.headers["Location"].endswith("/")
+
+
+def _row(**over):
+    base = {"renewing": False, "ssh_problems": [], "cert": {"present": True, "days_left": 60, "environment": "production"},
+            "lifecycle": {"state": "live", "configured_env": "production", "message": ""}, "last": {"outcome": "success"}}
+    base.update(over)
+    return base
+
+
+def test_health_rollup_order():
+    assert web.health(_row())["state"] == "ok"
+    assert web.health(_row(renewing=True))["state"] == "working"
+    assert web.health(_row(ssh_problems=["x"]))["state"] == "critical"
+    assert web.health(_row(last={"outcome": "failed"}))["state"] == "critical"
+    assert web.health(_row(cert={"present": True, "days_left": -1, "environment": "production"}))["state"] == "critical"
+    w = web.health(_row(lifecycle={"state": "pending", "configured_env": "production", "message": ""}))
+    assert w["state"] == "warning" and "not yet served" in w["reasons"][0]
+    assert web.health(_row(cert={"present": True, "days_left": 12, "environment": "production"}))["state"] == "warning"
+    assert web.health(_row(cert={"present": False}, lifecycle={"state": "none", "configured_env": "production", "message": ""}, last=None))["state"] == "none"
+    assert web.health(_row(lifecycle={"state": "unknown", "configured_env": "production", "message": "m"}))["state"] == "unknown"
+
+
+def test_fleet_summary_counts():
+    rows = [
+        {"health": {"state": "ok"}, "cert": {"present": True, "days_left": 60}, "renewing": False},
+        {"health": {"state": "warning"}, "cert": {"present": True, "days_left": 12}, "renewing": False},
+        {"health": {"state": "critical"}, "cert": {"present": False}, "renewing": False},
+        {"health": {"state": "working"}, "cert": {"present": True, "days_left": 40}, "renewing": True},
+    ]
+    s = web.fleet_summary(rows)
+    assert (s["servers"], s["healthy"], s["attention"], s["expiring"], s["working"], s["min_days"]) == (4, 1, 2, 1, 1, 12)
+
+
+def test_relative_time():
+    import datetime as dt
+    now = dt.datetime.now(dt.timezone.utc)
+    assert web.relative_time((now - dt.timedelta(hours=3)).isoformat()) == "3h ago"
+    assert web.relative_time((now - dt.timedelta(days=2)).isoformat()) == "2d ago"
+    assert web.relative_time(None) == "—"
+
+
+def test_server_partial_and_api(layout, server, monkeypatch):
+    config.upsert_server(server)
+    c = _client(layout, monkeypatch)
+    frag = c.get("/partials/server/orch-test").get_data(as_text=True)
+    assert frag.lstrip().startswith("<div data-busy=") and "Activation (SSH)" in frag
+    j = c.get("/api/server/orch-test").get_json()
+    assert j["server"]["health"]["state"] in ("none", "unknown")
+    assert "history" in j

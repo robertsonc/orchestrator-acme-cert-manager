@@ -9,7 +9,7 @@ import ssl
 import threading
 import time
 
-from flask import Flask, jsonify, make_response, redirect, render_template, request, url_for
+from flask import Flask, abort, jsonify, make_response, redirect, render_template, request, url_for
 
 from .. import config, preflight, sshcheck, store
 from . import auth
@@ -35,7 +35,7 @@ def _set_session(resp, username: str):
 
 @app.context_processor
 def _inject_user():
-    return {"current_user": _current_user()}
+    return {"current_user": _current_user(), "relative_time": relative_time}
 
 
 @app.before_request
@@ -226,6 +226,67 @@ def lifecycle(server, issued: dict, served: dict) -> dict:
                         f"use Force deploy (no CA contact).")}
 
 
+def _parse_ts(ts: str | None):
+    if not ts:
+        return None
+    try:
+        d = datetime.datetime.fromisoformat(ts)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=datetime.timezone.utc)
+        return d
+    except ValueError:
+        return None
+
+
+def relative_time(ts: str | None) -> str:
+    d = _parse_ts(ts)
+    if d is None:
+        return "—"
+    secs = int((datetime.datetime.now(datetime.timezone.utc) - d).total_seconds())
+    if secs < 0:
+        return "just now"
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size:
+            return f"{secs // size}{unit} ago"
+    return f"{secs}s ago"
+
+
+def health(row: dict) -> dict:
+    """One roll-up state per server, with the reasons behind it.
+
+    States, worst first: working, critical, warning, ok, unknown, none.
+    Status colors never carry meaning alone: the template pairs each state
+    with a glyph and the label.
+    """
+    reasons: list[str] = []
+    cert, lc, last = row["cert"], row["lifecycle"], row["last"]
+    if row["renewing"]:
+        return {"state": "working", "label": "working", "reasons": ["a run is in progress"]}
+    if row["ssh_problems"]:
+        reasons.append("SSH configuration invalid")
+    if cert.get("present") and cert.get("days_left") is not None and cert["days_left"] <= 0:
+        reasons.append("certificate expired")
+    if last and last.get("outcome") == "failed":
+        reasons.append("last run failed")
+    if reasons:
+        return {"state": "critical", "label": "attention", "reasons": reasons}
+    if lc["state"] == "pending":
+        reasons.append("issued certificate not yet served")
+    if cert.get("present") and cert.get("days_left") is not None and cert["days_left"] <= 30:
+        reasons.append(f"expires in {cert['days_left']} days")
+    if cert.get("environment") == "staging" and lc["configured_env"] == "production":
+        reasons.append("staging certificate while configured for production")
+    if cert.get("environment") == "staging" and lc["state"] == "live":
+        reasons.append("serving a staging certificate")
+    if reasons:
+        return {"state": "warning", "label": "warning", "reasons": reasons}
+    if not cert.get("present"):
+        return {"state": "none", "label": "no certificate", "reasons": ["nothing issued yet"]}
+    if lc["state"] == "unknown":
+        return {"state": "unknown", "label": "unverified", "reasons": [lc["message"]]}
+    return {"state": "ok", "label": "healthy", "reasons": ["issued certificate is live"]}
+
+
 def _summarize(record: dict | None) -> dict | None:
     if not record:
         return None
@@ -244,28 +305,57 @@ def _summarize(record: dict | None) -> dict | None:
         message = ""
     return {
         "server_id": record.get("server_id"), "outcome": outcome,
-        "timestamp": record.get("timestamp"), "steps": steps, "message": message,
+        "timestamp": record.get("timestamp"), "ago": relative_time(record.get("timestamp")),
+        "steps": steps, "message": message,
         "rolled_back": rolled_back, "not_after": record.get("not_after"),
         "serial": record.get("serial"), "failed_step": failed_step,
+        "kind": record.get("kind") or "renew", "elapsed_s": record.get("elapsed_s"),
     }
 
 
+def _row_for(s, with_served: bool = True) -> dict:
+    issued = _cert_info(s)
+    served = _served_info(s) if with_served else {"present": False, "error": "not checked"}
+    row = {
+        "id": s.id, "name": s.name, "domain": s.domain,
+        "host": s.orchestrator_host, "ca": s.acme_ca,
+        "ca_env": "staging" if config.is_staging_ca(s.acme_ca) else "production",
+        "verify_ssl": s.verify_ssl, "ca_bundle": s.ca_bundle,
+        "ssh_user": s.ssh_user, "ssh_key_path": s.ssh_key_path,
+        "ssh_known_hosts": s.ssh_known_hosts, "ssh_port": s.ssh_port,
+        "restart_command": s.restart_command, "nginx_reload_command": s.nginx_reload_command,
+        "key_type": s.key_type, "acme_email": s.acme_email,
+        "secrets": {"cf_inline": bool(s.dns_api_token), "api_inline": bool(s.api_key),
+                    "api_key_env": s.api_key_env},
+        "cert": issued, "served": served, "lifecycle": lifecycle(s, issued, served),
+        "ssh_problems": sshcheck.validate(s),
+        "last": _summarize(store.latest_for(s.id)),
+        "renewing": _is_renewing(s.id),
+    }
+    row["health"] = health(row)
+    return row
+
+
 def _rows(with_served: bool = True) -> list[dict]:
-    rows = []
-    for s in config.load_servers():
-        issued = _cert_info(s)
-        served = _served_info(s) if with_served else {"present": False, "error": "not checked"}
-        rows.append({
-            "id": s.id, "name": s.name, "domain": s.domain,
-            "host": s.orchestrator_host, "ca": s.acme_ca,
-            "ca_env": "staging" if config.is_staging_ca(s.acme_ca) else "production",
-            "verify_ssl": s.verify_ssl,
-            "cert": issued, "served": served, "lifecycle": lifecycle(s, issued, served),
-            "ssh_problems": sshcheck.validate(s),
-            "last": _summarize(store.latest_for(s.id)),
-            "renewing": _is_renewing(s.id),
-        })
-    return rows
+    return [_row_for(s, with_served) for s in config.load_servers()]
+
+
+_HEALTH_ORDER = {"working": 0, "critical": 1, "warning": 2, "unknown": 3, "none": 4, "ok": 5}
+
+
+def fleet_summary(rows: list[dict]) -> dict:
+    """Counts for the overview tiles."""
+    return {
+        "servers": len(rows),
+        "healthy": sum(1 for r in rows if r["health"]["state"] == "ok"),
+        "attention": sum(1 for r in rows if r["health"]["state"] in ("critical", "warning")),
+        "expiring": sum(1 for r in rows if r["cert"].get("present")
+                        and r["cert"].get("days_left") is not None and r["cert"]["days_left"] <= 30),
+        "working": sum(1 for r in rows if r["renewing"]),
+        "min_days": min((r["cert"]["days_left"] for r in rows
+                         if r["cert"].get("present") and r["cert"].get("days_left") is not None),
+                        default=None),
+    }
 
 
 def _system() -> dict:
@@ -276,18 +366,67 @@ def _system() -> dict:
 
 
 # ============================= dashboard =====================================
+def _fleet_context() -> dict:
+    rows = sorted(_rows(), key=lambda r: (_HEALTH_ORDER.get(r["health"]["state"], 9), r["name"].lower()))
+    history = [_summarize(r) for r in store.all_records()[:20]]
+    return {"rows": rows, "summary": fleet_summary(rows), "history": history,
+            "system": _system(), "busy": any(r["renewing"] for r in rows), "now": _now(),
+            "updated": datetime.datetime.now().strftime("%H:%M:%S")}
+
+
 @app.route("/")
 def index():
-    rows = _rows()
-    renewing_names = [r["name"] for r in rows if r["renewing"]]
-    history = [_summarize(r) for r in store.all_records()[:25]]
-    return render_template("index.html", rows=rows, history=history, system=_system(),
-                           renewing_names=renewing_names, now=_now())
+    return render_template("index.html", **_fleet_context())
+
+
+@app.route("/partials/fleet")
+def partial_fleet():
+    """Live-refresh fragment for the overview (swapped in by app.js)."""
+    return render_template("_fleet.html", **_fleet_context())
+
+
+def _server_context(server_id: str) -> dict:
+    try:
+        s = config.get_server(server_id)
+    except config.ConfigError:
+        abort(404)
+    row = _row_for(s)
+    history = [_summarize(r) for r in store.all_records() if r.get("server_id") == server_id][:30]
+    return {"r": row, "history": history, "system": _system(), "busy": row["renewing"],
+            "now": _now(), "updated": datetime.datetime.now().strftime("%H:%M:%S")}
+
+
+@app.route("/server/<server_id>")
+def server_detail(server_id: str):
+    return render_template("server.html", test_result=None, **_server_context(server_id))
+
+
+@app.route("/partials/server/<server_id>")
+def partial_server(server_id: str):
+    return render_template("_server.html", test_result=None, **_server_context(server_id))
+
+
+@app.route("/server/<server_id>/test-ssh", methods=["POST"])
+def server_test_ssh(server_id: str):
+    """Authenticate over SSH and probe sudo authorization. Restarts nothing."""
+    try:
+        s = config.get_server(server_id)
+    except config.ConfigError:
+        abort(404)
+    res = sshcheck.test_connection(s)
+    log.info("ssh-test %s via web UI: %s", s.id, "ok" if res.ok else res.message)
+    return render_template("server.html", test_result=res.as_dict(), **_server_context(server_id))
 
 
 @app.route("/api/servers")
 def api_servers():
     return jsonify(_rows())
+
+
+@app.route("/api/server/<server_id>")
+def api_server(server_id: str):
+    ctx = _server_context(server_id)
+    return jsonify({"server": ctx["r"], "history": ctx["history"]})
 
 
 @app.route("/api/history")
@@ -323,7 +462,7 @@ def renew(server_id: str):
     """Force renew: full pipeline, contacts the ACME CA."""
     from .. import renew as renew_mod
     _run_in_background(server_id, lambda s: renew_mod.renew_server(s, force=True), "force renew")
-    return redirect(url_for("index"))
+    return redirect(_back(server_id))
 
 
 @app.route("/deploy/<server_id>", methods=["POST"])
@@ -331,7 +470,15 @@ def force_deploy(server_id: str):
     """Force deploy: re-push the on-disk cert (deploy -> restart), skipping issuance. No CA contact."""
     from .. import renew as renew_mod
     _run_in_background(server_id, renew_mod.redeploy_server, "force deploy")
-    return redirect(url_for("index"))
+    return redirect(_back(server_id))
+
+
+def _back(server_id: str) -> str:
+    """Return to the server page when the action came from it, else the overview."""
+    ref = request.form.get("return", "")
+    if ref == "server":
+        return url_for("server_detail", server_id=server_id)
+    return url_for("index")
 
 
 # ============================= settings ======================================
@@ -471,9 +618,7 @@ def settings_test_ssh(server_id: str):
         s = config.get_server(server_id)
     except config.ConfigError:
         return redirect(url_for("settings"))
-    res = sshcheck.test_connection(s)
-    log.info("ssh-test %s via web UI: %s", s.id, "ok" if res.ok else res.message)
-    return _render_settings(test_result=res.as_dict(), test_server=s)[0]
+    return server_test_ssh(server_id)
 
 
 @app.route("/settings/new")

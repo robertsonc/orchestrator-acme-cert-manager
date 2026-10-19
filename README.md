@@ -43,7 +43,7 @@ It is the Orchestrator counterpart to the [ClearPass ACME Certificate Manager](h
 - **Preflight checks**: the container refuses to start on a configuration that would silently lose changes; SSH settings are validated when saved and before every activation; a **Test SSH** button verifies authentication and `sudo` authorization without restarting anything.
 - **Deployment diagnostics**: every API failure records the phase (validation / install), HTTP status, attempt count, elapsed time and a redacted response excerpt; transient `502/503/504` answers to the validation call are retried with backoff, without ever re‑issuing.
 - **Lifecycle visibility**: the dashboard shows the **issued** certificate (local), the **served** certificate (what clients get on `:443`), whether each is **staging** or **production**, and an **activation** state (live / pending / unknown).
-- **Web dashboard**: certificate status, expiry, days‑left, serials, and renewal history at a glance; add/edit/delete servers; toggle staging↔production; manage secrets.
+- **Ops-console dashboard**: a fleet overview with a per-server health roll-up and a detail page per Orchestrator (pipeline timeline, diagnostics, SSH/API state, history); dark-first with a light theme; live refresh without a build step or external assets.
 - **Per‑server secrets with env fallback**: the Cloudflare token and Orchestrator API key can be stored per server (never echoed back to the browser) or supplied via environment variables.
 - **Authentication**: a first‑run Setup flow and a login gate protect the dashboard and settings.
 - **Failure alerts**: a webhook (email, Slack, etc.) fires when a renewal fails.
@@ -80,10 +80,10 @@ orchestrator-acme-cert-manager/
 │   ├── models.py              # ServerConfig, StepResult, RenewalRecord
 │   ├── entrypoint.sh          # runs preflight, then supercronic + the web server
 │   └── webui/
-│       ├── server.py          # Flask app: dashboard, lifecycle state, settings CRUD, Test SSH, auth
+│       ├── server.py          # Flask app: fleet + server pages, live fragments, settings CRUD, Test SSH, auth
 │       ├── auth.py            # PBKDF2 login + HMAC-signed sessions
-│       ├── templates/         # index, settings, server_form, login, setup
-│       └── static/style.css
+│       ├── templates/         # base, index/_fleet, server/_server, settings, server_form, login, setup
+│       └── static/            # style.css (dark-first tokens), app.js (theme + live refresh)
 ├── config/                    # PERSISTENT, bind-mounted at /config (gitignored contents)
 │   ├── crontab                # supercronic schedule (02:00 / 14:00)
 │   ├── servers.example.json   # template for servers.json
@@ -487,12 +487,14 @@ If the Issued badge says **staging** while the server is configured for producti
 
 ## Web UI
 
-Reached at `http://localhost:8090` over the SSH tunnel.
+Reached at `http://localhost:8090` over the SSH tunnel. Dark theme by default, light theme via the toggle in the top bar (remembered per browser). No build step, no external assets: the pages work with no internet access from the browser.
 
-- **Dashboard** (`/`) — a card per server showing CA, expiry, **Issued** and **Served** serials with staging/production badges, **Activation** state, last‑run outcome, a **Diagnostics** disclosure for failed runs (phase, status, attempt, elapsed, redacted response, next action), SSH configuration problems, and a note when API TLS verification is off. Two actions per server: **Force renew** (full pipeline, contacts the CA) and **Force deploy** (deploy → activate from the on‑disk cert, no CA contact). A **System** panel shows the active configuration path and whether it is bind‑mounted, plus any preflight warnings.
-- **Settings** (`/settings`) — list, **add**, **edit**, and **delete** servers; a **Test SSH** button per server that authenticates and probes `sudo -n -l` for both activation commands without restarting anything. The edit form includes the CA dropdown, TLS verification + CA bundle, the secret fields (never echoed back), and the SSH settings, which are **validated on save** (empty user/key path, missing/unreadable/unparseable/passphrase‑protected key, missing `known_hosts` entry).
-- **Setup / Login** — first‑run admin creation, then a login gate on everything else.
-- `/api/servers`, `/api/history`, `/api/status` — JSON views of the above (behind the login); `/healthz` is open.
+- **Fleet** (`/`) — the overview. Five tiles (servers, healthy, need attention, expiring ≤ 30 days, soonest expiry), the preflight findings, and one row per server sorted worst-first by a **health** roll-up (`attention` / `warning` / `healthy` / `unverified` / `working`, always shown as glyph + label with the top reason). Each row shows the configured CA, the **Issued** and **Served** certificate serials with staging/production badges, the **Activation** state, the last run and its kind, and the **Force renew** / **Force deploy** actions. Recent activity and the active configuration path sit below.
+- **Server** (`/server/<id>`) — everything about one Orchestrator: Issued / Served / Activation cards (with the issued certificate's remaining lifetime), the last run as a three-step pipeline (issue → deploy → restart) with elapsed time per step and a **Diagnostics** disclosure on the failed step (phase, HTTP status, attempt, elapsed, redacted response, next action), the SSH activation settings with their validation state, API TLS / secrets / CA summary, and the per-server history. Actions: Force renew (asks for confirmation because it spends an issuance), Force deploy, **Test SSH**, Edit.
+- **Live refresh** — the Fleet and Server pages re-fetch a server-rendered fragment every 8 s while a run is in progress and every 45 s otherwise (paused in background tabs), so a Force renew's outcome appears without reloading. The top-bar stamp shows the last refresh.
+- **Settings** (`/settings`) — list, add, edit, delete servers; Test SSH per server. The edit form validates the SSH block on save (empty user/key path, missing/unreadable/unparseable/passphrase-protected key, missing `known_hosts` entry) and never echoes stored secrets.
+- **Setup / Login** — first-run admin creation, then a login gate on everything else.
+- JSON: `/api/servers`, `/api/server/<id>`, `/api/history`, `/api/status` (behind the login); `/healthz` is open.
 
 Configuration is read on every request, so UI changes take effect on the next run with no restart.
 

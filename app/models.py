@@ -66,6 +66,8 @@ class RenewalRecord:
     steps: list[dict[str, Any]] = field(default_factory=list)
     not_after: Optional[str] = None
     serial: Optional[str] = None
+    kind: str = "renew"                   # scheduled | renew (forced) | redeploy
+    elapsed_s: Optional[float] = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -75,4 +77,6 @@ class RenewalRecord:
             "steps": self.steps,
             "not_after": self.not_after,
             "serial": self.serial,
+            "kind": self.kind,
+            "elapsed_s": self.elapsed_s,
         }

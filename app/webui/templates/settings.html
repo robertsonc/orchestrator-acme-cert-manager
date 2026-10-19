@@ -1,115 +1,47 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Settings · Orchestrator ACME Cert Manager</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-</head>
-<body>
-  <header>
-    <div class="wrap headbar">
-      <div>
-        <h1>Orchestrator <span>ACME Cert Manager</span></h1>
-        <div class="meta">EdgeConnect Orchestrator &middot; TLS lifecycle &middot; {{ now }}</div>
-      </div>
-      <nav class="nav">
-        <a href="{{ url_for('index') }}">Dashboard</a>
-        <a href="{{ url_for('settings') }}" class="active">Settings</a>
-        {% if current_user %}
-        <span class="nav-user">{{ current_user }}</span>
-        <a href="{{ url_for('logout') }}">Log out</a>
-        {% endif %}
-      </nav>
-    </div>
-  </header>
+{% extends "base.html" %}
+{% set nav = 'settings' %}
+{% block title %}Settings · Orchestrator ACME Cert Manager{% endblock %}
+{% block content %}
+  {% import "_macros.html" as m %}
+  {% if system.problems %}
+    <div class="alert a-warn"><strong>System checks</strong>
+      <ul>{% for p in system.problems %}<li><span class="mono small">[{{ p.code }}]</span> {{ p.message }}</li>{% endfor %}</ul></div>
+  {% endif %}
+  {% if test_result %}
+    <div class="alert {{ 'a-good' if test_result.ok else 'a-crit' }}"><strong>SSH test for {{ test_server.name }}</strong> {{ test_result.message }}</div>
+  {% endif %}
 
-  <main class="wrap">
-    {% if system.problems %}
-      <div class="sysbox sys-warn">
-        <strong>System checks</strong>
-        <ul>{% for p in system.problems %}<li><span class="mono small">[{{ p.code }}]</span> {{ p.message }}</li>{% endfor %}</ul>
-      </div>
-    {% endif %}
-
-    {% if test_result %}
-      <div class="sysbox {{ 'sys-ok' if test_result.ok else 'sys-bad' }}">
-        <strong>SSH test for {{ test_server.name }}:</strong> {{ test_result.message }}
-        {% if test_result.detail.checks %}
-        <ul>
-          {% for c in test_result.detail.checks %}
-          <li><span class="pill {{ 'ok' if c.ok else 'bad' }}">{{ 'ok' if c.ok else 'fail' }}</span>
-              <span class="mono small">{{ c.command }}</span>
-              {% if c.note %}<span class="muted small">— {{ c.note }}</span>{% endif %}
-              {% if not c.ok %}<div class="small">{{ c.hint or c.error }}{% if c.stderr %} <span class="mono">{{ c.stderr }}</span>{% endif %}</div>{% endif %}</li>
-          {% endfor %}
-        </ul>
-        {% endif %}
-      </div>
-    {% endif %}
-
-    <div class="section-head">
-      <h2>Servers</h2>
-      <a class="btn-link" href="{{ url_for('settings_new') }}">+ Add server</a>
-    </div>
-
+  <div class="section-head"><h2>Servers</h2><a class="btn" href="{{ url_for('settings_new') }}">+ Add server</a></div>
+  <div class="panel table-wrap">
     {% if not servers %}
       <p class="empty">No servers configured yet. <a href="{{ url_for('settings_new') }}">Add one</a> to get started.</p>
     {% else %}
-    <table>
-      <thead>
-        <tr><th>Name</th><th>Host</th><th>CA</th><th>Key</th><th>Secrets</th><th>API TLS</th><th class="right">Actions</th></tr>
-      </thead>
+    <table class="grid">
+      <thead><tr><th>Server</th><th>Host</th><th>CA</th><th>Key</th><th>Secrets</th><th>API TLS</th><th>SSH</th><th class="right">Actions</th></tr></thead>
       <tbody>
-        {% for s in servers %}
+      {% for s in servers %}
         <tr>
-          <td>
-            <strong>{{ s.name }}</strong>
-            <div class="muted small mono">{{ s.id }}</div>
-          </td>
-          <td class="small">{{ s.orchestrator_host }}</td>
-          <td>
-            {% if s.acme_ca == 'letsencrypt' %}
-              <span class="pill ok">production</span>
-            {% else %}
-              <span class="pill warn">staging</span>
-            {% endif %}
-          </td>
-          <td class="small mono">{{ s.key_type }}</td>
-          <td>
-            {% if s.dns_api_token and s.api_key %}
-              <span class="pill ok" title="Cloudflare token and API key stored in config">in config</span>
-            {% elif s.dns_api_token or s.api_key %}
-              <span class="pill warn" title="One secret stored, the other from the environment">partial</span>
-            {% else %}
-              <span class="pill none" title="Both secrets read from environment variables">env</span>
-            {% endif %}
-          </td>
-          <td>
-            {% if s.verify_ssl %}<span class="pill ok" title="Orchestrator API certificate is verified">verified</span>
-            {% else %}<span class="pill warn" title="verify_ssl is off: API calls do not check the appliance certificate">unverified</span>{% endif %}
-          </td>
-          <td class="right nowrap">
-            <form method="post" action="{{ url_for('settings_test_ssh', server_id=s.id) }}" class="inline">
-              <button type="submit" class="btn-sm" title="Authenticate over SSH and check sudo authorization for the activation commands. Restarts nothing.">Test SSH</button>
-            </form>
-            <a class="btn-sm" href="{{ url_for('settings_edit', server_id=s.id) }}">Edit</a>
+          <td><a class="primary" href="{{ url_for('server_detail', server_id=s.id) }}">{{ s.name }}</a><div class="secondary mono">{{ s.id }}</div></td>
+          <td class="mono small">{{ s.orchestrator_host }}</td>
+          <td>{{ m.env_pill('staging' if s.acme_ca != 'letsencrypt' else 'production') }}</td>
+          <td class="mono small">{{ s.key_type }}</td>
+          <td>{% if s.dns_api_token and s.api_key %}<span class="pill quiet" title="Cloudflare token and API key stored in config">in config</span>
+              {% elif s.dns_api_token or s.api_key %}<span class="pill quiet" title="One secret stored, the other from the environment">partial</span>
+              {% else %}<span class="pill quiet" title="Both secrets read from environment variables">env</span>{% endif %}</td>
+          <td>{% if s.verify_ssl %}<span class="check good"><span class="g">●</span>verified</span>{% else %}<span class="check warn"><span class="g">▲</span>unverified</span>{% endif %}</td>
+          <td class="mono small">{{ s.ssh_user or '—' }}{% if s.ssh_port != 22 %} <span class="muted">:{{ s.ssh_port }}</span>{% endif %}</td>
+          <td><div class="actions">
+            <form method="post" action="{{ url_for('settings_test_ssh', server_id=s.id) }}"><button type="submit" class="btn secondary sm" title="Authenticate and check sudo. Restarts nothing.">Test SSH</button></form>
+            <a class="btn secondary sm" href="{{ url_for('settings_edit', server_id=s.id) }}">Edit</a>
             <form method="post" action="{{ url_for('settings_delete', server_id=s.id) }}"
-                  class="inline" onsubmit="return confirm('Delete server &quot;{{ s.name }}&quot;? This only removes it from the config; issued certs on disk are left alone.');">
-              <button type="submit" class="btn-sm danger">Delete</button>
-            </form>
-          </td>
+                  data-confirm="Delete server '{{ s.name }}'? This only removes it from the config; issued certificates on disk are left alone.">
+              <button type="submit" class="btn danger sm">Delete</button></form>
+          </div></td>
         </tr>
-        {% endfor %}
+      {% endfor %}
       </tbody>
     </table>
-    <p class="muted small note-inline">Changes here take effect on the next run &mdash; no rebuild or restart needed. Saved to <span class="mono">{{ system.servers_file }}</span>.</p>
     {% endif %}
-  </main>
-
-  <footer class="wrap">
-    <span>orchestrator-acme-cert-manager</span>
-    <span class="muted">Internal lab/training use</span>
-  </footer>
-</body>
-</html>
+  </div>
+  <p class="help">Changes take effect on the next run — no rebuild or restart. Saved to <span class="mono">{{ system.servers_file }}</span>.</p>
+{% endblock %}

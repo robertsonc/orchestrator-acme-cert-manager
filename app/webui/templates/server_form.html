@@ -68,6 +68,12 @@
         </div>
         <div class="field check">
           <label><input type="checkbox" name="verify_ssl" {% if form.verify_ssl %}checked{% endif %}> Verify the Orchestrator's TLS cert on API calls</label>
+          <p class="hint">Leave off only while the appliance still serves its factory self-signed certificate. Turn on once the production certificate is live; the host above must then match a name on that certificate.</p>
+        </div>
+        <div class="field">
+          <label for="ca_bundle">CA bundle (optional)</label>
+          <input id="ca_bundle" name="ca_bundle" value="{{ form.ca_bundle }}" placeholder="/data/ssh/orchestrator-ca.pem">
+          <p class="hint">PEM bundle used for API verification when the appliance certificate chains to a private CA. Path inside the container.</p>
         </div>
       </fieldset>
 
@@ -134,6 +140,7 @@
 
       <fieldset>
         <legend>SSH (activation restart)</legend>
+        <p class="hint">Public-key authentication only. The user needs passwordless <code>sudo</code> scoped to the two commands below. See the README section <em>Configure SSH key authentication</em>, or run <code>./setup.sh</code>.</p>
         <div class="grid2">
           <div class="field">
             <label for="ssh_user">SSH user</label>
@@ -147,13 +154,15 @@
         <div class="field">
           <label for="ssh_key_path">SSH key path</label>
           <input id="ssh_key_path" name="ssh_key_path" value="{{ form.ssh_key_path }}"
-                 placeholder="/home/azureuser/.ssh/orch_restart">
+                 placeholder="{{ default_key }}">
+          <p class="hint">Path <strong>inside the container</strong>. <code>./data/ssh</code> on the host is mounted read-only at <code>/data/ssh</code>; <code>setup.sh</code> generates <code>{{ default_key }}</code>. The key is validated when you save.</p>
         </div>
         <details class="advanced">
           <summary>Advanced</summary>
           <div class="field">
             <label for="ssh_known_hosts">Known hosts path</label>
-            <input id="ssh_known_hosts" name="ssh_known_hosts" value="{{ form.ssh_known_hosts }}">
+            <input id="ssh_known_hosts" name="ssh_known_hosts" value="{{ form.ssh_known_hosts }}" placeholder="{{ default_known_hosts }}">
+            <p class="hint">Pinned host key for the Orchestrator (strict checking; unknown keys are rejected). Must contain an entry for the host above.</p>
           </div>
           <div class="field">
             <label for="restart_command">Restart command</label>

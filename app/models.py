@@ -31,6 +31,14 @@ class ServerConfig:
     api_key_env: str = "ORCH_API_KEY"     # env var name used when api_key is blank
     api_key: str = ""                     # inline Orchestrator API key (else api_key_env)
     verify_ssl: bool = False
+    ca_bundle: str = ""                   # optional CA bundle (PEM) used when verify_ssl is on
+
+    @property
+    def requests_verify(self):
+        """Value for requests' verify= : a CA bundle path, True, or False."""
+        if not self.verify_ssl:
+            return False
+        return self.ca_bundle or True
 
     @property
     def base_url(self) -> str:

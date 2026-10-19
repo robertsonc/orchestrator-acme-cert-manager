@@ -24,3 +24,7 @@ venv/
 *.swp
 config/servers.json.bak
 .env.bak
+
+# Local dev / test
+.pytest_cache/
+requirements-dev.lock

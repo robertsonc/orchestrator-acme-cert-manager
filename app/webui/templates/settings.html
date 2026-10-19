@@ -25,6 +25,29 @@
   </header>
 
   <main class="wrap">
+    {% if system.problems %}
+      <div class="sysbox sys-warn">
+        <strong>System checks</strong>
+        <ul>{% for p in system.problems %}<li><span class="mono small">[{{ p.code }}]</span> {{ p.message }}</li>{% endfor %}</ul>
+      </div>
+    {% endif %}
+
+    {% if test_result %}
+      <div class="sysbox {{ 'sys-ok' if test_result.ok else 'sys-bad' }}">
+        <strong>SSH test for {{ test_server.name }}:</strong> {{ test_result.message }}
+        {% if test_result.detail.checks %}
+        <ul>
+          {% for c in test_result.detail.checks %}
+          <li><span class="pill {{ 'ok' if c.ok else 'bad' }}">{{ 'ok' if c.ok else 'fail' }}</span>
+              <span class="mono small">{{ c.command }}</span>
+              {% if c.note %}<span class="muted small">— {{ c.note }}</span>{% endif %}
+              {% if not c.ok %}<div class="small">{{ c.hint or c.error }}{% if c.stderr %} <span class="mono">{{ c.stderr }}</span>{% endif %}</div>{% endif %}</li>
+          {% endfor %}
+        </ul>
+        {% endif %}
+      </div>
+    {% endif %}
+
     <div class="section-head">
       <h2>Servers</h2>
       <a class="btn-link" href="{{ url_for('settings_new') }}">+ Add server</a>
@@ -35,7 +58,7 @@
     {% else %}
     <table>
       <thead>
-        <tr><th>Name</th><th>Host</th><th>CA</th><th>Key</th><th>Secrets</th><th class="right">Actions</th></tr>
+        <tr><th>Name</th><th>Host</th><th>CA</th><th>Key</th><th>Secrets</th><th>API TLS</th><th class="right">Actions</th></tr>
       </thead>
       <tbody>
         {% for s in servers %}
@@ -62,7 +85,14 @@
               <span class="pill none" title="Both secrets read from environment variables">env</span>
             {% endif %}
           </td>
+          <td>
+            {% if s.verify_ssl %}<span class="pill ok" title="Orchestrator API certificate is verified">verified</span>
+            {% else %}<span class="pill warn" title="verify_ssl is off: API calls do not check the appliance certificate">unverified</span>{% endif %}
+          </td>
           <td class="right nowrap">
+            <form method="post" action="{{ url_for('settings_test_ssh', server_id=s.id) }}" class="inline">
+              <button type="submit" class="btn-sm" title="Authenticate over SSH and check sudo authorization for the activation commands. Restarts nothing.">Test SSH</button>
+            </form>
             <a class="btn-sm" href="{{ url_for('settings_edit', server_id=s.id) }}">Edit</a>
             <form method="post" action="{{ url_for('settings_delete', server_id=s.id) }}"
                   class="inline" onsubmit="return confirm('Delete server &quot;{{ s.name }}&quot;? This only removes it from the config; issued certs on disk are left alone.');">
@@ -73,7 +103,7 @@
         {% endfor %}
       </tbody>
     </table>
-    <p class="muted small note-inline">Changes here take effect on the next run &mdash; no rebuild or restart needed.</p>
+    <p class="muted small note-inline">Changes here take effect on the next run &mdash; no rebuild or restart needed. Saved to <span class="mono">{{ system.servers_file }}</span>.</p>
     {% endif %}
   </main>
 

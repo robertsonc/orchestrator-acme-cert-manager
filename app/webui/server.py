@@ -1,14 +1,17 @@
-"""Web UI: dashboard, renewal history, force-renew, and server management."""
+"""Web UI: dashboard, renewal history, force-renew / force-deploy, server management,
+SSH connection test, and a system/preflight panel."""
 from __future__ import annotations
 
 import datetime
 import logging
 import re
+import ssl
 import threading
+import time
 
 from flask import Flask, jsonify, make_response, redirect, render_template, request, url_for
 
-from .. import config, store
+from .. import config, preflight, sshcheck, store
 from . import auth
 
 log = logging.getLogger("webui")
@@ -87,7 +90,7 @@ def login():
         p = request.form.get("password", "")
         if auth.verify(u, p):
             nxt = request.form.get("next", "") or url_for("index")
-            if not nxt.startswith("/"):
+            if not nxt.startswith("/") or nxt.startswith("//"):
                 nxt = url_for("index")
             return _set_session(make_response(redirect(nxt)), u)
         return render_template("login.html", error="Incorrect username or password.",
@@ -101,6 +104,7 @@ def logout():
     resp.delete_cookie(auth.COOKIE_NAME)
     return resp
 
+
 CA_CHOICES = [
     ("letsencrypt", "Let's Encrypt (production)"),
     ("letsencrypt_test", "Let's Encrypt (staging)"),
@@ -113,6 +117,11 @@ _ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 _IN_PROGRESS: set[str] = set()
 _PROGRESS_LOCK = threading.Lock()
 
+_SERVED_TTL = 60          # seconds to cache the certificate served on :443
+_SERVED_TIMEOUT = 5
+_SERVED_CACHE: dict[str, tuple[float, dict]] = {}
+_SERVED_LOCK = threading.Lock()
+
 
 def _now() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -123,25 +132,98 @@ def _is_renewing(server_id: str) -> bool:
         return server_id in _IN_PROGRESS
 
 
+# ============================= certificate state =============================
+def environment_of(issuer: str | None) -> str | None:
+    """'staging' / 'production' from an issuer DN, or None if unknown."""
+    if not issuer:
+        return None
+    up = issuer.upper()
+    if "STAGING" in up or "FAKE" in up or "ERSATZ" in up:
+        return "staging"
+    return "production"
+
+
+def _parse_cert(pem: bytes) -> dict:
+    from cryptography import x509  # lazy import
+    cert = x509.load_pem_x509_certificate(pem)
+    na = cert.not_valid_after_utc
+    issuer = cert.issuer.rfc4514_string()
+    return {
+        "present": True,
+        "not_after": na.strftime("%Y-%m-%d"),
+        "days_left": (na - datetime.datetime.now(datetime.timezone.utc)).days,
+        "serial": format(cert.serial_number, "X"),
+        "issuer": issuer,
+        "environment": environment_of(issuer),
+    }
+
+
 def _cert_info(server) -> dict:
-    cert_path = config.cert_dir_for(server) / f"{server.domain}.cer"
-    info = {"present": False, "not_after": None, "days_left": None, "serial": None, "issuer": None}
+    """The *issued* certificate: what is stored locally for this server."""
+    cert_path = config.leaf_path_for(server)
+    info = {"present": False, "not_after": None, "days_left": None, "serial": None,
+            "issuer": None, "environment": None}
     if not cert_path.exists():
         return info
     try:
-        from cryptography import x509  # lazy import
-        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
-        na = cert.not_valid_after_utc
-        info.update(
-            present=True,
-            not_after=na.strftime("%Y-%m-%d"),
-            days_left=(na - datetime.datetime.now(datetime.timezone.utc)).days,
-            serial=format(cert.serial_number, "X"),
-            issuer=cert.issuer.rfc4514_string(),
-        )
+        info.update(_parse_cert(cert_path.read_bytes()))
     except Exception as exc:  # noqa: BLE001
         log.warning("cert parse failed for %s: %s", server.id, exc)
     return info
+
+
+def _fetch_served(host: str, port: int = 443) -> dict:
+    """The certificate the appliance actually presents on TCP/443 (no chain validation)."""
+    try:
+        pem = ssl.get_server_certificate((host, port), timeout=_SERVED_TIMEOUT)
+        info = _parse_cert(pem.encode())
+        info["error"] = None
+        return info
+    except (ssl.SSLError, OSError, ValueError) as exc:
+        return {"present": False, "serial": None, "issuer": None, "environment": None,
+                "not_after": None, "days_left": None, "error": str(exc) or exc.__class__.__name__}
+
+
+def _served_info(server) -> dict:
+    key = f"{server.orchestrator_host}:443"
+    now = time.monotonic()
+    with _SERVED_LOCK:
+        hit = _SERVED_CACHE.get(key)
+        if hit and now - hit[0] < _SERVED_TTL:
+            return hit[1]
+    info = _fetch_served(server.orchestrator_host)
+    with _SERVED_LOCK:
+        _SERVED_CACHE[key] = (now, info)
+    return info
+
+
+def invalidate_served_cache() -> None:
+    with _SERVED_LOCK:
+        _SERVED_CACHE.clear()
+
+
+def lifecycle(server, issued: dict, served: dict) -> dict:
+    """Activation state: does the appliance serve the certificate we issued?"""
+    configured_env = "staging" if config.is_staging_ca(server.acme_ca) else "production"
+    if not issued.get("present"):
+        return {"state": "none", "configured_env": configured_env,
+                "message": "No certificate issued yet — run Force renew."}
+    if served.get("error") or not served.get("present"):
+        return {"state": "unknown", "configured_env": configured_env,
+                "message": f"Could not read the certificate served on {server.orchestrator_host}:443 "
+                           f"({served.get('error') or 'no certificate'})."}
+    if served.get("serial") == issued.get("serial"):
+        msg = "The issued certificate is live on the appliance."
+        if issued.get("environment") == "staging" and configured_env == "production":
+            msg += " It is a STAGING certificate while the server is set to production — run Force renew."
+        return {"state": "live", "configured_env": configured_env, "message": msg}
+    ienv = (issued.get("environment") or "unknown").capitalize()
+    senv = served.get("environment") or "a different"
+    return {"state": "pending", "configured_env": configured_env,
+            "message": (f"{ienv} certificate issued (serial {issued.get('serial')}). "
+                        f"Orchestrator is still serving {senv} certificate "
+                        f"(serial {served.get('serial')}). Deployment or activation is pending — "
+                        f"use Force deploy (no CA contact).")}
 
 
 def _summarize(record: dict | None) -> dict | None:
@@ -150,9 +232,12 @@ def _summarize(record: dict | None) -> dict | None:
     steps = record.get("steps", []) or []
     outcome = record.get("outcome")
     rolled_back = any((s.get("detail") or {}).get("rolled_back") for s in steps)
+    failed_step = None
     if outcome == "failed":
         bad = next((s for s in steps if not s.get("ok", True)), None)
         message = (bad or {}).get("message", "")
+        if bad:
+            failed_step = {"step": bad.get("step"), "detail": bad.get("detail") or {}}
     elif steps:
         message = steps[-1].get("message", "")
     else:
@@ -161,20 +246,33 @@ def _summarize(record: dict | None) -> dict | None:
         "server_id": record.get("server_id"), "outcome": outcome,
         "timestamp": record.get("timestamp"), "steps": steps, "message": message,
         "rolled_back": rolled_back, "not_after": record.get("not_after"),
-        "serial": record.get("serial"),
+        "serial": record.get("serial"), "failed_step": failed_step,
     }
 
 
-def _rows() -> list[dict]:
+def _rows(with_served: bool = True) -> list[dict]:
     rows = []
     for s in config.load_servers():
+        issued = _cert_info(s)
+        served = _served_info(s) if with_served else {"present": False, "error": "not checked"}
         rows.append({
             "id": s.id, "name": s.name, "domain": s.domain,
             "host": s.orchestrator_host, "ca": s.acme_ca,
-            "cert": _cert_info(s), "last": _summarize(store.latest_for(s.id)),
+            "ca_env": "staging" if config.is_staging_ca(s.acme_ca) else "production",
+            "verify_ssl": s.verify_ssl,
+            "cert": issued, "served": served, "lifecycle": lifecycle(s, issued, served),
+            "ssh_problems": sshcheck.validate(s),
+            "last": _summarize(store.latest_for(s.id)),
             "renewing": _is_renewing(s.id),
         })
     return rows
+
+
+def _system() -> dict:
+    rep = preflight.run(strict=False)
+    d = rep.as_dict()
+    d["problems"] = [f.as_dict() for f in rep.findings if f.level in ("fatal", "warn")]
+    return d
 
 
 # ============================= dashboard =====================================
@@ -183,7 +281,7 @@ def index():
     rows = _rows()
     renewing_names = [r["name"] for r in rows if r["renewing"]]
     history = [_summarize(r) for r in store.all_records()[:25]]
-    return render_template("index.html", rows=rows, history=history,
+    return render_template("index.html", rows=rows, history=history, system=_system(),
                            renewing_names=renewing_names, now=_now())
 
 
@@ -197,44 +295,42 @@ def api_history():
     return jsonify([_summarize(r) for r in store.all_records()])
 
 
-@app.route("/renew/<server_id>", methods=["POST"])
-def renew(server_id: str):
+@app.route("/api/status")
+def api_status():
+    return jsonify(_system())
+
+
+def _run_in_background(server_id: str, fn, label: str):
     with _PROGRESS_LOCK:
         _IN_PROGRESS.add(server_id)
 
     def _run():
-        from .. import renew as renew_mod
         try:
             server = config.get_server(server_id)
-            renew_mod.renew_server(server, force=True)
+            fn(server)
         except Exception as exc:  # noqa: BLE001
-            log.error("force renew failed for %s: %s", server_id, exc)
+            log.error("%s failed for %s: %s", label, server_id, exc)
         finally:
+            invalidate_served_cache()
             with _PROGRESS_LOCK:
                 _IN_PROGRESS.discard(server_id)
 
     threading.Thread(target=_run, daemon=True).start()
+
+
+@app.route("/renew/<server_id>", methods=["POST"])
+def renew(server_id: str):
+    """Force renew: full pipeline, contacts the ACME CA."""
+    from .. import renew as renew_mod
+    _run_in_background(server_id, lambda s: renew_mod.renew_server(s, force=True), "force renew")
     return redirect(url_for("index"))
 
 
 @app.route("/deploy/<server_id>", methods=["POST"])
 def force_deploy(server_id: str):
-    """Re-push the on-disk cert (deploy -> restart), skipping issuance. No CA contact."""
-    with _PROGRESS_LOCK:
-        _IN_PROGRESS.add(server_id)
-
-    def _run():
-        from .. import renew as renew_mod
-        try:
-            server = config.get_server(server_id)
-            renew_mod.redeploy_server(server)
-        except Exception as exc:  # noqa: BLE001
-            log.error("force deploy failed for %s: %s", server_id, exc)
-        finally:
-            with _PROGRESS_LOCK:
-                _IN_PROGRESS.discard(server_id)
-
-    threading.Thread(target=_run, daemon=True).start()
+    """Force deploy: re-push the on-disk cert (deploy -> restart), skipping issuance. No CA contact."""
+    from .. import renew as renew_mod
+    _run_in_background(server_id, renew_mod.redeploy_server, "force deploy")
     return redirect(url_for("index"))
 
 
@@ -244,11 +340,12 @@ def _flat_from_server(s) -> dict:
     # echoed back to the browser. The template shows a "stored" hint instead.
     return {
         "id": s.id, "name": s.name, "orchestrator_host": s.orchestrator_host,
-        "domain": s.domain, "verify_ssl": s.verify_ssl, "acme_ca": s.acme_ca,
-        "acme_email": s.acme_email, "key_type": s.key_type, "dns_provider": s.dns_provider,
-        "dns_api_token": "", "ssh_user": s.ssh_user, "ssh_key_path": s.ssh_key_path,
-        "ssh_known_hosts": s.ssh_known_hosts, "ssh_port": s.ssh_port,
-        "restart_command": s.restart_command, "nginx_reload_command": s.nginx_reload_command,
+        "domain": s.domain, "verify_ssl": s.verify_ssl, "ca_bundle": s.ca_bundle,
+        "acme_ca": s.acme_ca, "acme_email": s.acme_email, "key_type": s.key_type,
+        "dns_provider": s.dns_provider, "dns_api_token": "", "ssh_user": s.ssh_user,
+        "ssh_key_path": s.ssh_key_path, "ssh_known_hosts": s.ssh_known_hosts,
+        "ssh_port": s.ssh_port, "restart_command": s.restart_command,
+        "nginx_reload_command": s.nginx_reload_command,
         "api_key_env": s.api_key_env, "api_key": "",
     }
 
@@ -256,11 +353,11 @@ def _flat_from_server(s) -> dict:
 def _flat_blank() -> dict:
     return {
         "id": "", "name": "", "orchestrator_host": "", "domain": "", "verify_ssl": False,
-        "acme_ca": "letsencrypt", "acme_email": "", "key_type": "rsa2048",
-        "dns_provider": "cloudflare", "dns_api_token": "", "ssh_user": "", "ssh_key_path": "",
-        "ssh_known_hosts": str(config.DATA_DIR / "ssh" / "known_hosts"), "ssh_port": 22,
-        "restart_command": "sudo systemctl restart --no-block gms.service",
-        "nginx_reload_command": "sudo systemctl reload nginx",
+        "ca_bundle": "", "acme_ca": "letsencrypt_test", "acme_email": "", "key_type": "rsa2048",
+        "dns_provider": "cloudflare", "dns_api_token": "", "ssh_user": "",
+        "ssh_key_path": config.DEFAULT_SSH_KEY, "ssh_known_hosts": config.DEFAULT_KNOWN_HOSTS,
+        "ssh_port": 22, "restart_command": config.DEFAULT_RESTART_COMMAND,
+        "nginx_reload_command": config.DEFAULT_NGINX_RELOAD_COMMAND,
         "api_key_env": "ORCH_API_KEY", "api_key": "",
     }
 
@@ -273,6 +370,7 @@ def _flat_from_request(f) -> dict:
         "orchestrator_host": host,
         "domain": f.get("domain", "").strip() or host,
         "verify_ssl": f.get("verify_ssl") == "on",
+        "ca_bundle": f.get("ca_bundle", "").strip(),
         "acme_ca": f.get("acme_ca", "letsencrypt").strip(),
         "acme_email": f.get("acme_email", "").strip(),
         "key_type": f.get("key_type", "rsa2048").strip(),
@@ -280,7 +378,7 @@ def _flat_from_request(f) -> dict:
         "dns_api_token": f.get("dns_api_token", "").strip(),
         "ssh_user": f.get("ssh_user", "").strip(),
         "ssh_key_path": f.get("ssh_key_path", "").strip(),
-        "ssh_known_hosts": f.get("ssh_known_hosts", "").strip(),
+        "ssh_known_hosts": f.get("ssh_known_hosts", "").strip() or config.DEFAULT_KNOWN_HOSTS,
         "ssh_port": f.get("ssh_port", "22").strip() or "22",
         "restart_command": f.get("restart_command", "").strip(),
         "nginx_reload_command": f.get("nginx_reload_command", "").strip(),
@@ -294,7 +392,7 @@ def _nest(flat: dict) -> dict:
         "id": flat["id"], "name": flat["name"] or flat["id"],
         "orchestrator_host": flat["orchestrator_host"], "domain": flat["domain"],
         "api_key_env": flat["api_key_env"], "api_key": flat["api_key"],
-        "verify_ssl": flat["verify_ssl"],
+        "verify_ssl": flat["verify_ssl"], "ca_bundle": flat["ca_bundle"],
         "acme": {"ca": flat["acme_ca"], "email": flat["acme_email"], "key_type": flat["key_type"]},
         "dns": {"provider": flat["dns_provider"], "api_token": flat["dns_api_token"]},
         "ssh": {
@@ -329,6 +427,18 @@ def _validate(flat: dict, is_new: bool) -> list[str]:
             errors.append("SSH port must be between 1 and 65535.")
     except (TypeError, ValueError):
         errors.append("SSH port must be a number.")
+        return errors
+    if flat["ca_bundle"]:
+        from pathlib import Path
+        if not Path(flat["ca_bundle"]).is_file():
+            errors.append(f"CA bundle not found at {flat['ca_bundle']} (path inside the container).")
+    if flat["orchestrator_host"]:
+        try:
+            candidate = config.server_from_dict(_nest(flat))
+        except config.ConfigError as exc:
+            errors.append(str(exc))
+        else:
+            errors.extend(f"SSH: {p}" for p in sshcheck.validate(candidate))
     return errors
 
 
@@ -338,14 +448,32 @@ def _render_form(flat, errors, is_new, existing=None, status=200):
         ca_choices=CA_CHOICES, key_choices=KEY_CHOICES,
         cf_token_set=bool(existing and existing.dns_api_token),
         api_key_set=bool(existing and existing.api_key),
+        default_key=config.DEFAULT_SSH_KEY, default_known_hosts=config.DEFAULT_KNOWN_HOSTS,
         now=_now(),
     ), status
 
 
+def _render_settings(test_result=None, test_server=None, status=200):
+    return render_template("settings.html", servers=config.load_servers(),
+                           ca_labels=dict(CA_CHOICES), system=_system(),
+                           test_result=test_result, test_server=test_server, now=_now()), status
+
+
 @app.route("/settings")
 def settings():
-    return render_template("settings.html", servers=config.load_servers(),
-                           ca_labels=dict(CA_CHOICES), now=_now())
+    return _render_settings()[0]
+
+
+@app.route("/settings/test-ssh/<server_id>", methods=["POST"])
+def settings_test_ssh(server_id: str):
+    """Authenticate over SSH and probe sudo authorization. Restarts nothing."""
+    try:
+        s = config.get_server(server_id)
+    except config.ConfigError:
+        return redirect(url_for("settings"))
+    res = sshcheck.test_connection(s)
+    log.info("ssh-test %s via web UI: %s", s.id, "ok" if res.ok else res.message)
+    return _render_settings(test_result=res.as_dict(), test_server=s)[0]
 
 
 @app.route("/settings/new")
@@ -389,7 +517,7 @@ def settings_save():
 
     server = config.server_from_dict(_nest(flat))
     config.upsert_server(server)
-    log.info("server %s saved via web UI", server.id)
+    log.info("server %s saved via web UI to %s", server.id, config.SERVERS_FILE)
     return redirect(url_for("settings"))
 
 
@@ -402,6 +530,7 @@ def settings_delete(server_id: str):
 
 def main() -> None:
     logging.basicConfig(level="INFO", format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    log.info("web UI starting; configuration file: %s", config.SERVERS_FILE)
     app.run(host="0.0.0.0", port=8080)
 
 

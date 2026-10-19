@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import socket
 import ssl
 import time
 from pathlib import Path
@@ -22,7 +23,7 @@ from pathlib import Path
 import paramiko
 from cryptography import x509
 
-from . import config, deploy
+from . import config, deploy, sshcheck
 from .models import ServerConfig, StepResult
 
 log = logging.getLogger("restart")
@@ -37,6 +38,10 @@ _ROLLBACK_POLL_TIMEOUT = 120
 
 def restart(server: ServerConfig) -> StepResult:
     """Reload so the new cert is served; verify; roll back to last-good on failure."""
+    pre = preflight(server)
+    if pre is not None:
+        return pre
+
     try:
         want_serial = _deployed_serial(server)
     except (FileNotFoundError, ValueError) as exc:
@@ -64,21 +69,36 @@ def restart(server: ServerConfig) -> StepResult:
 
 # --------------------------------------------------------------------------- apply / ssh
 
+def preflight(server: ServerConfig) -> StepResult | None:
+    """Static SSH configuration check; None when everything looks usable."""
+    problems = sshcheck.validate(server)
+    if not problems:
+        return None
+    return StepResult(STEP, ok=False,
+                      message=f"SSH configuration invalid for {server.id}: " + " | ".join(problems),
+                      detail={"phase": "preflight", "problems": problems})
+
+
 def _apply(server: ServerConfig) -> StepResult:
     client, err = _open(server)
     if err:
         return err
     try:
-        if server.restart_command:
-            rc, out, e = _run(client, server.restart_command)
+        for label, cmd in (("restart", server.restart_command),
+                           ("nginx reload", server.nginx_reload_command)):
+            if not cmd:
+                continue
+            try:
+                rc, out, e = _run(client, cmd)
+            except (paramiko.SSHException, socket.timeout, OSError) as exc:
+                return StepResult(STEP, ok=False,
+                                  message=f"{label} command could not be run over SSH: {exc}",
+                                  detail={"phase": label, "command": cmd})
             if rc != 0:
-                return StepResult(STEP, ok=False, message=f"restart command exited {rc}",
-                                  detail={"stderr": e[:2000], "stdout": out[:2000]})
-        if server.nginx_reload_command:
-            rc, out, e = _run(client, server.nginx_reload_command)
-            if rc != 0:
-                return StepResult(STEP, ok=False, message=f"nginx reload exited {rc}",
-                                  detail={"stderr": e[:2000], "stdout": out[:2000]})
+                return StepResult(STEP, ok=False,
+                                  message=f"{label} command exited {rc}: {_first_line(e or out)}",
+                                  detail={"phase": label, "command": cmd, "exit": rc,
+                                          "stderr": e[:2000], "stdout": out[:2000]})
     finally:
         client.close()
     return StepResult(STEP, ok=True, message="applied")
@@ -92,40 +112,31 @@ def _reload_nginx(server: ServerConfig) -> StepResult:
         return err
     try:
         rc, out, e = _run(client, server.nginx_reload_command)
+    except (paramiko.SSHException, socket.timeout, OSError) as exc:
+        return StepResult(STEP, ok=False, message=f"nginx reload could not be run over SSH: {exc}")
     finally:
         client.close()
     if rc != 0:
-        return StepResult(STEP, ok=False, message=f"nginx reload exited {rc}",
+        return StepResult(STEP, ok=False, message=f"nginx reload exited {rc}: {_first_line(e or out)}",
                           detail={"stderr": e[:2000]})
     return StepResult(STEP, ok=True, message="reloaded")
 
 
 def _open(server: ServerConfig):
-    """Return (client, None) or (None, StepResult-error)."""
-    known_hosts = getattr(server, "ssh_known_hosts", "") or "/data/ssh/known_hosts"
-    client = paramiko.SSHClient()
+    """Return (client, None) or (None, StepResult-error) with an operator-facing message."""
     try:
-        client.load_host_keys(known_hosts)
-    except (FileNotFoundError, OSError) as exc:
-        return None, StepResult(STEP, ok=False,
-                                message=f"known_hosts not found at {known_hosts}: {exc}")
-    client.set_missing_host_key_policy(paramiko.RejectPolicy())
-    try:
-        client.connect(hostname=server.orchestrator_host, port=server.ssh_port,
-                       username=server.ssh_user, key_filename=server.ssh_key_path,
-                       timeout=_SSH_TIMEOUT, allow_agent=False, look_for_keys=False)
-    except paramiko.SSHException as exc:
-        return None, StepResult(STEP, ok=False, message=f"SSH connect/host-key failure: {exc}")
-    except OSError as exc:
-        return None, StepResult(STEP, ok=False, message=f"SSH connection failed: {exc}")
-    return client, None
+        return sshcheck.open_client(server), None
+    except sshcheck.SSHConfigError as exc:
+        return None, StepResult(STEP, ok=False, message=str(exc), detail={"phase": "connect"})
 
 
 def _run(client: paramiko.SSHClient, cmd: str):
     log.info("restart: running %r", cmd)
-    stdin, stdout, stderr = client.exec_command(cmd, timeout=_CMD_TIMEOUT)
-    rc = stdout.channel.recv_exit_status()
-    return rc, stdout.read().decode(errors="replace").strip(), stderr.read().decode(errors="replace").strip()
+    return sshcheck.run(client, cmd, timeout=_CMD_TIMEOUT)
+
+
+def _first_line(text: str) -> str:
+    return (text or "").strip().splitlines()[0] if (text or "").strip() else "no output"
 
 
 # --------------------------------------------------------------------------- rollback

@@ -27,6 +27,8 @@ COPY app/ ./app/
 COPY config/crontab /app/crontab
 
 ENV DATA_DIR=/data \
+    CONFIG_DIR=/config \
+    SERVERS_FILE=/config/servers.json \
     PYTHONUNBUFFERED=1
 
 EXPOSE 8080

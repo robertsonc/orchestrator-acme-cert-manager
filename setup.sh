@@ -48,6 +48,7 @@ skip_remote=0
 install_sudoers=0
 start_stack=0
 ssh_tgt=""
+docker_ready=1
 
 usage() {
   cat <<EOF
@@ -189,22 +190,56 @@ install_docker() {
   fi
 }
 
+daemon_ok() { docker info >/dev/null 2>&1; }
+
+# Installed is not the same as running: a stopped daemon fails later at
+# 'docker compose up' with "Cannot connect to the Docker daemon".
+ensure_daemon() {
+  if daemon_ok; then ok "docker daemon reachable"; return 0; fi
+  if [[ $EUID -ne 0 ]] && sudo -n docker info >/dev/null 2>&1; then
+    warn "the docker daemon is running but ${USER} cannot reach the socket (not yet in the 'docker' group for this session)."
+    echo "  Run 'newgrp docker' or log out and back in, then re-run. 'sudo docker compose ...' also works meanwhile."
+    return 1
+  fi
+  warn "the docker daemon is not running"
+  if have systemctl; then
+    echo "  Starting it: systemctl enable --now docker"
+    sudo_cmd systemctl enable --now docker >/dev/null 2>&1 || true
+    local _try
+    for _try in 1 2 3 4 5; do daemon_ok && break; sleep 1; done
+    if daemon_ok; then ok "docker daemon started"; return 0; fi
+    if [[ $EUID -ne 0 ]] && sudo -n docker info >/dev/null 2>&1; then
+      warn "daemon started, but ${USER} cannot reach the socket yet. Run 'newgrp docker' or log out and back in, then re-run."
+      return 1
+    fi
+  fi
+  err "could not reach the docker daemon."
+  echo "  Check: systemctl status docker  (or: journalctl -u docker --no-pager | tail -20)"
+  echo "  If Docker came from snap: sudo snap start docker.  Docker Desktop: start it from the app."
+  echo "  Then re-run ./setup.sh, or 'docker compose up -d --build' once 'docker info' works."
+  return 1
+}
+
 ensure_docker() {
   step "Docker"
   if [[ $skip_docker -eq 1 ]]; then warn "skipping Docker check (--skip-docker)"; return; fi
-  if docker_ok; then ok "docker $(docker --version | sed 's/Docker version //') with compose plugin present"; return; fi
-  if have docker; then warn "docker is installed but the 'docker compose' plugin is missing"
-  else warn "docker is not installed"; fi
-  if ! ask "Install Docker Engine + Compose plugin from Docker's official repository now?" yes; then
-    die "Docker is required. Install it (https://docs.docker.com/engine/install/) or re-run with --skip-docker."
+  if docker_ok; then
+    ok "docker $(docker --version | sed 's/Docker version //') with compose plugin present"
+  else
+    if have docker; then warn "docker is installed but the 'docker compose' plugin is missing"
+    else warn "docker is not installed"; fi
+    if ! ask "Install Docker Engine + Compose plugin from Docker's official repository now?" yes; then
+      die "Docker is required. Install it (https://docs.docker.com/engine/install/) or re-run with --skip-docker."
+    fi
+    install_docker
+    docker_ok || die "Docker install finished but 'docker compose version' still fails"
+    ok "Docker installed: $(docker --version | sed 's/Docker version //')"
+    if [[ $EUID -ne 0 ]] && ! id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
+      sudo_cmd usermod -aG docker "$USER"
+      warn "added $USER to the 'docker' group — log out and back in (or run 'newgrp docker') before using docker without sudo"
+    fi
   fi
-  install_docker
-  docker_ok || die "Docker install finished but 'docker compose version' still fails"
-  ok "Docker installed: $(docker --version | sed 's/Docker version //')"
-  if [[ $EUID -ne 0 ]] && ! id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
-    sudo_cmd usermod -aG docker "$USER"
-    warn "added $USER to the 'docker' group — log out and back in (or run 'newgrp docker') before using docker without sudo"
-  fi
+  ensure_daemon || docker_ready=0
 }
 
 # ---- 2. directories ----------------------------------------------------------
@@ -469,9 +504,11 @@ cat <<EOF
   6. Run a STAGING renewal first, confirm 'Activation: live', then switch the CA to production.
 EOF
 [[ $remote_ok -eq 1 ]] || warn "the SSH/sudo check did not pass — activation will fail until it does (see above)"
+[[ $docker_ready -eq 1 ]] || warn "the docker daemon was not reachable — fix that before 'docker compose up' (see the Docker step above)"
 
 if [[ $start_stack -eq 1 ]]; then
   step "Starting the stack"
+  [[ $docker_ready -eq 1 ]] || die "cannot start: the docker daemon is not reachable"
   if docker compose version >/dev/null 2>&1; then docker compose up -d --build
   else sudo_cmd docker compose up -d --build; fi
 fi

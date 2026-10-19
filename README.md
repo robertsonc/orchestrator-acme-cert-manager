@@ -569,6 +569,17 @@ The Orchestrator reverse proxy answered before the GMS backend was ready (typica
 
 The appliance rejected the payload. Check the response excerpt under Diagnostics; typical causes are a key that does not match the certificate or an incomplete chain. This is not retried.
 
+### `Cannot connect to the Docker daemon at unix:///var/run/docker.sock`
+
+Docker is installed but the daemon is not running, or your user cannot reach its socket. `setup.sh` checks this (and starts the service) on every run; by hand:
+
+```bash
+sudo systemctl enable --now docker
+docker info >/dev/null && echo ok
+```
+
+`Unit docker.service not found` means Docker did not come from Docker's repository (snap: `sudo snap start docker`; Docker Desktop: start the app). `permission denied` on the socket means the `docker` group membership has not reached your session yet: `newgrp docker` or log out and back in.
+
 ### Container exits at start with `preflight FAILED`
 
 Read the `[FATAL]` lines:

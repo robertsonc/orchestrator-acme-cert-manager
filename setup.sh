@@ -41,6 +41,13 @@ ACME_EMAIL="${ACME_EMAIL:-}"
 ORCH_RESTART_CMD="${ORCH_RESTART_CMD:-/bin/systemctl restart --no-block gms.service}"
 ORCH_NGINX_RELOAD_CMD="${ORCH_NGINX_RELOAD_CMD:-/bin/systemctl reload nginx}"
 KEY_TYPE="${KEY_TYPE:-rsa}"
+LAB_CA_DOMAIN="${LAB_CA_DOMAIN:-}"
+LAB_CA_HOST="${LAB_CA_HOST:-}"
+LAB_CA_NAME="${LAB_CA_NAME:-}"        # empty = unspecified: taken from an existing CA, else "Lab CA"
+LAB_CA_PORT="${LAB_CA_PORT:-}"        # empty = unspecified: taken from an existing CA, else 9000
+LAB_CA_IMAGE="${LAB_CA_IMAGE:-smallstep/step-ca:0.30.2}"
+with_ca=0
+rotate_root=0
 non_interactive=0
 trust_host_key=0
 skip_docker=0
@@ -64,6 +71,19 @@ Target:
   --email EMAIL          ACME account email (required to write servers.json)
   --key-type rsa|ed25519 SSH key type to generate (default: rsa, 4096 bit — tested against Orchestrator)
 
+Bundled lab CA (optional):
+  --with-ca              Initialise the bundled step-ca (ACME DNS-01 + CRL) under ./data/pki and enable
+                         the 'lab-ca' compose profile. Requires a reachable Docker daemon.
+  --lab-domain DOMAIN    DNS domain the lab CA may issue for (name constraint), e.g. lab.example.net
+  --ca-host HOST         The CA's own hostname (default: ca.<lab-domain>); needs a DNS record to this host
+  --ca-name NAME         Display name of the CA (default: "Lab CA")
+  --rotate-root          Retire the current lab CA root and build a new one with the same identity.
+                         The old root stays trusted for API calls (data/pki/certs/retired/) until you
+                         Force renew every lab-CA server and delete it. See README "Root rollover".
+  --ca-port PORT         Port step-ca listens on, inside and outside the container (default: 9000)
+                         On a re-run, values you do not pass are taken from the initialised CA; values
+                         you do pass must match it (a CA cannot be renamed in place).
+
 Behaviour:
   --non-interactive      Never prompt. Docker install is auto-approved; anything needing a human
                          (host-key confirmation without --trust-host-key, password-based key install)
@@ -79,6 +99,7 @@ Behaviour:
 
 Environment equivalents: ORCH_HOST ORCH_DOMAIN ORCH_SSH_USER ORCH_SSH_PORT ORCH_SERVER_ID
                          ORCH_SERVER_NAME ACME_EMAIL ORCH_RESTART_CMD ORCH_NGINX_RELOAD_CMD KEY_TYPE
+                         LAB_CA_DOMAIN LAB_CA_HOST LAB_CA_NAME LAB_CA_PORT LAB_CA_IMAGE
 EOF
 }
 
@@ -92,6 +113,12 @@ while [[ $# -gt 0 ]]; do
     --name) ORCH_SERVER_NAME="$2"; shift 2 ;;
     --email) ACME_EMAIL="$2"; shift 2 ;;
     --key-type) KEY_TYPE="$2"; shift 2 ;;
+    --with-ca) with_ca=1; shift ;;
+    --rotate-root) with_ca=1; rotate_root=1; shift ;;
+    --lab-domain) LAB_CA_DOMAIN="$2"; shift 2 ;;
+    --ca-host) LAB_CA_HOST="$2"; shift 2 ;;
+    --ca-name) LAB_CA_NAME="$2"; shift 2 ;;
+    --ca-port) LAB_CA_PORT="$2"; shift 2 ;;
     --non-interactive) non_interactive=1; shift ;;
     --trust-host-key) trust_host_key=1; shift ;;
     --install-sudoers) install_sudoers=1; shift ;;
@@ -290,6 +317,116 @@ ensure_env() {
   fi
 }
 
+set_env_kv() {
+  local key="$1" val="$2" f="${here}/.env"
+  if grep -q "^#\?${key}=" "$f"; then
+    sed -i "s|^#\?${key}=.*|${key}=${val}|" "$f"
+  else
+    printf '%s=%s\n' "$key" "$val" >> "$f"
+  fi
+}
+
+# ---- 4b. bundled lab CA -------------------------------------------------------
+read_meta() { local key="$1" f="$2"; grep -E "^${key}=" "$f" 2>/dev/null | head -1 | cut -d= -f2-; }
+
+ensure_lab_ca() {
+  step "Bundled lab CA (step-ca)"
+  local pki="${data}/pki" offline="${data}/pki-root" meta="${data}/pki/config/lab-ca.meta" dcmd
+  if docker info >/dev/null 2>&1; then dcmd="docker"
+  elif [[ $EUID -ne 0 ]] && sudo -n docker info >/dev/null 2>&1; then dcmd="sudo docker"
+  else die "the lab CA is initialised inside the step-ca image, which needs a reachable Docker daemon (see the Docker step above; or re-run after 'docker info' works)"; fi
+
+  # An existing CA has an identity; arguments that differ from it are an error, absent ones are filled in.
+  if [[ -f "$meta" ]]; then
+    local s_host s_dom s_port s_name
+    s_host="$(read_meta LAB_CA_HOST "$meta")"; s_dom="$(read_meta LAB_CA_DOMAIN "$meta")"
+    s_port="$(read_meta LAB_CA_PORT "$meta")"; s_name="$(read_meta LAB_CA_NAME "$meta")"
+    local drift=0
+    [[ -z "$LAB_CA_DOMAIN" || "$LAB_CA_DOMAIN" == "$s_dom" ]]  || { err "--lab-domain '$LAB_CA_DOMAIN' differs from the initialised CA ('$s_dom')"; drift=1; }
+    [[ -z "$LAB_CA_HOST"   || "$LAB_CA_HOST"   == "$s_host" ]] || { err "--ca-host '$LAB_CA_HOST' differs from the initialised CA ('$s_host')"; drift=1; }
+    [[ -z "$LAB_CA_PORT"   || "$LAB_CA_PORT"   == "$s_port" ]] || { err "--ca-port '$LAB_CA_PORT' differs from the initialised CA ('$s_port')"; drift=1; }
+    [[ -z "$LAB_CA_NAME"   || "$LAB_CA_NAME"   == "$s_name" ]] || { err "--ca-name '$LAB_CA_NAME' differs from the initialised CA ('$s_name')"; drift=1; }
+    if [[ $drift -eq 1 ]]; then
+      die "a CA cannot be renamed in place. To rebuild: docker compose stop lab-ca; move ${pki} aside (and ${offline} for a new root); re-run; re-distribute the root to every client."
+    fi
+    LAB_CA_DOMAIN="$s_dom"; LAB_CA_HOST="$s_host"; LAB_CA_PORT="$s_port"; LAB_CA_NAME="$s_name"
+  else
+    [[ -n "$LAB_CA_DOMAIN" ]] || die "--with-ca needs --lab-domain <dns-domain the CA may issue for>"
+    [[ -n "$LAB_CA_HOST" ]] || LAB_CA_HOST="ca.${LAB_CA_DOMAIN}"
+    [[ -n "$LAB_CA_PORT" ]] || LAB_CA_PORT=9000
+    [[ -n "$LAB_CA_NAME" ]] || LAB_CA_NAME="Lab CA"
+  fi
+  [[ "$LAB_CA_DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] || die "invalid --lab-domain '${LAB_CA_DOMAIN}'"
+  [[ "$LAB_CA_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || die "invalid --ca-host '${LAB_CA_HOST}'"
+  [[ "$LAB_CA_HOST" == *".${LAB_CA_DOMAIN}" ]] || die "--ca-host must be a name under --lab-domain (the CA's own certificate is name-constrained)"
+  [[ "$LAB_CA_PORT" =~ ^[0-9]+$ && $LAB_CA_PORT -ge 1 && $LAB_CA_PORT -le 65535 ]] || die "invalid --ca-port '${LAB_CA_PORT}'"
+  [[ "$LAB_CA_NAME" != *'"'* && "$LAB_CA_NAME" != *'\'* ]] || die "--ca-name may not contain quotes or backslashes"
+
+  if [[ $rotate_root -eq 1 ]]; then
+    [[ -f "$meta" && -f "${pki}/certs/root_ca.crt" ]] || die "--rotate-root needs an initialised lab CA in ${pki}"
+    local ts old_fp
+    ts="$(date -u +%Y%m%dT%H%M%SZ)"
+    old_fp="$(openssl x509 -in "${pki}/certs/root_ca.crt" -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//; s/://g' | tr 'A-F' 'a-f')"
+    [[ -n "$old_fp" ]] || old_fp="$ts"
+    echo "  Retiring root ${old_fp}"
+    if [[ $non_interactive -eq 0 ]]; then
+      ask "Stop lab-ca, move ${pki} and ${offline} aside, build a NEW root and intermediate with the same identity, and keep the old root trusted for API calls until you re-issue every lab-CA server?" \
+        || die "root rollover cancelled"
+    fi
+    $dcmd compose stop lab-ca >/dev/null 2>&1 || true
+    mv "$pki" "${pki}.retired-${ts}"
+    [[ -d "$offline" ]] && mv "$offline" "${offline}.retired-${ts}"
+    mkdir -p "${pki}/certs/retired"
+    cp "${pki}.retired-${ts}/certs/root_ca.crt" "${pki}/certs/retired/root-${old_fp}.crt"
+    chmod 644 "${pki}/certs/retired/root-${old_fp}.crt"
+    ok "old root kept as ${pki}/certs/retired/root-${old_fp}.crt; previous state in ${pki}.retired-${ts} and ${offline}.retired-${ts}"
+  fi
+  mkdir -p "${pki}/certs" "${pki}/secrets" "${pki}/config" "${pki}/db" "$offline"
+  chmod 700 "${pki}/secrets" "$offline"
+  local uid gid; uid="$(id -u)"; gid="$(id -g)"
+  echo "  ${LAB_CA_IMAGE}: CA host ${LAB_CA_HOST}:${LAB_CA_PORT}, issuing scope .${LAB_CA_DOMAIN}"
+  $dcmd run --rm --entrypoint bash -u "${uid}:${gid}" \
+    -e STEPPATH=/home/step -e HOME=/home/step -e OFFLINE=/root-offline \
+    -e LAB_CA_NAME="$LAB_CA_NAME" -e LAB_CA_HOST="$LAB_CA_HOST" -e LAB_CA_DOMAIN="$LAB_CA_DOMAIN" -e LAB_CA_PORT="$LAB_CA_PORT" \
+    -v "${pki}:/home/step" -v "${offline}:/root-offline" -v "${here}/pki:/pki-init:ro" \
+    "$LAB_CA_IMAGE" /pki-init/lab-ca-init.sh || die "lab CA initialisation failed (see above)"
+  [[ -f "${pki}/secrets/root_ca_key" ]] && die "the root key is present in the ONLINE volume (${pki}/secrets/root_ca_key); move it to ${offline} with its password before starting the service"
+  [[ -f "${pki}/certs/root-key-offline" ]] || warn "marker ${pki}/certs/root-key-offline missing; this CA was initialised by an older script — verify the root key is not under ${pki}/secrets"
+  ok "lab CA ready in ${pki}; online private key: intermediate only"
+
+  set_env_kv COMPOSE_PROFILES lab-ca
+  set_env_kv LAB_CA_DOMAIN "$LAB_CA_DOMAIN"
+  set_env_kv LAB_CA_HOST "$LAB_CA_HOST"
+  set_env_kv LAB_CA_PORT "$LAB_CA_PORT"
+  set_env_kv LAB_CA_UID "$uid"
+  set_env_kv LAB_CA_GID "$gid"
+  ok ".env: COMPOSE_PROFILES=lab-ca, LAB_CA_HOST=${LAB_CA_HOST}, LAB_CA_DOMAIN=${LAB_CA_DOMAIN}, LAB_CA_PORT=${LAB_CA_PORT}"
+  local fp="(see ${pki}/certs/root_ca.fingerprint)"
+  [[ -f "${pki}/certs/root_ca.fingerprint" ]] && fp="$(cat "${pki}/certs/root_ca.fingerprint")"
+  cat <<EOF
+  Root CA fingerprint (SHA-256): ${fp}
+  REQUIRED BEFORE ANY CLIENT TRUSTS THIS ROOT:
+    1. Move ${offline} (root_ca_key + root_password) off this host to offline storage. It is not
+       mounted into any container and the running CA does not need it; only a future intermediate
+       re-issue does. Keep the password with the key.
+    2. Confirm the fingerprint above out of band on each client before installing the root.
+  DNS: ${LAB_CA_HOST} -> this host's private address (Cloudflare, DNS-only). Clients and this tool reach
+       the CA as https://${LAB_CA_HOST}:${LAB_CA_PORT}; every leaf carries CRL https://${LAB_CA_HOST}:${LAB_CA_PORT}/1.0/crl
+  Root download: https://${LAB_CA_HOST}:${LAB_CA_PORT}/roots.pem
+EOF
+  if [[ $rotate_root -eq 1 ]]; then
+    cat <<EOF
+  ROOT ROLLOVER IN PROGRESS:
+    1. docker compose up -d lab-ca            (new CA; appliances still serve leaves from the old root)
+    2. Distribute the NEW root to every client (fingerprint above).
+    3. Force renew every server that uses the Lab CA; API calls keep verifying because the old root
+       is still trusted from ${pki}/certs/retired/.
+    4. When every lab-CA server shows Activation: live with the new issuer, delete ${pki}/certs/retired/*
+       and remove the old root from client trust stores. The dashboard warns until the retired root is gone.
+EOF
+  fi
+}
+
 ensure_servers_json() {
   step "Server configuration"
   local f="${cfg}/servers.json"
@@ -474,6 +611,7 @@ fi
 [[ -n "$ORCH_DOMAIN" ]] || ORCH_DOMAIN="$ORCH_HOST"
 
 ensure_env
+if [[ $with_ca -eq 1 ]]; then ensure_lab_ca; fi
 remote_ok=1
 if [[ -z "$ORCH_HOST" ]]; then
   warn "no Orchestrator host given — skipping config generation and remote steps (re-run with --host)"
@@ -503,6 +641,10 @@ cat <<EOF
   5. Tunnel to the UI: ssh -L 8090:localhost:8090 <user>@<this-host>  →  http://localhost:8090
   6. Run a STAGING renewal first, confirm 'Activation: live', then switch the CA to production.
 EOF
+if [[ $with_ca -eq 1 ]]; then
+  echo "  7. Lab CA: move ${data}/pki-root offline, distribute the root (README: 'Bundled lab CA'), then pick 'Lab CA' as the server's CA."
+  echo "     Check it from inside the container: docker compose exec -T orchestrator-acme-cert-manager python -m app.cli ca-info"
+fi
 [[ $remote_ok -eq 1 ]] || warn "the SSH/sudo check did not pass — activation will fail until it does (see above)"
 [[ $docker_ready -eq 1 ]] || warn "the docker daemon was not reachable — fix that before 'docker compose up' (see the Docker step above)"
 

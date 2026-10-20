@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  STEP_CLI_VERSION: "0.31.0"
+  STEP_CA_IMAGE: "smallstep/step-ca:0.30.2"
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -13,12 +17,80 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install the pinned step CLI (the lab CA tests run it natively)
+        run: |
+          curl -fsSL -o /tmp/step.tgz "https://github.com/smallstep/cli/releases/download/v${STEP_CLI_VERSION}/step_linux_${STEP_CLI_VERSION}_amd64.tar.gz"
+          tar -xzf /tmp/step.tgz -C /tmp
+          sudo install -m 0755 "/tmp/step_${STEP_CLI_VERSION}/bin/step" /usr/local/bin/step
+          step version
       - run: pip install -r requirements.txt -r requirements-dev.txt
       - run: python -m compileall -q app
       - run: python -m pytest -q
+        env:
+          REQUIRE_STEP_CLI: "1"   # the native lab CA tests must run, not skip
+
   shell:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-      - run: bash -n setup.sh app/entrypoint.sh && shellcheck -S warning setup.sh
+      - run: bash -n setup.sh app/entrypoint.sh pki/lab-ca-init.sh && shellcheck -S warning setup.sh pki/lab-ca-init.sh
+
+  lab-ca-smoke:
+    # Starts the real step-ca container the way setup.sh does: init on a
+    # non-default port with the root kept offline, bring the service up with the
+    # compose profile, wait for the health check, hit the ACME directory and
+    # the CRL by the CA's constrained name. No ACME issuance (needs DNS-01).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialise the lab CA in the pinned image
+        run: |
+          set -euo pipefail
+          mkdir -p data/pki data/pki-root data/certs data/logs data/ssh config
+          chmod 700 data/pki-root
+          docker run --rm --entrypoint bash -u "$(id -u):$(id -g)" \
+            -e STEPPATH=/home/step -e HOME=/home/step -e OFFLINE=/root-offline \
+            -e LAB_CA_NAME="Lab CA" -e LAB_CA_HOST=ca.lab.example.net -e LAB_CA_DOMAIN=lab.example.net -e LAB_CA_PORT=9443 \
+            -v "$PWD/data/pki:/home/step" -v "$PWD/data/pki-root:/root-offline" -v "$PWD/pki:/pki-init:ro" \
+            "$STEP_CA_IMAGE" /pki-init/lab-ca-init.sh
+          test ! -e data/pki/secrets/root_ca_key
+          test -f data/pki-root/root_ca_key
+          test -f data/pki/certs/root-key-offline
+          grep -q '^LAB_CA_PORT=9443$' data/pki/config/lab-ca.meta
+          grep -q '"idpURL": "https://ca.lab.example.net:9443/1.0/crl"' data/pki/config/ca.json
+      - name: Re-run is a no-op; drift is refused
+        run: |
+          set -euo pipefail
+          run() { docker run --rm --entrypoint bash -u "$(id -u):$(id -g)" -e STEPPATH=/home/step -e HOME=/home/step -e OFFLINE=/root-offline \
+                    -e LAB_CA_NAME="Lab CA" -e LAB_CA_HOST="$1" -e LAB_CA_DOMAIN="$2" -e LAB_CA_PORT="$3" \
+                    -v "$PWD/data/pki:/home/step" -v "$PWD/data/pki-root:/root-offline" -v "$PWD/pki:/pki-init:ro" "$STEP_CA_IMAGE" /pki-init/lab-ca-init.sh; }
+          run ca.lab.example.net lab.example.net 9443 | grep -q "nothing to do"
+          if run ca.other.example.net other.example.net 9443; then echo "drift was not refused"; exit 1; fi
+      - name: Start the service and wait for a healthy container
+        run: |
+          set -euo pipefail
+          cp .env.example .env
+          printf 'COMPOSE_PROFILES=lab-ca\nLAB_CA_HOST=ca.lab.example.net\nLAB_CA_DOMAIN=lab.example.net\nLAB_CA_PORT=9443\nLAB_CA_UID=%s\nLAB_CA_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
+          docker compose up -d lab-ca
+          for _ in $(seq 1 40); do
+            s="$(docker inspect --format '{{.State.Health.Status}}' lab-ca)"
+            [ "$s" = "healthy" ] && break
+            sleep 3
+          done
+          docker inspect --format '{{.State.Health.Status}}' lab-ca | tee /dev/stderr | grep -qx healthy
+      - name: ACME directory, root and CRL by the constrained name on port 9443
+        run: |
+          set -euo pipefail
+          echo "127.0.0.1 ca.lab.example.net" | sudo tee -a /etc/hosts >/dev/null
+          curl -fsS --cacert data/pki/certs/root_ca.crt https://ca.lab.example.net:9443/acme/lab/directory | grep -q newOrder
+          curl -fsS --cacert data/pki/certs/root_ca.crt https://ca.lab.example.net:9443/roots.pem | grep -q 'BEGIN CERTIFICATE'
+          curl -fsS --cacert data/pki/certs/root_ca.crt -o /tmp/crl.der https://ca.lab.example.net:9443/1.0/crl
+          openssl crl -inform DER -in /tmp/crl.der -noout -issuer
+          openssl x509 -in data/pki/certs/intermediate_ca.crt -noout -text | grep -A2 'Name Constraints'
+      - name: Logs on failure
+        if: failure()
+        run: |
+          docker logs lab-ca 2>&1 | tail -50 || true
+          ls -la data/pki data/pki/config data/pki/secrets data/pki-root 2>/dev/null || true
+          sed -n '1,12p' data/pki/config/ca.json 2>/dev/null || true

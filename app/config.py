@@ -35,6 +35,17 @@ DEFAULT_NGINX_RELOAD_COMMAND = "sudo /bin/systemctl reload nginx"
 
 CF_TOKEN_ENV = "CF_DNS_API_TOKEN"  # env var Lego reads for the Cloudflare DNS-01 challenge
 
+# Bundled lab CA (step-ca), optional. See README "Bundled lab CA".
+LAB_CA_ID = "lab"                                  # acme.ca value that selects it
+LAB_CA_HOST = os.environ.get("LAB_CA_HOST", "")
+LAB_CA_PORT = int(os.environ.get("LAB_CA_PORT", "9000") or 9000)   # step-ca listens on this port inside and outside
+LAB_CA_PROVISIONER = "lab"   # fixed: created by pki/lab-ca-init.sh; not configurable (see README)
+LAB_CA_CERTS_DIR = Path(os.environ.get("LAB_CA_CERTS_DIR", str(DATA_DIR / "pki" / "certs")))
+LAB_CA_ROOT = LAB_CA_CERTS_DIR / "root_ca.crt"
+LAB_CA_INTERMEDIATE = LAB_CA_CERTS_DIR / "intermediate_ca.crt"
+LAB_CA_OFFLINE_MARKER = LAB_CA_CERTS_DIR / "root-key-offline"   # written by lab-ca-init.sh
+LAB_CA_RETIRED_DIR = LAB_CA_CERTS_DIR / "retired"   # previous roots kept in API trust during a root rollover
+
 
 class ConfigError(Exception):
     pass
@@ -65,6 +76,7 @@ def _one(s: dict) -> ServerConfig:
             api_key=s.get("api_key", ""),
             verify_ssl=bool(s.get("verify_ssl", False)),
             ca_bundle=(s.get("ca_bundle") or "").strip(),
+            ca_bundle_mode=(s.get("ca_bundle_mode") or "exclusive").strip().lower(),
         )
     except KeyError as exc:
         raise ConfigError(f"server entry missing required field: {exc}") from exc
@@ -83,6 +95,7 @@ def _to_dict(s: ServerConfig) -> dict:
         "api_key": s.api_key,
         "verify_ssl": s.verify_ssl,
         "ca_bundle": s.ca_bundle,
+        "ca_bundle_mode": s.ca_bundle_mode,
         "acme": {"ca": s.acme_ca, "email": s.acme_email, "key_type": s.key_type},
         "dns": {"provider": s.dns_provider, "api_token": s.dns_api_token},
         "ssh": {
@@ -211,3 +224,134 @@ def leaf_path_for(server: ServerConfig) -> Path:
 def is_staging_ca(acme_ca: str) -> bool:
     ca = (acme_ca or "").strip().lower()
     return ca == "letsencrypt_test" or "staging" in ca
+
+
+def is_lab_ca(acme_ca: str) -> bool:
+    return (acme_ca or "").strip().lower() == LAB_CA_ID
+
+
+def ca_environment(acme_ca: str) -> str:
+    """'lab' | 'staging' | 'production' for a configured acme.ca value."""
+    if is_lab_ca(acme_ca):
+        return "lab"
+    return "staging" if is_staging_ca(acme_ca) else "production"
+
+
+def lab_ca_base_url() -> str:
+    return f"https://{LAB_CA_HOST}:{LAB_CA_PORT}" if LAB_CA_HOST else ""
+
+
+def lab_ca_acme_url() -> str:
+    """ACME directory of the bundled CA, or '' when it is not configured."""
+    base = lab_ca_base_url()
+    return f"{base}/acme/{LAB_CA_PROVISIONER}/directory" if base else ""
+
+
+def lab_ca_available() -> bool:
+    return bool(LAB_CA_HOST) and LAB_CA_ROOT.is_file()
+
+
+_LAB_ISSUERS: tuple[float, frozenset[str]] = (-1.0, frozenset())
+
+
+def lab_ca_issuer_names() -> frozenset[str]:
+    """RFC 4514 subject names of the lab root, intermediate and retired roots (cached by mtime).
+
+    A certificate whose issuer is one of these was issued by the lab CA.
+    """
+    global _LAB_ISSUERS
+    files = [f for f in (LAB_CA_ROOT, LAB_CA_INTERMEDIATE) if f.is_file()]
+    if LAB_CA_RETIRED_DIR.is_dir():
+        files.extend(sorted(f for f in LAB_CA_RETIRED_DIR.glob("*.crt") if f.is_file()))
+    if not files:
+        return frozenset()
+    stamp = max(f.stat().st_mtime for f in files)
+    if stamp == _LAB_ISSUERS[0]:
+        return _LAB_ISSUERS[1]
+    from cryptography import x509  # lazy import
+    names = set()
+    for f in files:
+        try:
+            names.add(x509.load_pem_x509_certificate(f.read_bytes()).subject.rfc4514_string())
+        except (ValueError, OSError):
+            continue
+    _LAB_ISSUERS = (stamp, frozenset(names))
+    return _LAB_ISSUERS[1]
+
+
+TRUST_DIR = CONFIG_DIR / "trust"
+CA_BUNDLE_MODES = ("exclusive", "additive")
+_TRUST_LOCK = __import__("threading").Lock()
+
+
+def api_trust_bundle(ca_bundle: str = "", mode: str = "exclusive") -> str | bool:
+    """Trust material for verified Orchestrator API calls.
+
+    * ca_bundle set, mode "exclusive" (default): that file is the ONLY trust, as
+      before the lab CA existed. A missing file is a ConfigError, never a
+      fallback to broader trust.
+    * ca_bundle set, mode "additive": system (certifi) roots + lab root + the
+      bundle, for operators who want a private CA *and* public/lab transitions.
+    * no ca_bundle: system roots + the lab root when the lab CA is configured,
+      so public<->lab migrations and rollback keep verifying; plain system trust
+      (True) when the lab CA is not configured.
+
+    Combined bundles are immutable files named by content digest and written
+    atomically, so concurrent deployments with different inputs never share or
+    truncate each other's file.
+    """
+    extras: list[Path] = []
+    if ca_bundle:
+        p = Path(ca_bundle)
+        if not p.is_file():
+            raise ConfigError(f"ca_bundle {ca_bundle} is not readable; refusing to fall back to broader trust")
+        if mode not in CA_BUNDLE_MODES:
+            raise ConfigError(f"ca_bundle_mode must be one of {CA_BUNDLE_MODES}, got {mode!r}")
+        if mode == "exclusive":
+            return str(p)
+        extras.append(p)
+    if LAB_CA_HOST:
+        # Lab trust is configured: its root is a required anchor, never a
+        # silently-dropped one. A missing/unreadable root fails closed.
+        if not LAB_CA_ROOT.is_file() or not os.access(LAB_CA_ROOT, os.R_OK):
+            raise ConfigError(
+                f"LAB_CA_HOST is set but the lab root {LAB_CA_ROOT} is missing or unreadable; refusing "
+                f"to fall back to public trust. Mount ./data/pki/certs (compose does) and run "
+                f"./setup.sh --with-ca, or unset LAB_CA_HOST if the lab CA is not in use.")
+        extras.append(LAB_CA_ROOT)
+        # During a root rollover the appliances still serve leaves from the previous
+        # root; keep those roots trusted until every target has been re-issued.
+        if LAB_CA_RETIRED_DIR.is_dir():
+            extras.extend(sorted(f for f in LAB_CA_RETIRED_DIR.glob("*.crt") if f.is_file()))
+    if not extras:
+        return True
+    try:
+        import certifi
+        system = Path(certifi.where())
+    except ImportError:  # pragma: no cover
+        system = None
+    parts = ([system] if system and system.is_file() else []) + extras
+    data = b"".join(f.read_bytes().rstrip(b"\n") + b"\n" for f in parts)
+    import hashlib
+    digest = hashlib.sha256(data).hexdigest()[:24]
+    out = TRUST_DIR / f"api-trust-{digest}.pem"
+    if out.is_file():
+        return str(out)
+    with _TRUST_LOCK:
+        if out.is_file():
+            return str(out)
+        TRUST_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = TRUST_DIR / f".{out.name}.{os.getpid()}.tmp"
+        tmp.write_bytes(data)
+        os.replace(tmp, out)          # atomic: readers see either nothing or the whole file
+    return str(out)
+
+
+def lab_ca_root_fingerprint() -> str:
+    """SHA-256 of the root certificate in DER form (same value `step certificate fingerprint` prints)."""
+    if not LAB_CA_ROOT.is_file():
+        return ""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    cert = x509.load_pem_x509_certificate(LAB_CA_ROOT.read_bytes())
+    return cert.fingerprint(hashes.SHA256()).hex()

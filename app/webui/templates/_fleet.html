@@ -98,6 +98,9 @@
         {% if system.config_mounted %}<span class="check good"><span class="g">●</span>bind-mounted</span>
         {% elif system.config_mounted is sameas false %}<span class="check bad"><span class="g">✕</span>not mounted</span>
         {% else %}<span class="muted">n/a outside a container</span>{% endif %}</span>
+      {% if system.lab_ca and system.lab_ca.configured %}
+      <span>lab CA <span class="mono">{{ system.lab_ca.url }}</span> <span class="muted">root sha256</span> <span class="mono" title="{{ system.lab_ca.fingerprint }}">{{ system.lab_ca.fingerprint[:16] }}…</span></span>
+      {% endif %}
     </div>
   </div>
 </div>

@@ -92,7 +92,14 @@ def deploy_paths(server: ServerConfig, cert_file: Path, key_file: Path, ca_file:
     }
     headers = {"Content-Type": "application/json", "X-Auth-Token": api_key}
     base_url = server.base_url
-    verify = server.requests_verify
+    # Verified calls trust system roots + the lab root + the server's ca_bundle
+    # together, independent of which CA is *configured*: during a migration or a
+    # rollback the appliance still serves the previous CA's certificate.
+    try:
+        verify = (config.api_trust_bundle(server.ca_bundle, server.ca_bundle_mode)
+                  if server.verify_ssl else False)
+    except config.ConfigError as exc:
+        return StepResult(STEP, ok=False, message=str(exc), detail={"phase": "prepare", "kind": "config"})
 
     if verify is False:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)

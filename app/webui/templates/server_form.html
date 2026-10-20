@@ -59,7 +59,7 @@
           <select id="acme_ca" name="acme_ca">
             {% for value, label in ca_choices %}<option value="{{ value }}" {% if form.acme_ca == value %}selected{% endif %}>{{ label }}</option>{% endfor %}
           </select>
-          <p class="hint">Staging has high rate limits but issues browser-untrusted certs. Test there, then switch to production.</p>
+          <p class="hint">Staging has high rate limits but issues browser-untrusted certs. Test there, then switch to production. <strong>Lab CA</strong> issues from the bundled step-ca (DNS-01 via Cloudflare, names under the lab domain only); clients must trust its root.</p>
         </div>
         <div class="field">
           <label for="key_type">Key type</label>

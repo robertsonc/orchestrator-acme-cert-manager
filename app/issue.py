@@ -70,6 +70,14 @@ def issue_or_renew(server: ServerConfig, force: bool = False) -> StepResult:
             message=f"acme.email is not set for server {server.id!r}.",
         )
 
+    if config.is_lab_ca(server.acme_ca) and not config.lab_ca_available():
+        return StepResult(
+            step=STEP, ok=False,
+            message=("The bundled lab CA is selected but is not configured: run "
+                     "./setup.sh --with-ca --lab-domain <zone> (needs LAB_CA_HOST and the root at "
+                     f"{config.LAB_CA_ROOT})."),
+        )
+
     acme_url = _acme_url(server)
     cert_dir = config.cert_dir_for(server)                 # lego state + flattened files live here
     lego_cert = cert_dir / "certificates" / f"{server.domain}.crt"
@@ -106,8 +114,7 @@ def issue_or_renew(server: ServerConfig, force: bool = False) -> StepResult:
 
     # Inject the resolved Cloudflare token so Lego's DNS-01 provider can see it,
     # regardless of whether it came from the server config or the environment.
-    env = os.environ.copy()
-    env[CF_TOKEN_ENV] = cf_token
+    env = lego_environment(server, cf_token)
 
     log.info("lego %s for %s (%s)", action, server.domain, acme_url)
     try:
@@ -167,7 +174,19 @@ def issue_or_renew(server: ServerConfig, force: bool = False) -> StepResult:
 
 def _acme_url(server: ServerConfig) -> str:
     ca = (server.acme_ca or "letsencrypt").strip()
+    if config.is_lab_ca(ca):
+        return config.lab_ca_acme_url()
     return ca if ca.startswith("http") else _ACME_URLS.get(ca, _ACME_URLS["letsencrypt"])
+
+
+def lego_environment(server: ServerConfig, cf_token: str) -> dict[str, str]:
+    """Environment for the Lego subprocess: DNS credentials plus, for the bundled
+    lab CA, the root certificate Lego must trust when talking to the directory."""
+    env = os.environ.copy()
+    env[CF_TOKEN_ENV] = cf_token
+    if config.is_lab_ca(server.acme_ca):
+        env["LEGO_CA_CERTIFICATES"] = str(config.LAB_CA_ROOT)
+    return env
 
 
 def _flatten(cert_dir: Path, domain: str) -> tuple[Path, Path, Path]:

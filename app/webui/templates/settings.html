@@ -23,7 +23,7 @@
         <tr>
           <td><a class="primary" href="{{ url_for('server_detail', server_id=s.id) }}">{{ s.name }}</a><div class="secondary mono">{{ s.id }}</div></td>
           <td class="mono small">{{ s.orchestrator_host }}</td>
-          <td>{{ m.env_pill('staging' if s.acme_ca != 'letsencrypt' else 'production') }}</td>
+          <td>{{ m.env_pill('lab' if s.acme_ca == 'lab' else ('staging' if s.acme_ca != 'letsencrypt' else 'production')) }}</td>
           <td class="mono small">{{ s.key_type }}</td>
           <td>{% if s.dns_api_token and s.api_key %}<span class="pill quiet" title="Cloudflare token and API key stored in config">in config</span>
               {% elif s.dns_api_token or s.api_key %}<span class="pill quiet" title="One secret stored, the other from the environment">partial</span>

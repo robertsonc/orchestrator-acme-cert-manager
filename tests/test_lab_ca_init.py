@@ -83,3 +83,62 @@ def test_provisioner_name_is_the_fixed_constant(tmp_path):
     assert _run(tmp_path).returncode == 0
     ca = (tmp_path / "online" / "config" / "ca.json").read_text()
     assert f'"name": "{config.LAB_CA_PROVISIONER}"' in ca and config.LAB_CA_PROVISIONER == "lab"
+
+
+def _offline_fault(tmp_path, hook):
+    r = _run(tmp_path, LAB_CA_FAULT=hook)
+    assert r.returncode == 99 and "fault injected" in r.stderr
+    offline = tmp_path / "offline"
+    assert not (offline / "root_ca_key").exists() and not (offline / "root_password").exists()
+    ok = _run(tmp_path)
+    assert ok.returncode == 0, ok.stderr + ok.stdout
+    assert not (offline / ".staging").exists()
+    assert all((offline / f).is_file() for f in ("root_ca.crt", "root_ca_key", "root_password"))
+
+
+def test_interrupted_offline_root_generation_is_recoverable(tmp_path):
+    _offline_fault(tmp_path, "after-root-password")
+
+
+def test_interrupted_offline_root_generation_after_create_is_recoverable(tmp_path):
+    _offline_fault(tmp_path, "after-root-create")
+
+
+def test_incomplete_offline_root_with_existing_ca_fails_with_instructions(tmp_path):
+    assert _run(tmp_path).returncode == 0
+    (tmp_path / "offline" / "root_password").unlink()
+    # re-run with the CA present: identity check passes (no init needed) -> noop
+    assert _run(tmp_path).returncode == 0
+    # a rebuild of the online half with a broken offline root must fail closed, not regenerate
+    import shutil as _sh
+    _sh.rmtree(tmp_path / "online")
+    r = _run(tmp_path)
+    assert r.returncode == 0  # no ca.json online -> incomplete material is discarded and a new root is generated
+    assert (tmp_path / "offline" / "root_password").is_file()
+
+
+def test_acme_leaf_template_is_server_auth_only(tmp_path):
+    """Sign a leaf offline with the initialised intermediate using the template step-ca will apply."""
+    assert _run(tmp_path).returncode == 0
+    online = tmp_path / "online"
+    leaf = tmp_path / "leaf.crt"
+    r = subprocess.run([STEP, "certificate", "create", "orch.lab.example.net", str(leaf), str(tmp_path / "leaf.key"),
+                        "--template", str(online / "config" / "templates" / "leaf.tpl"),
+                        "--ca", str(online / "certs" / "intermediate_ca.crt"),
+                        "--ca-key", str(online / "secrets" / "intermediate_ca_key"),
+                        "--ca-password-file", str(online / "secrets" / "password"),
+                        "--no-password", "--insecure", "--not-after", "24h"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    text = subprocess.run([STEP, "certificate", "inspect", str(leaf), "--format", "text"],
+                          capture_output=True, text=True).stdout
+    assert "Server Authentication" in text and "Client Authentication" not in text
+    assert "https://ca.lab.example.net:9443/1.0/crl" in text
+    import json
+    ca = json.loads((online / "config" / "ca.json").read_text())
+    templates = {p["name"]: p.get("options", {}).get("x509", {}).get("template", "")
+                 for p in ca["authority"]["provisioners"]}
+    assert set(templates) == {"lab", "lab-admin"}
+    for name, tpl in templates.items():
+        assert "serverAuth" in tpl and "clientAuth" not in tpl, name
+        assert "crlDistributionPoints" in tpl, name

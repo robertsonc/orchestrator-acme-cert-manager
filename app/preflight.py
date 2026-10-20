@@ -161,6 +161,13 @@ def check_config_paths(strict: bool = True) -> list[Finding]:
             out.append(Finding("warn", "config-dir-readonly",
                                f"{parent} is not writable; the web UI cannot create {active.name}."))
 
+    if config.LAB_CA_HOST and config.LAB_CA_RETIRED_DIR.is_dir():
+        retired = sorted(config.LAB_CA_RETIRED_DIR.glob("*.crt"))
+        if retired:
+            out.append(Finding("warn", "lab-ca-rollover",
+                               f"root rollover in progress: {len(retired)} retired root(s) still trusted for API "
+                               f"calls ({config.LAB_CA_RETIRED_DIR}). Force renew every lab-CA server, then "
+                               f"delete the retired roots."))
     mig = _migrate_history()
     if mig:
         out.append(mig)

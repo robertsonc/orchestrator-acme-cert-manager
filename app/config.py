@@ -44,6 +44,7 @@ LAB_CA_CERTS_DIR = Path(os.environ.get("LAB_CA_CERTS_DIR", str(DATA_DIR / "pki" 
 LAB_CA_ROOT = LAB_CA_CERTS_DIR / "root_ca.crt"
 LAB_CA_INTERMEDIATE = LAB_CA_CERTS_DIR / "intermediate_ca.crt"
 LAB_CA_OFFLINE_MARKER = LAB_CA_CERTS_DIR / "root-key-offline"   # written by lab-ca-init.sh
+LAB_CA_RETIRED_DIR = LAB_CA_CERTS_DIR / "retired"   # previous roots kept in API trust during a root rollover
 
 
 class ConfigError(Exception):
@@ -254,12 +255,14 @@ _LAB_ISSUERS: tuple[float, frozenset[str]] = (-1.0, frozenset())
 
 
 def lab_ca_issuer_names() -> frozenset[str]:
-    """RFC 4514 subject names of the lab root and intermediate (cached by mtime).
+    """RFC 4514 subject names of the lab root, intermediate and retired roots (cached by mtime).
 
     A certificate whose issuer is one of these was issued by the lab CA.
     """
     global _LAB_ISSUERS
     files = [f for f in (LAB_CA_ROOT, LAB_CA_INTERMEDIATE) if f.is_file()]
+    if LAB_CA_RETIRED_DIR.is_dir():
+        files.extend(sorted(f for f in LAB_CA_RETIRED_DIR.glob("*.crt") if f.is_file()))
     if not files:
         return frozenset()
     stamp = max(f.stat().st_mtime for f in files)
@@ -307,8 +310,19 @@ def api_trust_bundle(ca_bundle: str = "", mode: str = "exclusive") -> str | bool
         if mode == "exclusive":
             return str(p)
         extras.append(p)
-    if LAB_CA_HOST and LAB_CA_ROOT.is_file():
+    if LAB_CA_HOST:
+        # Lab trust is configured: its root is a required anchor, never a
+        # silently-dropped one. A missing/unreadable root fails closed.
+        if not LAB_CA_ROOT.is_file() or not os.access(LAB_CA_ROOT, os.R_OK):
+            raise ConfigError(
+                f"LAB_CA_HOST is set but the lab root {LAB_CA_ROOT} is missing or unreadable; refusing "
+                f"to fall back to public trust. Mount ./data/pki/certs (compose does) and run "
+                f"./setup.sh --with-ca, or unset LAB_CA_HOST if the lab CA is not in use.")
         extras.append(LAB_CA_ROOT)
+        # During a root rollover the appliances still serve leaves from the previous
+        # root; keep those roots trusted until every target has been re-issued.
+        if LAB_CA_RETIRED_DIR.is_dir():
+            extras.extend(sorted(f for f in LAB_CA_RETIRED_DIR.glob("*.crt") if f.is_file()))
     if not extras:
         return True
     try:

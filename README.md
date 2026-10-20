@@ -405,7 +405,7 @@ If the Issued badge says **staging** while the server is configured for producti
 
 ## Bundled lab CA
 
-Public CAs will happily issue for a public DNS name that resolves to a private address (DNS-01 proves zone control, not reachability), and that is still the right choice for anything that should be trusted by default. The bundled CA is for the cases a public CA does not fit: names you don't want in a public zone or in certificate transparency logs, issuance you want governed locally, lab work with no internet path, and devices that enroll over EST rather than ACME (phase 2). ClearPass's EST cannot issue server certificates, which is what started this. It is a `step-ca` container next to the cert manager, issuing over ACME with the same Cloudflare DNS-01 flow this tool already uses. Install its root where you choose and lab-CA hosts get a clean padlock there. Decide which names are lab-only before distributing a trusted root; the name constraint should cover exactly those.
+Public CAs will happily issue for a public DNS name that resolves to a private address (DNS-01 proves zone control, not reachability), and that is still the right choice for anything that should be trusted by default. The bundled CA is for the cases a public CA does not fit: names you don't want in certificate transparency logs, issuance you want governed locally with your own root, and devices that enroll over EST rather than ACME (phase 2). Issuance through this tool still uses DNS-01 against Cloudflare, so the runner needs to reach the Cloudflare API and the CA must be able to validate the challenge in public DNS; hosts may be privately addressed, but an air-gapped lab or a purely private DNS zone cannot use the automatic ACME path as shipped (other DNS providers are a separate epic). ClearPass's EST cannot issue server certificates, which is what started this. It is a `step-ca` container next to the cert manager, issuing over ACME with the same Cloudflare DNS-01 flow this tool already uses. Install its root where you choose and lab-CA hosts get a clean padlock there. Decide which names are lab-only before distributing a trusted root; the name constraint should cover exactly those.
 
 ### What it is, and what keeps it lab-safe
 
@@ -464,7 +464,16 @@ A published CRL only matters on clients that fetch it. Every lab-CA leaf carries
 | Firefox | OCSP-oriented; no OCSP responder here, so revocation is generally not enforced. |
 | Browsers for Let's Encrypt | Not applicable to the lab CA. |
 
-Treat revocation as defence in depth: short lifetimes (90 days) and re-issuing after a key compromise are the controls that always work. There is no OCSP responder.
+Treat revocation as defence in depth, not as the control. Issuing a replacement does **not** cancel a stolen leaf: it keeps authenticating until it expires or until a client that checks the CRL rejects it. On a key compromise: revoke the serial (CRL regenerates), re-issue with a **new key** (Force renew always generates a new key), and assume an exposure window of up to the remaining lifetime (≤ 90 days) on any client that does not check revocation. If that window is unacceptable for a given client, make it check the CRL or shorten the leaf lifetime. There is no OCSP responder.
+
+### Root rollover
+
+Two kinds of rotation, both keep the CA's name, domain and port:
+
+- **New intermediate, same root** (no client changes): `docker compose stop lab-ca`, move `data/pki` aside, run `./setup.sh --with-ca` again. The init reuses the offline root in `data/pki-root` (put it back on the host for this one run), signs a new intermediate, and the online volume is rebuilt. Clients keep trusting the same root; re-issue servers at your leisure.
+- **New root** (`./setup.sh --rotate-root`): stops the service, moves `data/pki` and `data/pki-root` aside, copies the old root into `data/pki/certs/retired/`, and initialises a new root and intermediate with the same identity. While a retired root exists it stays in the API trust bundle, so **verified deploys and rollback keep working against appliances that still serve leaves from the old root**; the dashboard warns that a rollover is in progress. Then: `docker compose up -d lab-ca` → distribute the new root → Force renew every lab-CA server → when all show Activation live with the new issuer, delete `data/pki/certs/retired/*` and remove the old root from client trust stores. Never disable verification to get through a rollover.
+
+An interrupted root generation is safe: the root is built in a staging directory and promoted only when all three files exist; a half-written set with no CA yet is discarded and regenerated, a half-written set next to an existing CA fails with instructions to restore the missing file from your offline copy.
 
 ### Limits
 

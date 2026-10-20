@@ -25,8 +25,10 @@
 #
 # Offline directory ($OFFLINE):
 #   root_ca.crt, root_ca_key (encrypted), root_password
-#   Generated here, used once to sign the intermediate, then left for the
-#   operator to move off the host. The running CA never needs it.
+#   Generated here (staged, promoted only when all three exist), used once to
+#   sign the intermediate, then left for the operator to move off the host.
+#   The running CA never needs it. Leaves are serverAuth-only (pki/leaf.tpl);
+#   clientAuth will come from a separate, explicitly authorised provisioner.
 # =============================================================================
 set -euo pipefail
 
@@ -89,13 +91,35 @@ echo "started $(date -u +%Y-%m-%dT%H:%M:%SZ) for ${LAB_CA_HOST}:${LAB_CA_PORT}" 
 [[ -d "$OFFLINE" && -w "$OFFLINE" ]] || die "offline root directory $OFFLINE is missing or not writable" 2
 [[ -s secrets/password ]] || head -c 30 /dev/urandom | base64 | tr -d '/+=' > secrets/password
 
-if [[ -f "$OFFLINE/root_ca.crt" && -f "$OFFLINE/root_ca_key" && -s "$OFFLINE/root_password" ]]; then
+# Offline root: all three files, or none. Generated in a staging directory and
+# promoted only when complete, so an interrupted run never leaves a half root
+# that later runs trip over.
+root_present=0
+for f in root_ca.crt root_ca_key root_password; do [[ -s "$OFFLINE/$f" ]] && root_present=$((root_present + 1)); done
+STAGING="$OFFLINE/.staging"
+if [[ $root_present -eq 3 ]]; then
   echo ">> reusing the existing offline root in $OFFLINE"
-else
+elif [[ $root_present -ne 0 ]]; then
+  if [[ -f config/ca.json ]]; then
+    die "offline root material in $OFFLINE is incomplete ($root_present of 3 files: root_ca.crt, root_ca_key, root_password) while a CA already exists. Restore the missing file(s) from your offline copy; if that copy is lost, this CA cannot re-issue its intermediate and must be rebuilt (move $STEPPATH and $OFFLINE aside, re-run, re-distribute the root)." 6
+  fi
+  echo ">> offline root material in $OFFLINE is incomplete and no CA exists yet; discarding it and generating a new root"
+  rm -f "$OFFLINE/root_ca.crt" "$OFFLINE/root_ca_key" "$OFFLINE/root_password"
+  root_present=0
+fi
+if [[ $root_present -eq 0 ]]; then
   echo ">> generating the root CA in $OFFLINE (its own password; never copied online)"
-  head -c 30 /dev/urandom | base64 | tr -d '/+=' > "$OFFLINE/root_password"
-  step certificate create "$LAB_CA_NAME Root CA" "$OFFLINE/root_ca.crt" "$OFFLINE/root_ca_key" \
-    --profile root-ca --password-file "$OFFLINE/root_password" --not-after 87600h >/dev/null
+  rm -rf "$STAGING"; mkdir -p "$STAGING"
+  head -c 30 /dev/urandom | base64 | tr -d '/+=' > "$STAGING/root_password"
+  [[ "${LAB_CA_FAULT:-}" == "after-root-password" ]] && die "fault injected after root password (test hook)" 99
+  step certificate create "$LAB_CA_NAME Root CA" "$STAGING/root_ca.crt" "$STAGING/root_ca_key" \
+    --profile root-ca --password-file "$STAGING/root_password" --not-after 87600h >/dev/null
+  [[ "${LAB_CA_FAULT:-}" == "after-root-create" ]] && die "fault injected after root create (test hook)" 99
+  [[ -s "$STAGING/root_ca.crt" && -s "$STAGING/root_ca_key" && -s "$STAGING/root_password" ]] || die "root generation produced incomplete output in $STAGING" 6
+  mv "$STAGING/root_password" "$OFFLINE/root_password"
+  mv "$STAGING/root_ca_key" "$OFFLINE/root_ca_key"
+  mv "$STAGING/root_ca.crt" "$OFFLINE/root_ca.crt"
+  rmdir "$STAGING"
 fi
 
 echo ">> step ca init ($LAB_CA_NAME, https://$LAB_CA_HOST:$LAB_CA_PORT) from the offline root"

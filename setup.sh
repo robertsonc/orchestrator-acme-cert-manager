@@ -47,6 +47,7 @@ LAB_CA_NAME="${LAB_CA_NAME:-}"        # empty = unspecified: taken from an exist
 LAB_CA_PORT="${LAB_CA_PORT:-}"        # empty = unspecified: taken from an existing CA, else 9000
 LAB_CA_IMAGE="${LAB_CA_IMAGE:-smallstep/step-ca:0.30.2}"
 with_ca=0
+rotate_root=0
 non_interactive=0
 trust_host_key=0
 skip_docker=0
@@ -76,6 +77,9 @@ Bundled lab CA (optional):
   --lab-domain DOMAIN    DNS domain the lab CA may issue for (name constraint), e.g. lab.example.net
   --ca-host HOST         The CA's own hostname (default: ca.<lab-domain>); needs a DNS record to this host
   --ca-name NAME         Display name of the CA (default: "Lab CA")
+  --rotate-root          Retire the current lab CA root and build a new one with the same identity.
+                         The old root stays trusted for API calls (data/pki/certs/retired/) until you
+                         Force renew every lab-CA server and delete it. See README "Root rollover".
   --ca-port PORT         Port step-ca listens on, inside and outside the container (default: 9000)
                          On a re-run, values you do not pass are taken from the initialised CA; values
                          you do pass must match it (a CA cannot be renamed in place).
@@ -110,6 +114,7 @@ while [[ $# -gt 0 ]]; do
     --email) ACME_EMAIL="$2"; shift 2 ;;
     --key-type) KEY_TYPE="$2"; shift 2 ;;
     --with-ca) with_ca=1; shift ;;
+    --rotate-root) with_ca=1; rotate_root=1; shift ;;
     --lab-domain) LAB_CA_DOMAIN="$2"; shift 2 ;;
     --ca-host) LAB_CA_HOST="$2"; shift 2 ;;
     --ca-name) LAB_CA_NAME="$2"; shift 2 ;;
@@ -357,6 +362,25 @@ ensure_lab_ca() {
   [[ "$LAB_CA_PORT" =~ ^[0-9]+$ && $LAB_CA_PORT -ge 1 && $LAB_CA_PORT -le 65535 ]] || die "invalid --ca-port '${LAB_CA_PORT}'"
   [[ "$LAB_CA_NAME" != *'"'* && "$LAB_CA_NAME" != *'\'* ]] || die "--ca-name may not contain quotes or backslashes"
 
+  if [[ $rotate_root -eq 1 ]]; then
+    [[ -f "$meta" && -f "${pki}/certs/root_ca.crt" ]] || die "--rotate-root needs an initialised lab CA in ${pki}"
+    local ts old_fp
+    ts="$(date -u +%Y%m%dT%H%M%SZ)"
+    old_fp="$(openssl x509 -in "${pki}/certs/root_ca.crt" -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//; s/://g' | tr 'A-F' 'a-f')"
+    [[ -n "$old_fp" ]] || old_fp="$ts"
+    echo "  Retiring root ${old_fp}"
+    if [[ $non_interactive -eq 0 ]]; then
+      ask "Stop lab-ca, move ${pki} and ${offline} aside, build a NEW root and intermediate with the same identity, and keep the old root trusted for API calls until you re-issue every lab-CA server?" \
+        || die "root rollover cancelled"
+    fi
+    $dcmd compose stop lab-ca >/dev/null 2>&1 || true
+    mv "$pki" "${pki}.retired-${ts}"
+    [[ -d "$offline" ]] && mv "$offline" "${offline}.retired-${ts}"
+    mkdir -p "${pki}/certs/retired"
+    cp "${pki}.retired-${ts}/certs/root_ca.crt" "${pki}/certs/retired/root-${old_fp}.crt"
+    chmod 644 "${pki}/certs/retired/root-${old_fp}.crt"
+    ok "old root kept as ${pki}/certs/retired/root-${old_fp}.crt; previous state in ${pki}.retired-${ts} and ${offline}.retired-${ts}"
+  fi
   mkdir -p "${pki}/certs" "${pki}/secrets" "${pki}/config" "${pki}/db" "$offline"
   chmod 700 "${pki}/secrets" "$offline"
   local uid gid; uid="$(id -u)"; gid="$(id -g)"
@@ -390,6 +414,17 @@ ensure_lab_ca() {
        the CA as https://${LAB_CA_HOST}:${LAB_CA_PORT}; every leaf carries CRL https://${LAB_CA_HOST}:${LAB_CA_PORT}/1.0/crl
   Root download: https://${LAB_CA_HOST}:${LAB_CA_PORT}/roots.pem
 EOF
+  if [[ $rotate_root -eq 1 ]]; then
+    cat <<EOF
+  ROOT ROLLOVER IN PROGRESS:
+    1. docker compose up -d lab-ca            (new CA; appliances still serve leaves from the old root)
+    2. Distribute the NEW root to every client (fingerprint above).
+    3. Force renew every server that uses the Lab CA; API calls keep verifying because the old root
+       is still trusted from ${pki}/certs/retired/.
+    4. When every lab-CA server shows Activation: live with the new issuer, delete ${pki}/certs/retired/*
+       and remove the old root from client trust stores. The dashboard warns until the retired root is gone.
+EOF
+  fi
 }
 
 ensure_servers_json() {

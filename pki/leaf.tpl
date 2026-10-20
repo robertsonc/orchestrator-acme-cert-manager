@@ -6,6 +6,6 @@
 {{- else }}
   "keyUsage": ["digitalSignature"],
 {{- end }}
-  "extKeyUsage": ["serverAuth", "clientAuth"],
+  "extKeyUsage": ["serverAuth"],
   "crlDistributionPoints": ["__CRL_URL__"]
 }

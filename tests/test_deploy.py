@@ -272,3 +272,54 @@ def test_concurrent_bundles_are_distinct_and_immutable(layout, monkeypatch):
     assert not errors
     assert len(results["a"]) == 1 and len(results["b"]) == 1 and results["a"] != results["b"]
     assert not list((layout["cfg"] / "trust").glob(".*.tmp"))
+
+
+
+def test_missing_lab_root_fails_closed_when_lab_is_configured(layout, monkeypatch):
+    """LAB_CA_HOST set but root absent: no silent fallback to public trust, zero API calls."""
+    from app import config as cfg
+    root = _lab_root(layout, monkeypatch, cfg)
+    assert cfg.api_trust_bundle() is not True
+    root.unlink()
+    with __import__("pytest").raises(cfg.ConfigError):
+        cfg.api_trust_bundle()
+    calls = []
+    monkeypatch.setattr(deploy.requests, "post", lambda *a, **k: calls.append(1))
+    cert, key, ca = _files(layout)
+    for ca_choice in ("lab", "letsencrypt"):
+        res = deploy.deploy_paths(make_server(acme_ca=ca_choice, verify_ssl=True), cert, key, ca)
+        assert not res.ok and "lab root" in res.message
+    assert calls == []
+    # an exclusive custom bundle does not involve lab trust and still works
+    custom = layout["data"] / "custom.pem"; custom.write_text("-----BEGIN CERTIFICATE-----\nCUSTOM\n-----END CERTIFICATE-----\n")
+    assert cfg.api_trust_bundle(str(custom)) == str(custom)
+    # lab not configured at all -> plain system trust
+    monkeypatch.setattr(cfg, "LAB_CA_HOST", "")
+    assert cfg.api_trust_bundle() is True
+
+
+def test_retired_roots_stay_trusted_during_rollover(layout, monkeypatch):
+    """Old-root -> new-root: verified deploy and rollback trust both roots, no verification off."""
+    from app import config as cfg, restart
+    root = _lab_root(layout, monkeypatch, cfg)
+    retired = root.parent / "retired"; retired.mkdir()
+    monkeypatch.setattr(cfg, "LAB_CA_RETIRED_DIR", retired)
+    (retired / "root-old.crt").write_text("-----BEGIN CERTIFICATE-----\nOLDLABROOT\n-----END CERTIFICATE-----\n")
+    seen = []
+    monkeypatch.setattr(deploy.requests, "post", lambda url, **k: (seen.append(k["verify"]), _Resp(200) if url.endswith("/validation") else _Resp(204))[1])
+    cert, key, ca = _files(layout)
+    assert deploy.deploy_paths(make_server(acme_ca="lab", verify_ssl=True), cert, key, ca).ok
+    text = open(seen[0]).read()
+    assert "LABROOT" in text and "OLDLABROOT" in text
+    monkeypatch.setattr(restart, "_reload_nginx", lambda s: StepResult("restart", True, "ok"))
+    monkeypatch.setattr(restart, "_wait_for_served_serial", lambda s, want, t: (True, 0))
+    monkeypatch.setattr(restart, "_deployed_serial_from", lambda p: 1)
+    rb = restart._rollback_dir(make_server()); rb.mkdir(parents=True, exist_ok=True)
+    for name in ("orch.example.test.cer", "orch.example.test.key", "ca.cer"):
+        (rb / name).write_text("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n")
+    seen.clear()
+    restart._attempt_rollback(make_server(acme_ca="lab", verify_ssl=True), failed_serial=2)
+    assert seen and "OLDLABROOT" in open(seen[0]).read()
+    # once the retired root is removed the bundle changes (new immutable file) and no longer trusts it
+    (retired / "root-old.crt").unlink()
+    assert "OLDLABROOT" not in open(cfg.api_trust_bundle()).read()

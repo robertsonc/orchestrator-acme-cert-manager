@@ -21,6 +21,7 @@ pytestmark = pytest.mark.skipif(STEP is None, reason="step CLI not on PATH")
 SHIM = r"""#!/bin/bash
 # fake docker: `info` succeeds; `run` executes the lab CA init script natively.
 if [[ "$1" == "info" ]]; then exit 0; fi
+if [[ "$1" == "compose" ]]; then exit 0; fi
 if [[ "$1" != "run" ]]; then exit 0; fi
 shift
 envs=(); vols=()
@@ -87,3 +88,27 @@ def test_rerun_with_different_identity_is_refused(tmp_path):
     assert _env(tmp_path)["LAB_CA_DOMAIN"] == "lab.example.net"   # .env untouched
     port = _setup(tmp_path, "--ca-port", "9999")
     assert port.returncode != 0 and "--ca-port" in port.stdout + port.stderr
+
+
+def test_rotate_root_keeps_identity_and_retires_old_root(tmp_path):
+    first = _setup(tmp_path, "--lab-domain", "lab.example.net", "--ca-port", "9443")
+    assert first.returncode == 0, first.stdout + first.stderr
+    repo = tmp_path / "repo"
+    old_root = (repo / "data" / "pki" / "certs" / "root_ca.crt").read_text()
+    old_fp = (repo / "data" / "pki" / "certs" / "root_ca.fingerprint").read_text().strip()
+    rot = _setup(tmp_path, "--rotate-root")
+    assert rot.returncode == 0, rot.stdout + rot.stderr
+    assert "ROOT ROLLOVER IN PROGRESS" in rot.stdout
+    new_root = (repo / "data" / "pki" / "certs" / "root_ca.crt").read_text()
+    new_fp = (repo / "data" / "pki" / "certs" / "root_ca.fingerprint").read_text().strip()
+    assert new_root != old_root and new_fp != old_fp
+    retired = list((repo / "data" / "pki" / "certs" / "retired").glob("*.crt"))
+    assert len(retired) == 1 and retired[0].read_text() == old_root
+    meta = (repo / "data" / "pki" / "config" / "lab-ca.meta").read_text()
+    assert "LAB_CA_HOST=ca.lab.example.net" in meta and "LAB_CA_PORT=9443" in meta
+    assert _env(tmp_path)["LAB_CA_PORT"] == "9443"
+    assert (repo / "data" / "pki-root" / "root_ca_key").is_file()
+    assert any(p.name.startswith("pki.retired-") for p in (repo / "data").iterdir())
+    assert any(p.name.startswith("pki-root.retired-") for p in (repo / "data").iterdir())
+    # the fake docker shim must have been asked to stop the old service
+    assert _setup(tmp_path).returncode == 0   # plain re-run after rollover is a no-op

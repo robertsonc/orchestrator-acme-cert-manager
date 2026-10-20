@@ -28,6 +28,7 @@
       <nav class="nav" aria-label="Primary">
         <a href="{{ url_for('index') }}" class="{{ 'active' if nav == 'fleet' else '' }}">Fleet</a>
         <a href="{{ url_for('settings') }}" class="{{ 'active' if nav == 'settings' else '' }}">Settings</a>
+        <a href="{{ url_for('system_page') }}" class="{{ 'active' if nav == 'system' else '' }}">System</a>
       </nav>
       {% endif %}
       <div class="topbar-right">

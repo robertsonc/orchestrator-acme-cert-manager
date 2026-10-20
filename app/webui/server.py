@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import os
 import re
 import ssl
 import threading
@@ -11,7 +12,7 @@ import time
 
 from flask import Flask, abort, jsonify, make_response, redirect, render_template, request, url_for
 
-from .. import config, preflight, sshcheck, store
+from .. import __version__, config, preflight, sshcheck, store, sysinfo
 from . import auth
 
 log = logging.getLogger("webui")
@@ -364,13 +365,52 @@ def fleet_summary(rows: list[dict]) -> dict:
 
 
 def _system() -> dict:
+    """The light system summary every page carries (preflight, lab CA, schedule).
+
+    The System page and /api/status use sysinfo.snapshot() for the full picture.
+    """
     rep = preflight.run(strict=False)
     d = rep.as_dict()
+    d["version"] = __version__
     d["problems"] = [f.as_dict() for f in rep.findings if f.level in ("fatal", "warn")]
     d["lab_ca"] = {"configured": config.lab_ca_available(), "host": config.LAB_CA_HOST,
                    "url": config.lab_ca_base_url(),
                    "fingerprint": config.lab_ca_root_fingerprint() if config.LAB_CA_ROOT.is_file() else ""}
+    d["scheduler"] = sysinfo.scheduler()
     return d
+
+
+# ============================= system page ===================================
+@app.route("/system")
+def system_page():
+    """Everything an operator needs to know about this deployment, read-only.
+
+    Items that are configured on the host (setup.sh, .env, docker compose) are
+    marked as such, with the command that changes them.
+    """
+    rep = preflight.run(strict=False)
+    snap = sysinfo.snapshot(rep, probe_ca=True)
+    return render_template("system.html", sys=snap, now=_now())
+
+
+def _send_pem(path, filename: str):
+    if not path.is_file():
+        abort(404)
+    resp = make_response(path.read_bytes())
+    resp.headers["Content-Type"] = "application/x-pem-file"
+    resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return resp
+
+
+@app.route("/ca/root.pem")
+def ca_root_pem():
+    """The lab CA root certificate (public). Confirm the fingerprint out of band before trusting it."""
+    return _send_pem(config.LAB_CA_ROOT, "lab-root-ca.pem")
+
+
+@app.route("/ca/intermediate.pem")
+def ca_intermediate_pem():
+    return _send_pem(config.LAB_CA_INTERMEDIATE, "lab-intermediate-ca.pem")
 
 
 # ============================= dashboard =====================================
@@ -444,7 +484,9 @@ def api_history():
 
 @app.route("/api/status")
 def api_status():
-    return jsonify(_system())
+    """Full system snapshot (what the System page shows). Secrets are reported as set/unset only."""
+    probe = request.args.get("probe", "0") in ("1", "true", "yes")
+    return jsonify(sysinfo.snapshot(preflight.run(strict=False), probe_ca=probe))
 
 
 def _run_in_background(server_id: str, fn, label: str):
@@ -610,7 +652,12 @@ def _render_form(flat, errors, is_new, existing=None, status=200):
         ca_choices=CA_CHOICES, key_choices=KEY_CHOICES,
         cf_token_set=bool(existing and existing.dns_api_token),
         api_key_set=bool(existing and existing.api_key),
+        cf_env_set=bool(os.environ.get(config.CF_TOKEN_ENV)),
+        api_env_set=bool(os.environ.get((flat.get("api_key_env") or "ORCH_API_KEY"))),
         default_key=config.DEFAULT_SSH_KEY, default_known_hosts=config.DEFAULT_KNOWN_HOSTS,
+        ca_bundle_modes=config.CA_BUNDLE_MODES,
+        lab_ca={"available": config.lab_ca_available(), "configured": bool(config.LAB_CA_HOST),
+                "url": config.lab_ca_base_url(), "root_present": config.LAB_CA_ROOT.is_file()},
         now=_now(),
     ), status
 

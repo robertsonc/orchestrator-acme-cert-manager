@@ -100,11 +100,11 @@
         <p class="small"><span class="check good"><span class="g">●</span>settings valid</span> <span class="muted">— press Test SSH to verify authentication and sudo on the appliance.</span></p>
       {% endif %}
       <dl class="kv">
-        <dt>Target</dt><dd class="mono">{{ r.ssh_user or '?' }}@{{ r.host }}:{{ r.ssh_port }}</dd>
-        <dt>Key</dt><dd class="mono">{{ r.ssh_key_path or '— not set —' }}</dd>
-        <dt>Known hosts</dt><dd class="mono">{{ r.ssh_known_hosts }}</dd>
+        <dt>Target</dt><dd class="mono">{{ r.ssh_user or '?' }}@{{ r.host }}:{{ r.ssh_port }} {{ m.info('The account needs the public key installed and the scoped sudoers rule; both are prepared on the host.', './setup.sh --host ' ~ r.host ~ ' --ssh-user ' ~ (r.ssh_user or '<user>') ~ ' [--install-sudoers]') }}</dd>
+        <dt>Key</dt><dd class="mono">{{ r.ssh_key_path or '— not set —' }} {{ m.info('Generated on the host (data/ssh/orch_restart, no passphrase) and mounted read-only at /data/ssh.', './setup.sh') }}</dd>
+        <dt>Known hosts</dt><dd class="mono">{{ r.ssh_known_hosts }} {{ m.info('The host key is pinned on the host after you confirm the fingerprint; strict checking, no prompt at run time.', './setup.sh --host ' ~ r.host ~ ' --ssh-port ' ~ r.ssh_port) }}</dd>
         <dt>Restart</dt><dd class="mono">{{ r.restart_command }}</dd>
-        <dt>Reload</dt><dd class="mono">{{ r.nginx_reload_command }}</dd>
+        <dt>Reload</dt><dd class="mono">{{ r.nginx_reload_command }} {{ m.info('Both commands must match the NOPASSWD sudoers rule on the appliance exactly; setup.sh prints or installs that rule.', './setup.sh --host ' ~ r.host ~ ' --install-sudoers') }}</dd>
       </dl>
     </div>
     <div class="panel panel-body">
@@ -112,12 +112,12 @@
       <dl class="kv">
         <dt>API TLS</dt><dd>{% if r.verify_ssl %}<span class="check good"><span class="g">●</span>verified{% if r.ca_bundle %} · <span class="mono">{{ r.ca_bundle }}</span>{% endif %}</span>
           {% else %}<span class="check warn"><span class="g">▲</span>unverified</span> <span class="muted">— enable after the production certificate is live</span>{% endif %}</dd>
-        <dt>API key</dt><dd>{{ 'stored in config' if r.secrets.api_inline else 'from env ' ~ r.secrets.api_key_env }}</dd>
-        <dt>DNS token</dt><dd>{{ 'stored in config' if r.secrets.cf_inline else 'from env CF_DNS_API_TOKEN' }}</dd>
-        <dt>CA</dt><dd>{{ r.ca }} {{ m.env_pill(r.ca_env) }}</dd>
+        <dt>API key</dt><dd>{{ 'stored in config' if r.secrets.api_inline else 'from env ' ~ r.secrets.api_key_env }}{% if not r.secrets.api_inline %} {{ m.info('Fallback read from .env on the host; a value entered in Settings takes precedence.', r.secrets.api_key_env ~ '=… in .env, then docker compose down && docker compose up -d') }}{% endif %}</dd>
+        <dt>DNS token</dt><dd>{{ 'stored in config' if r.secrets.cf_inline else 'from env CF_DNS_API_TOKEN' }}{% if not r.secrets.cf_inline %} {{ m.info('Fallback read from .env on the host; a value entered in Settings takes precedence.', 'CF_DNS_API_TOKEN=… in .env, then docker compose down && docker compose up -d') }}{% endif %}</dd>
+        <dt>CA</dt><dd>{{ r.ca }} {{ m.env_pill(r.ca_env) }}{% if r.ca_env == 'lab' %} {{ m.info('The bundled CA is initialised and pinned on the host; see the System page for its state and root fingerprint.', './setup.sh --with-ca --lab-domain <zone>') }}{% endif %}</dd>
         <dt>Account</dt><dd>{{ r.acme_email }}</dd>
         <dt>Key type</dt><dd class="mono">{{ r.key_type }}</dd>
-        <dt>Schedule</dt><dd>twice daily; renews when ≤ 30 days remain</dd>
+        <dt>Schedule</dt><dd>{% if system.scheduler and system.scheduler.entries %}{% for e in system.scheduler.entries %}<span class="mono">{{ e.expr }}</span>{% if not loop.last %}, {% endif %}{% endfor %}; renews when ≤ {{ system.scheduler.window_days }} days remain{% else %}twice daily; renews when ≤ 30 days remain{% endif %} {{ m.info('The schedule comes from config/crontab in the image; the window from RENEW_WINDOW_DAYS in .env.', 'edit config/crontab and rebuild; RENEW_WINDOW_DAYS=30 in .env') }}</dd>
       </dl>
     </div>
   </div>

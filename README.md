@@ -25,6 +25,7 @@ It is the Orchestrator counterpart to the [ClearPass ACME Certificate Manager](h
 - [Web UI](#web-ui)
 - [CLI](#cli)
 - [Maintenance](#maintenance)
+- [Upgrading](#upgrading)
 - [Troubleshooting](#troubleshooting)
 - [Security Considerations](#security-considerations)
 - [Orchestrator API Reference](#orchestrator-api-reference)
@@ -99,7 +100,8 @@ orchestrator-acme-cert-manager/
 │   └── ssh/                   # orch_restart (private key), orch_restart.pub, known_hosts
 ├── pki/
 │   ├── lab-ca-init.sh         # one-time step-ca init (run inside the step-ca image by setup.sh --with-ca)
-│   └── intermediate.tpl       # name-constrained issuing-CA template
+│   ├── intermediate.tpl       # name-constrained issuing-CA template
+│   └── leaf.tpl               # serverAuth-only leaf template with the CRL distribution point
 ├── data/pki/                  # lab CA ONLINE state (gitignored): certs/, secrets/ (intermediate key only), config/, db/
 ├── data/pki-root/             # lab CA OFFLINE root key + password (gitignored; move off the host)
 ├── tests/                     # pytest suite
@@ -108,7 +110,9 @@ orchestrator-acme-cert-manager/
 ├── docker-compose.override.yml.example
 ├── .env.example               # copy → .env (setup.sh does this)
 ├── requirements.txt / requirements-dev.txt
-└── setup.sh                   # host preparation (Docker, key, host key, sudo check)
+├── setup.sh                   # host preparation (Docker, key, host key, sudo check, lab CA init)
+├── upgrade-check.sh           # read-only host readiness report before an upgrade or lab CA enablement
+└── UPGRADING.md               # version-to-version upgrade steps and lab CA enablement on an existing host
 ```
 
 `config/` and `data/` are **bind‑mounted** into the container so state survives rebuilds. `config/` must be mounted as a **directory** (not a single file) and must be **writable**; the web UI writes `servers.json` there. See [Configuration persistence](#configuration-persistence).
@@ -585,9 +589,11 @@ Reached at `http://localhost:8090` over the SSH tunnel. Dark theme by default, l
 - **Fleet** (`/`) — the overview. Five tiles (servers, healthy, need attention, expiring ≤ 30 days, soonest expiry), the preflight findings, and one row per server sorted worst-first by a **health** roll-up (`attention` / `warning` / `healthy` / `unverified` / `working`, always shown as glyph + label with the top reason). Each row shows the configured CA, the **Issued** and **Served** certificate serials with staging/production badges, the **Activation** state, the last run and its kind, and the **Force renew** / **Force deploy** actions. Recent activity and the active configuration path sit below.
 - **Server** (`/server/<id>`) — everything about one Orchestrator: Issued / Served / Activation cards (with the issued certificate's remaining lifetime), the last run as a three-step pipeline (issue → deploy → restart) with elapsed time per step and a **Diagnostics** disclosure on the failed step (phase, HTTP status, attempt, elapsed, redacted response, next action), the SSH activation settings with their validation state, API TLS / secrets / CA summary, and the per-server history. Actions: Force renew (asks for confirmation because it spends an issuance), Force deploy, **Test SSH**, Edit.
 - **Live refresh** — the Fleet and Server pages re-fetch a server-rendered fragment every 8 s while a run is in progress and every 45 s otherwise (paused in background tabs), so a Force renew's outcome appears without reloading. The top-bar stamp shows the last refresh.
-- **Settings** (`/settings`) — list, add, edit, delete servers; Test SSH per server. The edit form validates the SSH block on save (empty user/key path, missing/unreadable/unparseable/passphrase-protected key, missing `known_hosts` entry) and never echoes stored secrets.
+- **Settings** (`/settings`) — list, add, edit, delete servers; Test SSH per server. The edit form validates the SSH block on save (empty user/key path, missing/unreadable/unparseable/passphrase-protected key, missing `known_hosts` entry) and never echoes stored secrets. The CA bundle mode (exclusive / additive) and the lab CA's availability are shown inline.
+- **System** (`/system`) — the deployment as the container sees it, read-only: version, the full preflight report, every documented environment variable with its state (secrets as set / unset, never the value), the scheduler with its next run, the SSH key and pinned host keys per server, and the lab CA (identity, URLs, root fingerprint, live health probe, **Download root**). Everything that is configured on the Docker host rather than in the UI carries an **ⓘ** indicator naming the exact `setup.sh` flag, `.env` key or command, and a table at the bottom lists all host-side operations. Host-level readiness (Docker, Compose, `.env` drift, ownership) is `./upgrade-check.sh` on the host, because the container cannot see the host.
+- **CLI-dependency indicators** — the same **ⓘ** appears in the server form and on the server page next to every field whose value depends on host configuration: key path, known hosts, sudoers-bound commands, CA bundle location, environment-variable fallbacks for secrets, the lab CA option. Hover or focus shows what it depends on and the command that sets it up.
 - **Setup / Login** — first-run admin creation, then a login gate on everything else.
-- JSON: `/api/servers`, `/api/server/<id>`, `/api/history`, `/api/status` (behind the login); `/healthz` is open.
+- JSON: `/api/servers`, `/api/server/<id>`, `/api/history`, `/api/status` (the System snapshot; `?probe=1` adds the lab CA health probe), `/ca/root.pem` and `/ca/intermediate.pem` (behind the login); `/healthz` is open.
 
 Configuration is read on every request, so UI changes take effect on the next run with no restart.
 
@@ -602,7 +608,7 @@ All commands run inside the container: `docker compose exec -T orchestrator-acme
 | `list` | Configured servers, their CA and last outcome, plus the active configuration path. |
 | `check [--json] [--lenient]` | Preflight: configuration path and persistence, legacy‑file detection, per‑server SSH validation, credential presence. Exit 1 on fatal findings. |
 | `ssh-test <id>` | Connect with the pinned host key and probe `sudo -n -l` for both activation commands. Restarts nothing. |
-| `ca-info` | Bundled lab CA endpoints, root fingerprint and issuer names. |
+| `ca-info` | Bundled lab CA endpoints, root fingerprint and issuer names (the System page shows the same, plus a live health probe). |
 | `issue <id>` / `deploy <id>` / `restart <id>` | Run a single stage. |
 | `renew <id> [--force]` | Full pipeline for one server (contacts the CA). |
 | `redeploy <id>` | Deploy → activate from the certificate already on disk (no CA contact). |
@@ -644,6 +650,19 @@ docker compose up -d --build
 ```
 
 Certificates, history, and config live in the mounted volumes. A volume, `.env` or Compose change requires `docker compose down && docker compose up -d`.
+
+---
+
+## Upgrading
+
+[UPGRADING.md](UPGRADING.md) has the version-to-version procedure (backup, what to export from a 1.0.x container before it is recreated, the idempotent `setup.sh` re-run, verification that touches no appliance, rollback) and the order of operations for enabling the bundled lab CA on a host that already runs the cert manager. Start with the read-only readiness report on the host:
+
+```bash
+./upgrade-check.sh                                   # tools, checkout, layout, .env, Compose, SSH material, running container
+./upgrade-check.sh --with-ca --lab-domain <zone>     # plus DNS record, port, PKI state before setup.sh --with-ca
+```
+
+It prints a numbered fix list and exits non-zero while anything blocks the upgrade. Secrets are reported as present or absent only.
 
 ---
 
@@ -766,8 +785,10 @@ The payload is a JSON object carrying the leaf certificate, private key, and int
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest -q
-shellcheck -S warning setup.sh
+shellcheck -S warning setup.sh upgrade-check.sh
 ```
+
+`upgrade-check.sh` is tested against synthetic 1.0.x and current layouts with a fake `docker` on `PATH` (`tests/test_upgrade_check.py`); every scenario also asserts the tree is byte-for-byte unchanged afterwards.
 
 The lab CA tests run `pki/lab-ca-init.sh` against a real `step` binary when one is on `PATH` (download the pinned release from the smallstep/cli GitHub releases; CI installs it and fails if the tests would skip). CI also runs a Docker smoke job that initialises the CA in the pinned image on a non-default port, starts the `lab-ca` service, waits for a healthy container and queries the ACME directory, root and CRL by the CA's constrained name.
 

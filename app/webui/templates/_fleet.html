@@ -90,16 +90,22 @@
   </div>
 
   <div class="section">
-    <div class="section-head"><h2>System</h2></div>
+    <div class="section-head"><h2>System</h2><a class="small" href="{{ url_for('system_page') }}">checks, environment, SSH material, lab CA →</a></div>
     <div class="panel panel-body sys-strip">
+      <span>version <span class="mono">{{ system.version }}</span></span>
       <span>config <span class="mono">{{ system.servers_file }}</span></span>
       <span>history <span class="mono">{{ system.history_file }}</span></span>
       <span>persistence
         {% if system.config_mounted %}<span class="check good"><span class="g">●</span>bind-mounted</span>
         {% elif system.config_mounted is sameas false %}<span class="check bad"><span class="g">✕</span>not mounted</span>
         {% else %}<span class="muted">n/a outside a container</span>{% endif %}</span>
+      {% if system.scheduler and system.scheduler.next_run %}
+      <span>next scheduled run <span class="mono">{{ system.scheduler.next_run|replace('T',' ') }}</span></span>
+      {% endif %}
       {% if system.lab_ca and system.lab_ca.configured %}
       <span>lab CA <span class="mono">{{ system.lab_ca.url }}</span> <span class="muted">root sha256</span> <span class="mono" title="{{ system.lab_ca.fingerprint }}">{{ system.lab_ca.fingerprint[:16] }}…</span></span>
+      {% else %}
+      <span>lab CA <span class="muted">not configured</span> {{ m.info('Initialised on the Docker host; the identity is pinned at init and written to .env.', './setup.sh --with-ca --lab-domain <zone>') }}</span>
       {% endif %}
     </div>
   </div>

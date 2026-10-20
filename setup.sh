@@ -272,9 +272,15 @@ ensure_docker() {
 # ---- 2. directories ----------------------------------------------------------
 ensure_dirs() {
   step "Directories"
-  mkdir -p "${data}/certs" "${data}/logs" "$ssh_dir" "$cfg"
+  # data/pki/certs is created here, owned by the invoking user, because docker-compose.yml
+  # bind-mounts it read-only into the cert manager: if Docker creates it first it is owned
+  # by root and a later `--with-ca` init (which runs as this user) cannot write under data/pki.
+  mkdir -p "${data}/certs" "${data}/logs" "$ssh_dir" "$cfg" "${data}/pki/certs"
   chmod 700 "$ssh_dir" "${data}/certs"
-  ok "created ${data}/{certs,logs,ssh} and ${cfg}"
+  if [[ ! -w "${data}/pki" ]]; then
+    warn "${data}/pki is not writable by $(id -un) (owner uid $(stat -c %u "${data}/pki" 2>/dev/null)) — Docker probably created it; fix with: sudo chown -R $(id -u):$(id -g) ${data}/pki"
+  fi
+  ok "created ${data}/{certs,logs,ssh,pki/certs} and ${cfg}"
 }
 
 # ---- 3. key pair -------------------------------------------------------------

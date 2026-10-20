@@ -40,6 +40,18 @@
 </details>
 {%- endmacro %}
 
+{# Info indicator for anything that depends on configuration done outside the UI.
+   `text` says what and where; `cmd` is the exact host command / .env key. Hover or
+   focus shows the tip; the aria-label carries the same text for screen readers. #}
+{% macro info(text, cmd='') -%}
+<span class="info" tabindex="0" aria-label="{{ text }}{% if cmd %} Command: {{ cmd }}{% endif %}"><span class="info-g" aria-hidden="true">i</span><span class="tip" role="tooltip"><span class="tip-text">{{ text }}</span>{% if cmd %}<code class="tip-cmd">{{ cmd }}</code>{% endif %}</span></span>
+{%- endmacro %}
+
+{# A visible "configured on the host" tag with the same tooltip, for list rows. #}
+{% macro host_tag(cmd, text='Configured on the Docker host, not from this UI.') -%}
+<span class="host-tag">host{{ info(text, cmd) }}</span>
+{%- endmacro %}
+
 {% macro action_buttons(r, origin, size='') -%}
   <form method="post" action="{{ url_for('renew', server_id=r.id) }}"
         data-confirm="Force renew contacts the ACME CA and issues a new certificate for {{ r.domain }}. This counts against Let's Encrypt rate limits. Continue?">

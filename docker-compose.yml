@@ -1,7 +1,7 @@
 services:
   orchestrator-acme-cert-manager:
     build: .
-    image: orchestrator-acme-cert-manager:1.1.0
+    image: orchestrator-acme-cert-manager:1.2.0
     container_name: orchestrator-acme-cert-manager
     restart: unless-stopped
     env_file: .env

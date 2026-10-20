@@ -43,5 +43,6 @@
     </table>
     {% endif %}
   </div>
-  <p class="help">Changes take effect on the next run — no rebuild or restart. Saved to <span class="mono">{{ system.servers_file }}</span>.</p>
+  <p class="help">Changes take effect on the next run — no rebuild or restart. Saved to <span class="mono">{{ system.servers_file }}</span>.
+    What a server needs from the host (SSH key, pinned host key, sudoers rule, environment secrets, lab CA) is prepared by <code>./setup.sh</code> and shown on the <a href="{{ url_for('system_page') }}">System</a> page.</p>
 {% endblock %}

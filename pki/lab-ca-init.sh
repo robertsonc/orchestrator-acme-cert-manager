@@ -127,8 +127,16 @@ step ca provisioner add "$LAB_CA_PROVISIONER" --type ACME --challenge dns-01 \
 step ca provisioner update lab-admin --x509-template config/templates/leaf.tpl --ca-config config/ca.json >/dev/null
 
 echo ">> enabling the CRL (issuing distribution point $CRL_URL)"
-# step-ca writes pretty JSON whose first line is '{'; the image has no jq/python.
-sed -i "0,/^{\$/s#^{\$#{\n  \"crl\": {\"enabled\": true, \"generateOnRevoke\": true, \"cacheDuration\": \"24h\", \"idpURL\": \"${CRL_URL}\"},#" config/ca.json
+# step-ca writes pretty JSON whose first line is '{'; the image has no jq/python
+# and its sed is BusyBox, so splice the stanza in with portable shell only.
+[[ "$(head -n 1 config/ca.json)" == "{" ]] || die "config/ca.json does not start with '{' as expected; refusing to patch it" 5
+{
+  echo "{"
+  echo "  \"crl\": {\"enabled\": true, \"generateOnRevoke\": true, \"cacheDuration\": \"24h\", \"idpURL\": \"${CRL_URL}\"},"
+  tail -n +2 config/ca.json
+} > config/ca.json.new
+mv config/ca.json.new config/ca.json
+grep -q "\"idpURL\": \"${CRL_URL}\"" config/ca.json || die "CRL stanza was not written to config/ca.json" 5
 
 step certificate fingerprint certs/root_ca.crt > certs/root_ca.fingerprint
 chmod 644 certs/root_ca.crt certs/intermediate_ca.crt certs/root_ca.fingerprint

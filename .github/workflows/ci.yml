@@ -90,4 +90,7 @@ jobs:
           openssl x509 -in data/pki/certs/intermediate_ca.crt -noout -text | grep -A2 'Name Constraints'
       - name: Logs on failure
         if: failure()
-        run: docker compose logs lab-ca | tail -50 || true
+        run: |
+          docker logs lab-ca 2>&1 | tail -50 || true
+          ls -la data/pki data/pki/config data/pki/secrets data/pki-root 2>/dev/null || true
+          sed -n '1,12p' data/pki/config/ca.json 2>/dev/null || true

@@ -83,6 +83,9 @@ def cmd_ca_info(_: argparse.Namespace) -> int:
         print(f"Root SHA-256:    {config.lab_ca_root_fingerprint()}")
         names = sorted(config.lab_ca_issuer_names())
         print("Issuers:         " + "; ".join(names))
+        print("Root key:        " + ("offline (marker present)" if config.LAB_CA_OFFLINE_MARKER.is_file()
+                                     else "UNKNOWN — marker missing; verify the key is not in the online volume"))
+        print(f"API trust:       {config.api_trust_bundle()}")
     else:
         print(f"Root file:       {config.LAB_CA_ROOT} (MISSING — mount ./data/pki/certs and run setup.sh --with-ca)")
         return 1

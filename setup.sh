@@ -76,6 +76,8 @@ Bundled lab CA (optional):
   --lab-domain DOMAIN    DNS domain the lab CA may issue for (name constraint), e.g. lab.example.net
   --ca-host HOST         The CA's own hostname (default: ca.<lab-domain>); needs a DNS record to this host
   --ca-name NAME         Display name of the CA (default: "${LAB_CA_NAME}")
+  --ca-port PORT         Port step-ca listens on, inside and outside the container (default: ${LAB_CA_PORT})
+                         Re-runs verify these against the initialised CA and refuse to drift.
 
 Behaviour:
   --non-interactive      Never prompt. Docker install is auto-approved; anything needing a human
@@ -110,6 +112,7 @@ while [[ $# -gt 0 ]]; do
     --lab-domain) LAB_CA_DOMAIN="$2"; shift 2 ;;
     --ca-host) LAB_CA_HOST="$2"; shift 2 ;;
     --ca-name) LAB_CA_NAME="$2"; shift 2 ;;
+    --ca-port) LAB_CA_PORT="$2"; shift 2 ;;
     --non-interactive) non_interactive=1; shift ;;
     --trust-host-key) trust_host_key=1; shift ;;
     --install-sudoers) install_sudoers=1; shift ;;
@@ -318,49 +321,71 @@ set_env_kv() {
 }
 
 # ---- 4b. bundled lab CA -------------------------------------------------------
+read_meta() { local key="$1" f="$2"; grep -E "^${key}=" "$f" 2>/dev/null | head -1 | cut -d= -f2-; }
+
 ensure_lab_ca() {
   step "Bundled lab CA (step-ca)"
-  [[ -n "$LAB_CA_DOMAIN" ]] || die "--with-ca needs --lab-domain <dns-domain the CA may issue for>"
-  [[ "$LAB_CA_DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] || die "invalid --lab-domain '${LAB_CA_DOMAIN}'"
-  [[ -n "$LAB_CA_HOST" ]] || LAB_CA_HOST="ca.${LAB_CA_DOMAIN}"
-  [[ "$LAB_CA_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || die "invalid --ca-host '${LAB_CA_HOST}'"
-  [[ "$LAB_CA_HOST" == *".${LAB_CA_DOMAIN}" ]] || die "--ca-host must be a name under --lab-domain (the CA's own certificate is name-constrained)"
-  [[ "$LAB_CA_NAME" != *'"'* && "$LAB_CA_NAME" != *'\'* ]] || die "--ca-name may not contain quotes or backslashes"
-  local pki="${data}/pki" dcmd="docker"
+  local pki="${data}/pki" offline="${data}/pki-root" meta="${data}/pki/config/lab-ca.meta" dcmd
   if docker info >/dev/null 2>&1; then dcmd="docker"
   elif [[ $EUID -ne 0 ]] && sudo -n docker info >/dev/null 2>&1; then dcmd="sudo docker"
   else die "the lab CA is initialised inside the step-ca image, which needs a reachable Docker daemon (see the Docker step above; or re-run after 'docker info' works)"; fi
-  mkdir -p "${pki}/certs" "${pki}/secrets" "${pki}/config" "${pki}/db"
-  chmod 700 "${pki}/secrets"
-  local uid gid; uid="$(id -u)"; gid="$(id -g)"
-  if [[ -f "${pki}/config/ca.json" ]]; then
-    ok "lab CA already initialised in ${pki}"
+
+  # An existing CA has an identity; arguments that differ from it are an error, absent ones are filled in.
+  if [[ -f "$meta" ]]; then
+    local s_host s_dom s_port s_name
+    s_host="$(read_meta LAB_CA_HOST "$meta")"; s_dom="$(read_meta LAB_CA_DOMAIN "$meta")"
+    s_port="$(read_meta LAB_CA_PORT "$meta")"; s_name="$(read_meta LAB_CA_NAME "$meta")"
+    local drift=0
+    [[ -z "$LAB_CA_DOMAIN" || "$LAB_CA_DOMAIN" == "$s_dom" ]] || { err "--lab-domain '$LAB_CA_DOMAIN' differs from the initialised CA ('$s_dom')"; drift=1; }
+    [[ -z "$LAB_CA_HOST"   || "$LAB_CA_HOST"   == "$s_host" ]] || { err "--ca-host '$LAB_CA_HOST' differs from the initialised CA ('$s_host')"; drift=1; }
+    [[ "$LAB_CA_PORT" == "$s_port" ]] || { err "LAB_CA_PORT '$LAB_CA_PORT' differs from the initialised CA ('$s_port')"; drift=1; }
+    [[ "$LAB_CA_NAME" == "Lab CA" || "$LAB_CA_NAME" == "$s_name" ]] || { err "--ca-name '$LAB_CA_NAME' differs from the initialised CA ('$s_name')"; drift=1; }
+    if [[ $drift -eq 1 ]]; then
+      die "a CA cannot be renamed in place. To rebuild: docker compose stop lab-ca; move ${pki} aside (and ${offline} for a new root); re-run; re-distribute the root to every client."
+    fi
+    LAB_CA_DOMAIN="$s_dom"; LAB_CA_HOST="$s_host"; LAB_CA_NAME="$s_name"
   else
-    echo "  Initialising with ${LAB_CA_IMAGE} (name constraint: .${LAB_CA_DOMAIN}; CA host ${LAB_CA_HOST})"
-    $dcmd run --rm --entrypoint bash -u "${uid}:${gid}" \
-      -e STEPPATH=/home/step -e HOME=/home/step \
-      -e LAB_CA_NAME="$LAB_CA_NAME" -e LAB_CA_HOST="$LAB_CA_HOST" -e LAB_CA_DOMAIN="$LAB_CA_DOMAIN" \
-      -v "${pki}:/home/step" -v "${here}/pki:/pki-init:ro" \
-      "$LAB_CA_IMAGE" /pki-init/lab-ca-init.sh || die "lab CA initialisation failed"
-    ok "lab CA initialised in ${pki}"
+    [[ -n "$LAB_CA_DOMAIN" ]] || die "--with-ca needs --lab-domain <dns-domain the CA may issue for>"
+    [[ -n "$LAB_CA_HOST" ]] || LAB_CA_HOST="ca.${LAB_CA_DOMAIN}"
   fi
+  [[ "$LAB_CA_DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] || die "invalid --lab-domain '${LAB_CA_DOMAIN}'"
+  [[ "$LAB_CA_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || die "invalid --ca-host '${LAB_CA_HOST}'"
+  [[ "$LAB_CA_HOST" == *".${LAB_CA_DOMAIN}" ]] || die "--ca-host must be a name under --lab-domain (the CA's own certificate is name-constrained)"
+  [[ "$LAB_CA_PORT" =~ ^[0-9]+$ && $LAB_CA_PORT -ge 1 && $LAB_CA_PORT -le 65535 ]] || die "invalid LAB_CA_PORT '${LAB_CA_PORT}'"
+  [[ "$LAB_CA_NAME" != *'"'* && "$LAB_CA_NAME" != *'\'* ]] || die "--ca-name may not contain quotes or backslashes"
+
+  mkdir -p "${pki}/certs" "${pki}/secrets" "${pki}/config" "${pki}/db" "$offline"
+  chmod 700 "${pki}/secrets" "$offline"
+  local uid gid; uid="$(id -u)"; gid="$(id -g)"
+  echo "  ${LAB_CA_IMAGE}: CA host ${LAB_CA_HOST}:${LAB_CA_PORT}, issuing scope .${LAB_CA_DOMAIN}"
+  $dcmd run --rm --entrypoint bash -u "${uid}:${gid}" \
+    -e STEPPATH=/home/step -e HOME=/home/step -e OFFLINE=/root-offline \
+    -e LAB_CA_NAME="$LAB_CA_NAME" -e LAB_CA_HOST="$LAB_CA_HOST" -e LAB_CA_DOMAIN="$LAB_CA_DOMAIN" -e LAB_CA_PORT="$LAB_CA_PORT" \
+    -v "${pki}:/home/step" -v "${offline}:/root-offline" -v "${here}/pki:/pki-init:ro" \
+    "$LAB_CA_IMAGE" /pki-init/lab-ca-init.sh || die "lab CA initialisation failed (see above)"
+  [[ -f "${pki}/secrets/root_ca_key" ]] && die "the root key is present in the ONLINE volume (${pki}/secrets/root_ca_key); move it to ${offline} with its password before starting the service"
+  [[ -f "${pki}/certs/root-key-offline" ]] || warn "marker ${pki}/certs/root-key-offline missing; this CA was initialised by an older script — verify the root key is not under ${pki}/secrets"
+  ok "lab CA ready in ${pki}; online private key: intermediate only"
+
   set_env_kv COMPOSE_PROFILES lab-ca
   set_env_kv LAB_CA_DOMAIN "$LAB_CA_DOMAIN"
   set_env_kv LAB_CA_HOST "$LAB_CA_HOST"
   set_env_kv LAB_CA_PORT "$LAB_CA_PORT"
   set_env_kv LAB_CA_UID "$uid"
   set_env_kv LAB_CA_GID "$gid"
-  ok ".env: COMPOSE_PROFILES=lab-ca, LAB_CA_HOST=${LAB_CA_HOST}, LAB_CA_DOMAIN=${LAB_CA_DOMAIN}"
+  ok ".env: COMPOSE_PROFILES=lab-ca, LAB_CA_HOST=${LAB_CA_HOST}, LAB_CA_DOMAIN=${LAB_CA_DOMAIN}, LAB_CA_PORT=${LAB_CA_PORT}"
   local fp="(see ${pki}/certs/root_ca.fingerprint)"
   [[ -f "${pki}/certs/root_ca.fingerprint" ]] && fp="$(cat "${pki}/certs/root_ca.fingerprint")"
   cat <<EOF
   Root CA fingerprint (SHA-256): ${fp}
-  Before anything trusts this root, confirm that fingerprint out of band on each client.
-  Required DNS: ${LAB_CA_HOST} -> this host's private address (Cloudflare, DNS-only). The CA's own
-  certificate is issued for that name; clients (and this tool) reach it as https://${LAB_CA_HOST}:${LAB_CA_PORT}
-  Root download: https://${LAB_CA_HOST}:${LAB_CA_PORT}/roots.pem   CRL: https://${LAB_CA_HOST}:${LAB_CA_PORT}/1.0/crl
-  Root key: ${pki}/secrets/root_ca_key is encrypted with ${pki}/secrets/password. The running CA only
-  needs the intermediate key; move the root key off this host once the CA works (keep the password with it).
+  REQUIRED BEFORE ANY CLIENT TRUSTS THIS ROOT:
+    1. Move ${offline} (root_ca_key + root_password) off this host to offline storage. It is not
+       mounted into any container and the running CA does not need it; only a future intermediate
+       re-issue does. Keep the password with the key.
+    2. Confirm the fingerprint above out of band on each client before installing the root.
+  DNS: ${LAB_CA_HOST} -> this host's private address (Cloudflare, DNS-only). Clients and this tool reach
+       the CA as https://${LAB_CA_HOST}:${LAB_CA_PORT}; every leaf carries CRL https://${LAB_CA_HOST}:${LAB_CA_PORT}/1.0/crl
+  Root download: https://${LAB_CA_HOST}:${LAB_CA_PORT}/roots.pem
 EOF
 }
 
@@ -579,7 +604,7 @@ cat <<EOF
   6. Run a STAGING renewal first, confirm 'Activation: live', then switch the CA to production.
 EOF
 if [[ $with_ca -eq 1 ]]; then
-  echo "  7. Lab CA: distribute the root (README: 'Bundled lab CA'), then pick 'Lab CA' as the server's CA."
+  echo "  7. Lab CA: move ${data}/pki-root offline, distribute the root (README: 'Bundled lab CA'), then pick 'Lab CA' as the server's CA."
   echo "     Check it from inside the container: docker compose exec -T orchestrator-acme-cert-manager python -m app.cli ca-info"
 fi
 [[ $remote_ok -eq 1 ]] || warn "the SSH/sudo check did not pass — activation will fail until it does (see above)"

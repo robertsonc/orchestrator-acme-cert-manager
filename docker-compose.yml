@@ -46,16 +46,23 @@ services:
     environment:
       STEPPATH: /home/step
       HOME: /home/step
+      LAB_CA_HOST: "${LAB_CA_HOST:-ca.lab.invalid}"
+      LAB_CA_PORT: "${LAB_CA_PORT:-9000}"
     volumes:
-      - ./data/pki:/home/step
+      - ./data/pki:/home/step           # ONLINE state only: intermediate key, config, db. The root
+                                        # key lives in ./data/pki-root, which is never mounted here.
     ports:
-      - "${LAB_CA_PORT:-9000}:9000"
+      - "${LAB_CA_PORT:-9000}:${LAB_CA_PORT:-9000}"   # step-ca listens on the same port inside and out
     networks:
       default:
         aliases:
           - "${LAB_CA_HOST:-ca.lab.invalid}"
+    extra_hosts:
+      # The CA's certificate is valid only for LAB_CA_HOST (name-constrained), so the
+      # health check and in-container tooling must address it by that name.
+      - "${LAB_CA_HOST:-ca.lab.invalid}:127.0.0.1"
     healthcheck:
-      test: ["CMD", "step", "ca", "health", "--ca-url", "https://localhost:9000", "--root", "/home/step/certs/root_ca.crt"]
+      test: ["CMD-SHELL", "step ca health --ca-url https://$${LAB_CA_HOST}:$${LAB_CA_PORT} --root /home/step/certs/root_ca.crt"]
       interval: 60s
       timeout: 10s
       retries: 3

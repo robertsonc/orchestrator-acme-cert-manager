@@ -147,21 +147,62 @@ def test_lego_uses_lab_ca_directory_and_trust(layout, monkeypatch):
     assert not res.ok and "setup.sh --with-ca" in res.message
 
 
-def test_deploy_verifies_against_lab_root(layout, monkeypatch):
-    from app import config as cfg
+def _lab_root(layout, monkeypatch, cfg):
     root = layout["data"] / "pki" / "certs" / "root_ca.crt"
-    root.parent.mkdir(parents=True)
-    root.write_text("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n")
+    root.parent.mkdir(parents=True, exist_ok=True)
+    root.write_text("-----BEGIN CERTIFICATE-----\nLABROOT\n-----END CERTIFICATE-----\n")
+    monkeypatch.setattr(cfg, "LAB_CA_HOST", "ca.lab.example.net")
     monkeypatch.setattr(cfg, "LAB_CA_ROOT", root)
-    seen = {}
+    monkeypatch.setattr(cfg, "TRUST_DIR", layout["cfg"] / "trust")
+    monkeypatch.setattr(cfg, "COMBINED_TRUST_FILE", layout["cfg"] / "trust" / "api-trust.pem")
+    return root
+
+
+def test_api_trust_bundle_combines_system_lab_and_custom(layout, monkeypatch):
+    from app import config as cfg
+    import certifi
+    monkeypatch.setattr(cfg, "LAB_CA_HOST", "")
+    monkeypatch.setattr(cfg, "LAB_CA_ROOT", layout["data"] / "nope")
+    assert cfg.api_trust_bundle() is True                      # nothing to add -> plain system trust
+    _lab_root(layout, monkeypatch, cfg)
+    path = cfg.api_trust_bundle()
+    text = open(path).read()
+    assert "LABROOT" in text and open(certifi.where()).read()[:40] in text
+    custom = layout["data"] / "custom.pem"; custom.write_text("-----BEGIN CERTIFICATE-----\nCUSTOM\n-----END CERTIFICATE-----\n")
+    assert "CUSTOM" in open(cfg.api_trust_bundle(str(custom))).read()
+    assert cfg.api_trust_bundle(str(custom)) == path          # cached, same file
+
+
+def test_verified_calls_use_combined_trust_whatever_ca_is_configured(layout, monkeypatch):
+    """Migration public->lab, lab->public and rollback all verify against system + lab roots."""
+    from app import config as cfg
+    root = _lab_root(layout, monkeypatch, cfg)
+    seen = []
 
     def fake_post(url, json=None, headers=None, verify=None, timeout=None):
-        seen["verify"] = verify
+        seen.append(verify)
         return _Resp(200) if url.endswith("/validation") else _Resp(204)
 
     monkeypatch.setattr(deploy.requests, "post", fake_post)
     cert, key, ca = _files(layout)
-    res = deploy.deploy_paths(make_server(acme_ca="lab", verify_ssl=True), cert, key, ca)
-    assert res.ok and seen["verify"] == str(root)
-    deploy.deploy_paths(make_server(acme_ca="letsencrypt", verify_ssl=True), cert, key, ca)
-    assert seen["verify"] is True
+    for ca_choice in ("lab", "letsencrypt", "letsencrypt_test"):
+        assert deploy.deploy_paths(make_server(acme_ca=ca_choice, verify_ssl=True), cert, key, ca).ok
+    assert len(set(seen)) == 1 and seen[0].endswith("api-trust.pem")
+    text = open(seen[0]).read()
+    assert "LABROOT" in text and "BEGIN CERTIFICATE" in text
+    # rollback uses the same code path
+    from app import restart
+    monkeypatch.setattr(restart, "_reload_nginx", lambda s: StepResult("restart", True, "ok"))
+    monkeypatch.setattr(restart, "_wait_for_served_serial", lambda s, want, t: (True, 0))
+    rb = restart._rollback_dir(make_server()); rb.mkdir(parents=True, exist_ok=True)
+    for name in ("orch.example.test.cer", "orch.example.test.key", "ca.cer"):
+        (rb / name).write_text("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n")
+    monkeypatch.setattr(restart, "_deployed_serial_from", lambda p: 1)
+    seen.clear()
+    restart._attempt_rollback(make_server(acme_ca="lab", verify_ssl=True), failed_serial=2)
+    assert seen and seen[0].endswith("api-trust.pem")
+    # verify_ssl off still means no verification, root present or not
+    seen.clear()
+    deploy.deploy_paths(make_server(acme_ca="lab", verify_ssl=False), cert, key, ca)
+    assert seen[0] is False
+    assert root.is_file()

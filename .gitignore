@@ -28,3 +28,4 @@ config/servers.json.bak
 # Local dev / test
 .pytest_cache/
 requirements-dev.lock
+data/pki-root/

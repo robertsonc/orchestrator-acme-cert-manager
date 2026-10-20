@@ -38,11 +38,12 @@ CF_TOKEN_ENV = "CF_DNS_API_TOKEN"  # env var Lego reads for the Cloudflare DNS-0
 # Bundled lab CA (step-ca), optional. See README "Bundled lab CA".
 LAB_CA_ID = "lab"                                  # acme.ca value that selects it
 LAB_CA_HOST = os.environ.get("LAB_CA_HOST", "")
-LAB_CA_PORT = int(os.environ.get("LAB_CA_PORT", "9000") or 9000)
+LAB_CA_PORT = int(os.environ.get("LAB_CA_PORT", "9000") or 9000)   # step-ca listens on this port inside and outside
 LAB_CA_PROVISIONER = os.environ.get("LAB_CA_PROVISIONER", "lab")
 LAB_CA_CERTS_DIR = Path(os.environ.get("LAB_CA_CERTS_DIR", str(DATA_DIR / "pki" / "certs")))
 LAB_CA_ROOT = LAB_CA_CERTS_DIR / "root_ca.crt"
 LAB_CA_INTERMEDIATE = LAB_CA_CERTS_DIR / "intermediate_ca.crt"
+LAB_CA_OFFLINE_MARKER = LAB_CA_CERTS_DIR / "root-key-offline"   # written by lab-ca-init.sh
 
 
 class ConfigError(Exception):
@@ -271,6 +272,40 @@ def lab_ca_issuer_names() -> frozenset[str]:
             continue
     _LAB_ISSUERS = (stamp, frozenset(names))
     return _LAB_ISSUERS[1]
+
+
+TRUST_DIR = CONFIG_DIR / "trust"
+COMBINED_TRUST_FILE = TRUST_DIR / "api-trust.pem"
+
+
+def api_trust_bundle(ca_bundle: str = "") -> str | bool:
+    """Trust material for verified Orchestrator API calls.
+
+    Returns a PEM path that holds the system/certifi roots PLUS the lab CA root
+    (when the lab CA is configured) PLUS the server's own ca_bundle, so that a
+    verified call succeeds whatever the appliance currently serves: a public
+    certificate before a migration to the lab CA, a lab certificate during a
+    rollback to a public one, or a private-CA certificate the operator trusts.
+    Returns True (plain system trust) when nothing needs adding.
+    """
+    extras = [f for f in (LAB_CA_ROOT if LAB_CA_HOST else None,
+                          Path(ca_bundle) if ca_bundle else None) if f and f.is_file()]
+    if not extras:
+        return True
+    try:
+        import certifi
+        system = Path(certifi.where())
+    except ImportError:  # pragma: no cover
+        system = None
+    parts = [system] + extras if system and system.is_file() else extras
+    key = "|".join(f"{f}:{f.stat().st_mtime_ns}" for f in parts)
+    TRUST_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = TRUST_DIR / "api-trust.stamp"
+    if COMBINED_TRUST_FILE.is_file() and stamp.is_file() and stamp.read_text() == key:
+        return str(COMBINED_TRUST_FILE)
+    COMBINED_TRUST_FILE.write_bytes(b"".join(f.read_bytes().rstrip(b"\n") + b"\n" for f in parts))
+    stamp.write_text(key)
+    return str(COMBINED_TRUST_FILE)
 
 
 def lab_ca_root_fingerprint() -> str:

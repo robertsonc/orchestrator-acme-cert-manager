@@ -43,8 +43,8 @@ ORCH_NGINX_RELOAD_CMD="${ORCH_NGINX_RELOAD_CMD:-/bin/systemctl reload nginx}"
 KEY_TYPE="${KEY_TYPE:-rsa}"
 LAB_CA_DOMAIN="${LAB_CA_DOMAIN:-}"
 LAB_CA_HOST="${LAB_CA_HOST:-}"
-LAB_CA_NAME="${LAB_CA_NAME:-Lab CA}"
-LAB_CA_PORT="${LAB_CA_PORT:-9000}"
+LAB_CA_NAME="${LAB_CA_NAME:-}"        # empty = unspecified: taken from an existing CA, else "Lab CA"
+LAB_CA_PORT="${LAB_CA_PORT:-}"        # empty = unspecified: taken from an existing CA, else 9000
 LAB_CA_IMAGE="${LAB_CA_IMAGE:-smallstep/step-ca:0.30.2}"
 with_ca=0
 non_interactive=0
@@ -75,9 +75,10 @@ Bundled lab CA (optional):
                          the 'lab-ca' compose profile. Requires a reachable Docker daemon.
   --lab-domain DOMAIN    DNS domain the lab CA may issue for (name constraint), e.g. lab.example.net
   --ca-host HOST         The CA's own hostname (default: ca.<lab-domain>); needs a DNS record to this host
-  --ca-name NAME         Display name of the CA (default: "${LAB_CA_NAME}")
-  --ca-port PORT         Port step-ca listens on, inside and outside the container (default: ${LAB_CA_PORT})
-                         Re-runs verify these against the initialised CA and refuse to drift.
+  --ca-name NAME         Display name of the CA (default: "Lab CA")
+  --ca-port PORT         Port step-ca listens on, inside and outside the container (default: 9000)
+                         On a re-run, values you do not pass are taken from the initialised CA; values
+                         you do pass must match it (a CA cannot be renamed in place).
 
 Behaviour:
   --non-interactive      Never prompt. Docker install is auto-approved; anything needing a human
@@ -336,22 +337,24 @@ ensure_lab_ca() {
     s_host="$(read_meta LAB_CA_HOST "$meta")"; s_dom="$(read_meta LAB_CA_DOMAIN "$meta")"
     s_port="$(read_meta LAB_CA_PORT "$meta")"; s_name="$(read_meta LAB_CA_NAME "$meta")"
     local drift=0
-    [[ -z "$LAB_CA_DOMAIN" || "$LAB_CA_DOMAIN" == "$s_dom" ]] || { err "--lab-domain '$LAB_CA_DOMAIN' differs from the initialised CA ('$s_dom')"; drift=1; }
+    [[ -z "$LAB_CA_DOMAIN" || "$LAB_CA_DOMAIN" == "$s_dom" ]]  || { err "--lab-domain '$LAB_CA_DOMAIN' differs from the initialised CA ('$s_dom')"; drift=1; }
     [[ -z "$LAB_CA_HOST"   || "$LAB_CA_HOST"   == "$s_host" ]] || { err "--ca-host '$LAB_CA_HOST' differs from the initialised CA ('$s_host')"; drift=1; }
-    [[ "$LAB_CA_PORT" == "$s_port" ]] || { err "LAB_CA_PORT '$LAB_CA_PORT' differs from the initialised CA ('$s_port')"; drift=1; }
-    [[ "$LAB_CA_NAME" == "Lab CA" || "$LAB_CA_NAME" == "$s_name" ]] || { err "--ca-name '$LAB_CA_NAME' differs from the initialised CA ('$s_name')"; drift=1; }
+    [[ -z "$LAB_CA_PORT"   || "$LAB_CA_PORT"   == "$s_port" ]] || { err "--ca-port '$LAB_CA_PORT' differs from the initialised CA ('$s_port')"; drift=1; }
+    [[ -z "$LAB_CA_NAME"   || "$LAB_CA_NAME"   == "$s_name" ]] || { err "--ca-name '$LAB_CA_NAME' differs from the initialised CA ('$s_name')"; drift=1; }
     if [[ $drift -eq 1 ]]; then
       die "a CA cannot be renamed in place. To rebuild: docker compose stop lab-ca; move ${pki} aside (and ${offline} for a new root); re-run; re-distribute the root to every client."
     fi
-    LAB_CA_DOMAIN="$s_dom"; LAB_CA_HOST="$s_host"; LAB_CA_NAME="$s_name"
+    LAB_CA_DOMAIN="$s_dom"; LAB_CA_HOST="$s_host"; LAB_CA_PORT="$s_port"; LAB_CA_NAME="$s_name"
   else
     [[ -n "$LAB_CA_DOMAIN" ]] || die "--with-ca needs --lab-domain <dns-domain the CA may issue for>"
     [[ -n "$LAB_CA_HOST" ]] || LAB_CA_HOST="ca.${LAB_CA_DOMAIN}"
+    [[ -n "$LAB_CA_PORT" ]] || LAB_CA_PORT=9000
+    [[ -n "$LAB_CA_NAME" ]] || LAB_CA_NAME="Lab CA"
   fi
   [[ "$LAB_CA_DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] || die "invalid --lab-domain '${LAB_CA_DOMAIN}'"
   [[ "$LAB_CA_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || die "invalid --ca-host '${LAB_CA_HOST}'"
   [[ "$LAB_CA_HOST" == *".${LAB_CA_DOMAIN}" ]] || die "--ca-host must be a name under --lab-domain (the CA's own certificate is name-constrained)"
-  [[ "$LAB_CA_PORT" =~ ^[0-9]+$ && $LAB_CA_PORT -ge 1 && $LAB_CA_PORT -le 65535 ]] || die "invalid LAB_CA_PORT '${LAB_CA_PORT}'"
+  [[ "$LAB_CA_PORT" =~ ^[0-9]+$ && $LAB_CA_PORT -ge 1 && $LAB_CA_PORT -le 65535 ]] || die "invalid --ca-port '${LAB_CA_PORT}'"
   [[ "$LAB_CA_NAME" != *'"'* && "$LAB_CA_NAME" != *'\'* ]] || die "--ca-name may not contain quotes or backslashes"
 
   mkdir -p "${pki}/certs" "${pki}/secrets" "${pki}/config" "${pki}/db" "$offline"

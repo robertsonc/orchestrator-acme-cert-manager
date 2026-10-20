@@ -154,7 +154,6 @@ def _lab_root(layout, monkeypatch, cfg):
     monkeypatch.setattr(cfg, "LAB_CA_HOST", "ca.lab.example.net")
     monkeypatch.setattr(cfg, "LAB_CA_ROOT", root)
     monkeypatch.setattr(cfg, "TRUST_DIR", layout["cfg"] / "trust")
-    monkeypatch.setattr(cfg, "COMBINED_TRUST_FILE", layout["cfg"] / "trust" / "api-trust.pem")
     return root
 
 
@@ -169,8 +168,13 @@ def test_api_trust_bundle_combines_system_lab_and_custom(layout, monkeypatch):
     text = open(path).read()
     assert "LABROOT" in text and open(certifi.where()).read()[:40] in text
     custom = layout["data"] / "custom.pem"; custom.write_text("-----BEGIN CERTIFICATE-----\nCUSTOM\n-----END CERTIFICATE-----\n")
-    assert "CUSTOM" in open(cfg.api_trust_bundle(str(custom))).read()
-    assert cfg.api_trust_bundle(str(custom)) == path          # cached, same file
+    # exclusive (default): the custom bundle is the ONLY trust, exactly as before the lab CA existed
+    assert cfg.api_trust_bundle(str(custom)) == str(custom)
+    # additive: custom + lab + system, in a distinct immutable file
+    add = cfg.api_trust_bundle(str(custom), "additive")
+    assert add != path and "CUSTOM" in open(add).read() and "LABROOT" in open(add).read()
+    assert cfg.api_trust_bundle(str(custom), "additive") == add   # same content -> same file
+    assert cfg.api_trust_bundle() == path                          # unchanged by the other call
 
 
 def test_verified_calls_use_combined_trust_whatever_ca_is_configured(layout, monkeypatch):
@@ -187,7 +191,7 @@ def test_verified_calls_use_combined_trust_whatever_ca_is_configured(layout, mon
     cert, key, ca = _files(layout)
     for ca_choice in ("lab", "letsencrypt", "letsencrypt_test"):
         assert deploy.deploy_paths(make_server(acme_ca=ca_choice, verify_ssl=True), cert, key, ca).ok
-    assert len(set(seen)) == 1 and seen[0].endswith("api-trust.pem")
+    assert len(set(seen)) == 1 and "/trust/api-trust-" in seen[0]
     text = open(seen[0]).read()
     assert "LABROOT" in text and "BEGIN CERTIFICATE" in text
     # rollback uses the same code path
@@ -200,9 +204,71 @@ def test_verified_calls_use_combined_trust_whatever_ca_is_configured(layout, mon
     monkeypatch.setattr(restart, "_deployed_serial_from", lambda p: 1)
     seen.clear()
     restart._attempt_rollback(make_server(acme_ca="lab", verify_ssl=True), failed_serial=2)
-    assert seen and seen[0].endswith("api-trust.pem")
+    assert seen and "/trust/api-trust-" in seen[0]
     # verify_ssl off still means no verification, root present or not
     seen.clear()
     deploy.deploy_paths(make_server(acme_ca="lab", verify_ssl=False), cert, key, ca)
     assert seen[0] is False
     assert root.is_file()
+
+
+
+def test_missing_ca_bundle_fails_closed(layout, monkeypatch):
+    from app import config as cfg
+    _lab_root(layout, monkeypatch, cfg)
+    custom = layout["data"] / "custom.pem"
+    custom.write_text("-----BEGIN CERTIFICATE-----\nCUSTOM\n-----END CERTIFICATE-----\n")
+    assert cfg.api_trust_bundle(str(custom)) == str(custom)
+    custom.unlink()                                   # the operator's pinned CA disappears
+    for mode in ("exclusive", "additive"):
+        with __import__("pytest").raises(cfg.ConfigError):
+            cfg.api_trust_bundle(str(custom), mode)
+    calls = []
+    monkeypatch.setattr(deploy.requests, "post", lambda *a, **k: calls.append(1))
+    cert, key, ca = _files(layout)
+    res = deploy.deploy_paths(make_server(verify_ssl=True, ca_bundle=str(custom)), cert, key, ca)
+    assert not res.ok and "refusing to fall back" in res.message and calls == []
+
+
+def test_exclusive_bundle_is_passed_verbatim_even_with_lab_ca(layout, monkeypatch):
+    """A pinned private CA must not be widened by the lab root or system roots."""
+    from app import config as cfg
+    _lab_root(layout, monkeypatch, cfg)
+    custom = layout["data"] / "private-ca.pem"
+    custom.write_text("-----BEGIN CERTIFICATE-----\nPRIVATE\n-----END CERTIFICATE-----\n")
+    seen = []
+    monkeypatch.setattr(deploy.requests, "post", lambda url, **k: (seen.append(k["verify"]), _Resp(200) if url.endswith("/validation") else _Resp(204))[1])
+    cert, key, ca = _files(layout)
+    assert deploy.deploy_paths(make_server(acme_ca="lab", verify_ssl=True, ca_bundle=str(custom)), cert, key, ca).ok
+    assert seen[0] == str(custom)
+    text = open(seen[0]).read()
+    assert "LABROOT" not in text and text.count("BEGIN CERTIFICATE") == 1
+
+
+def test_concurrent_bundles_are_distinct_and_immutable(layout, monkeypatch):
+    """Two deployments with different custom CAs in additive mode never share or truncate a file."""
+    import threading
+    from app import config as cfg
+    _lab_root(layout, monkeypatch, cfg)
+    a = layout["data"] / "a.pem"; a.write_text("-----BEGIN CERTIFICATE-----\nCUSTOMROOT-ALPHA\n-----END CERTIFICATE-----\n")
+    b = layout["data"] / "b.pem"; b.write_text("-----BEGIN CERTIFICATE-----\nCUSTOMROOT-BRAVO\n-----END CERTIFICATE-----\n")
+    results: dict[str, set] = {"a": set(), "b": set()}
+    errors = []
+
+    def worker(tag, path):
+        try:
+            for _ in range(25):
+                out = cfg.api_trust_bundle(str(path), "additive")
+                text = open(out).read()
+                assert text.endswith("-----END CERTIFICATE-----\n"), "partial file observed"
+                assert ("CUSTOMROOT-ALPHA" in text) == (tag == "a") and ("CUSTOMROOT-BRAVO" in text) == (tag == "b")
+                results[tag].add(out)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(t, p)) for _ in range(3) for t, p in (("a", a), ("b", b))]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    assert not errors
+    assert len(results["a"]) == 1 and len(results["b"]) == 1 and results["a"] != results["b"]
+    assert not list((layout["cfg"] / "trust").glob(".*.tmp"))

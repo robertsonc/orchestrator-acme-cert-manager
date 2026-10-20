@@ -496,7 +496,7 @@ def _flat_from_server(s) -> dict:
     return {
         "id": s.id, "name": s.name, "orchestrator_host": s.orchestrator_host,
         "domain": s.domain, "verify_ssl": s.verify_ssl, "ca_bundle": s.ca_bundle,
-        "acme_ca": s.acme_ca, "acme_email": s.acme_email, "key_type": s.key_type,
+        "ca_bundle_mode": s.ca_bundle_mode, "acme_ca": s.acme_ca, "acme_email": s.acme_email, "key_type": s.key_type,
         "dns_provider": s.dns_provider, "dns_api_token": "", "ssh_user": s.ssh_user,
         "ssh_key_path": s.ssh_key_path, "ssh_known_hosts": s.ssh_known_hosts,
         "ssh_port": s.ssh_port, "restart_command": s.restart_command,
@@ -508,7 +508,7 @@ def _flat_from_server(s) -> dict:
 def _flat_blank() -> dict:
     return {
         "id": "", "name": "", "orchestrator_host": "", "domain": "", "verify_ssl": False,
-        "ca_bundle": "", "acme_ca": "letsencrypt_test", "acme_email": "", "key_type": "rsa2048",
+        "ca_bundle": "", "ca_bundle_mode": "exclusive", "acme_ca": "letsencrypt_test", "acme_email": "", "key_type": "rsa2048",
         "dns_provider": "cloudflare", "dns_api_token": "", "ssh_user": "",
         "ssh_key_path": config.DEFAULT_SSH_KEY, "ssh_known_hosts": config.DEFAULT_KNOWN_HOSTS,
         "ssh_port": 22, "restart_command": config.DEFAULT_RESTART_COMMAND,
@@ -526,6 +526,7 @@ def _flat_from_request(f) -> dict:
         "domain": f.get("domain", "").strip() or host,
         "verify_ssl": f.get("verify_ssl") == "on",
         "ca_bundle": f.get("ca_bundle", "").strip(),
+        "ca_bundle_mode": f.get("ca_bundle_mode", "exclusive").strip() or "exclusive",
         "acme_ca": f.get("acme_ca", "letsencrypt").strip(),
         "acme_email": f.get("acme_email", "").strip(),
         "key_type": f.get("key_type", "rsa2048").strip(),
@@ -548,6 +549,7 @@ def _nest(flat: dict) -> dict:
         "orchestrator_host": flat["orchestrator_host"], "domain": flat["domain"],
         "api_key_env": flat["api_key_env"], "api_key": flat["api_key"],
         "verify_ssl": flat["verify_ssl"], "ca_bundle": flat["ca_bundle"],
+        "ca_bundle_mode": flat["ca_bundle_mode"],
         "acme": {"ca": flat["acme_ca"], "email": flat["acme_email"], "key_type": flat["key_type"]},
         "dns": {"provider": flat["dns_provider"], "api_token": flat["dns_api_token"]},
         "ssh": {
@@ -590,6 +592,8 @@ def _validate(flat: dict, is_new: bool) -> list[str]:
         from pathlib import Path
         if not Path(flat["ca_bundle"]).is_file():
             errors.append(f"CA bundle not found at {flat['ca_bundle']} (path inside the container).")
+    if flat["ca_bundle_mode"] not in config.CA_BUNDLE_MODES:
+        errors.append("CA bundle mode must be 'exclusive' or 'additive'.")
     if flat["orchestrator_host"]:
         try:
             candidate = config.server_from_dict(_nest(flat))

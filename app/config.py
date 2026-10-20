@@ -39,7 +39,7 @@ CF_TOKEN_ENV = "CF_DNS_API_TOKEN"  # env var Lego reads for the Cloudflare DNS-0
 LAB_CA_ID = "lab"                                  # acme.ca value that selects it
 LAB_CA_HOST = os.environ.get("LAB_CA_HOST", "")
 LAB_CA_PORT = int(os.environ.get("LAB_CA_PORT", "9000") or 9000)   # step-ca listens on this port inside and outside
-LAB_CA_PROVISIONER = os.environ.get("LAB_CA_PROVISIONER", "lab")
+LAB_CA_PROVISIONER = "lab"   # fixed: created by pki/lab-ca-init.sh; not configurable (see README)
 LAB_CA_CERTS_DIR = Path(os.environ.get("LAB_CA_CERTS_DIR", str(DATA_DIR / "pki" / "certs")))
 LAB_CA_ROOT = LAB_CA_CERTS_DIR / "root_ca.crt"
 LAB_CA_INTERMEDIATE = LAB_CA_CERTS_DIR / "intermediate_ca.crt"
@@ -75,6 +75,7 @@ def _one(s: dict) -> ServerConfig:
             api_key=s.get("api_key", ""),
             verify_ssl=bool(s.get("verify_ssl", False)),
             ca_bundle=(s.get("ca_bundle") or "").strip(),
+            ca_bundle_mode=(s.get("ca_bundle_mode") or "exclusive").strip().lower(),
         )
     except KeyError as exc:
         raise ConfigError(f"server entry missing required field: {exc}") from exc
@@ -93,6 +94,7 @@ def _to_dict(s: ServerConfig) -> dict:
         "api_key": s.api_key,
         "verify_ssl": s.verify_ssl,
         "ca_bundle": s.ca_bundle,
+        "ca_bundle_mode": s.ca_bundle_mode,
         "acme": {"ca": s.acme_ca, "email": s.acme_email, "key_type": s.key_type},
         "dns": {"provider": s.dns_provider, "api_token": s.dns_api_token},
         "ssh": {
@@ -275,21 +277,38 @@ def lab_ca_issuer_names() -> frozenset[str]:
 
 
 TRUST_DIR = CONFIG_DIR / "trust"
-COMBINED_TRUST_FILE = TRUST_DIR / "api-trust.pem"
+CA_BUNDLE_MODES = ("exclusive", "additive")
+_TRUST_LOCK = __import__("threading").Lock()
 
 
-def api_trust_bundle(ca_bundle: str = "") -> str | bool:
+def api_trust_bundle(ca_bundle: str = "", mode: str = "exclusive") -> str | bool:
     """Trust material for verified Orchestrator API calls.
 
-    Returns a PEM path that holds the system/certifi roots PLUS the lab CA root
-    (when the lab CA is configured) PLUS the server's own ca_bundle, so that a
-    verified call succeeds whatever the appliance currently serves: a public
-    certificate before a migration to the lab CA, a lab certificate during a
-    rollback to a public one, or a private-CA certificate the operator trusts.
-    Returns True (plain system trust) when nothing needs adding.
+    * ca_bundle set, mode "exclusive" (default): that file is the ONLY trust, as
+      before the lab CA existed. A missing file is a ConfigError, never a
+      fallback to broader trust.
+    * ca_bundle set, mode "additive": system (certifi) roots + lab root + the
+      bundle, for operators who want a private CA *and* public/lab transitions.
+    * no ca_bundle: system roots + the lab root when the lab CA is configured,
+      so public<->lab migrations and rollback keep verifying; plain system trust
+      (True) when the lab CA is not configured.
+
+    Combined bundles are immutable files named by content digest and written
+    atomically, so concurrent deployments with different inputs never share or
+    truncate each other's file.
     """
-    extras = [f for f in (LAB_CA_ROOT if LAB_CA_HOST else None,
-                          Path(ca_bundle) if ca_bundle else None) if f and f.is_file()]
+    extras: list[Path] = []
+    if ca_bundle:
+        p = Path(ca_bundle)
+        if not p.is_file():
+            raise ConfigError(f"ca_bundle {ca_bundle} is not readable; refusing to fall back to broader trust")
+        if mode not in CA_BUNDLE_MODES:
+            raise ConfigError(f"ca_bundle_mode must be one of {CA_BUNDLE_MODES}, got {mode!r}")
+        if mode == "exclusive":
+            return str(p)
+        extras.append(p)
+    if LAB_CA_HOST and LAB_CA_ROOT.is_file():
+        extras.append(LAB_CA_ROOT)
     if not extras:
         return True
     try:
@@ -297,15 +316,21 @@ def api_trust_bundle(ca_bundle: str = "") -> str | bool:
         system = Path(certifi.where())
     except ImportError:  # pragma: no cover
         system = None
-    parts = [system] + extras if system and system.is_file() else extras
-    key = "|".join(f"{f}:{f.stat().st_mtime_ns}" for f in parts)
-    TRUST_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = TRUST_DIR / "api-trust.stamp"
-    if COMBINED_TRUST_FILE.is_file() and stamp.is_file() and stamp.read_text() == key:
-        return str(COMBINED_TRUST_FILE)
-    COMBINED_TRUST_FILE.write_bytes(b"".join(f.read_bytes().rstrip(b"\n") + b"\n" for f in parts))
-    stamp.write_text(key)
-    return str(COMBINED_TRUST_FILE)
+    parts = ([system] if system and system.is_file() else []) + extras
+    data = b"".join(f.read_bytes().rstrip(b"\n") + b"\n" for f in parts)
+    import hashlib
+    digest = hashlib.sha256(data).hexdigest()[:24]
+    out = TRUST_DIR / f"api-trust-{digest}.pem"
+    if out.is_file():
+        return str(out)
+    with _TRUST_LOCK:
+        if out.is_file():
+            return str(out)
+        TRUST_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = TRUST_DIR / f".{out.name}.{os.getpid()}.tmp"
+        tmp.write_bytes(data)
+        os.replace(tmp, out)          # atomic: readers see either nothing or the whole file
+    return str(out)
 
 
 def lab_ca_root_fingerprint() -> str:

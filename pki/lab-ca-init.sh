@@ -40,6 +40,7 @@ set -euo pipefail
 : "${LAB_CA_LEAF_MAX:=2160h}"      # 90 d, matches the renewal logic
 TPL_DIR="${LAB_CA_TEMPLATE_DIR:-/pki-init}"
 META="config/lab-ca.meta"
+PROGRESS="config/.init-in-progress"   # exists only while a fresh init is running
 CRL_URL="https://${LAB_CA_HOST}:${LAB_CA_PORT}/1.0/crl"
 
 die() { echo "lab-ca-init: $*" >&2; exit "${2:-1}"; }
@@ -53,10 +54,14 @@ esac
 mkdir -p "$STEPPATH"
 cd "$STEPPATH"
 
-# ---- re-run: verify identity, change nothing --------------------------------
+# ---- re-run: verify identity, change nothing; resume an interrupted init ------
+if [[ -f config/ca.json && ! -f "$META" && -f "$PROGRESS" ]]; then
+  echo ">> a previous initialisation was interrupted ($(cat "$PROGRESS")); discarding the partial ONLINE state and starting over (the offline root in $OFFLINE is kept and reused)"
+  rm -rf config db certs/intermediate_ca.crt certs/root_ca.crt certs/root_ca.fingerprint certs/root-key-offline secrets/intermediate_ca_key
+fi
 if [[ -f config/ca.json ]]; then
   if [[ ! -f "$META" ]]; then
-    die "config/ca.json exists but $META is missing; this CA was not initialised by this script (or metadata was removed). Refusing to guess its identity." 3
+    die "config/ca.json exists but $META is missing and no in-progress marker is present; this CA was not initialised by this script (or metadata was removed). Refusing to guess its identity." 3
   fi
   mismatch=0
   while IFS='=' read -r k v; do
@@ -80,6 +85,7 @@ fi
 # ---- fresh init ----------------------------------------------------------------
 umask 077
 mkdir -p secrets certs config config/templates
+echo "started $(date -u +%Y-%m-%dT%H:%M:%SZ) for ${LAB_CA_HOST}:${LAB_CA_PORT}" > "$PROGRESS"
 [[ -d "$OFFLINE" && -w "$OFFLINE" ]] || die "offline root directory $OFFLINE is missing or not writable" 2
 [[ -s secrets/password ]] || head -c 30 /dev/urandom | base64 | tr -d '/+=' > secrets/password
 
@@ -99,6 +105,7 @@ step ca init --deployment-type standalone \
   --root "$OFFLINE/root_ca.crt" --key "$OFFLINE/root_ca_key" --key-password-file "$OFFLINE/root_password" \
   --password-file secrets/password --provisioner-password-file secrets/password \
   --acme >/dev/null
+[[ "${LAB_CA_FAULT:-}" == "after-init" ]] && die "fault injected after step ca init (test hook)" 99
 
 echo ">> re-issuing the intermediate with name constraints (permitted: .$LAB_CA_DOMAIN, no IPs)"
 sed "s/__LAB_DOMAIN__/${LAB_CA_DOMAIN}/" "$TPL_DIR/intermediate.tpl" > config/templates/intermediate.tpl
@@ -135,6 +142,7 @@ LAB_CA_PROVISIONER=${LAB_CA_PROVISIONER}
 LAB_CA_INITIALISED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
 chmod 644 "$META"
+rm -f "$PROGRESS"
 
 [[ -f secrets/root_ca_key ]] && die "unexpected: root key found in the online volume" 4
 echo "root key generated in $OFFLINE on $(date -u +%Y-%m-%dT%H:%M:%SZ); never present in this volume" > certs/root-key-offline

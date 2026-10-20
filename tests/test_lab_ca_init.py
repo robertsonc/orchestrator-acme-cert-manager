@@ -14,6 +14,8 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 STEP = shutil.which("step")
+if STEP is None and os.environ.get("REQUIRE_STEP_CLI"):
+    raise RuntimeError("REQUIRE_STEP_CLI is set but no `step` binary is on PATH; these tests must run, not skip")
 pytestmark = pytest.mark.skipif(STEP is None, reason="step CLI not on PATH")
 
 
@@ -57,3 +59,27 @@ def test_rerun_is_noop_and_drift_fails_closed(tmp_path):
 def test_host_outside_domain_is_refused(tmp_path):
     r = _run(tmp_path, LAB_CA_HOST="ca.other.net")
     assert r.returncode == 2 and not (tmp_path / "online" / "config").exists()
+
+
+def test_interrupted_init_is_resumed(tmp_path):
+    """Fault-inject right after `step ca init`: the next run discards the partial state and completes."""
+    broken = _run(tmp_path, LAB_CA_FAULT="after-init")
+    assert broken.returncode == 99 and "fault injected" in broken.stderr
+    online = tmp_path / "online"
+    assert (online / "config" / "ca.json").is_file() and not (online / "config" / "lab-ca.meta").exists()
+    assert (online / "config" / ".init-in-progress").is_file()
+    again = _run(tmp_path)
+    assert again.returncode == 0, again.stderr + again.stdout
+    assert "interrupted" in again.stdout and "Lab CA initialised" in again.stdout
+    assert (online / "config" / "lab-ca.meta").is_file() and not (online / "config" / ".init-in-progress").exists()
+    assert sorted(p.name for p in (online / "secrets").iterdir()) == ["intermediate_ca_key", "password"]
+    # the offline root was reused, not regenerated
+    assert (tmp_path / "offline" / "root_ca_key").is_file()
+    assert _run(tmp_path).returncode == 0
+
+
+def test_provisioner_name_is_the_fixed_constant(tmp_path):
+    from app import config
+    assert _run(tmp_path).returncode == 0
+    ca = (tmp_path / "online" / "config" / "ca.json").read_text()
+    assert f'"name": "{config.LAB_CA_PROVISIONER}"' in ca and config.LAB_CA_PROVISIONER == "lab"

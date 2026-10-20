@@ -32,10 +32,15 @@ class ServerConfig:
     api_key: str = ""                     # inline Orchestrator API key (else api_key_env)
     verify_ssl: bool = False
     ca_bundle: str = ""                   # optional CA bundle (PEM) used when verify_ssl is on
+    ca_bundle_mode: str = "exclusive"     # exclusive: ca_bundle is the ONLY trust; additive: + system + lab roots
 
     @property
     def requests_verify(self):
-        """Value for requests' verify= : a CA bundle path, True, or False."""
+        """Legacy view of the trust setting: a CA bundle path, True, or False.
+
+        deploy.py uses config.api_trust_bundle(), which honours ca_bundle_mode and
+        adds the lab root; this property keeps the exclusive semantics of ca_bundle.
+        """
         if not self.verify_ssl:
             return False
         return self.ca_bundle or True

@@ -85,7 +85,7 @@ def cmd_ca_info(_: argparse.Namespace) -> int:
         print("Issuers:         " + "; ".join(names))
         print("Root key:        " + ("offline (marker present)" if config.LAB_CA_OFFLINE_MARKER.is_file()
                                      else "UNKNOWN — marker missing; verify the key is not in the online volume"))
-        print(f"API trust:       {config.api_trust_bundle()}")
+        print(f"API trust:       {config.api_trust_bundle()} (servers without ca_bundle)")
     else:
         print(f"Root file:       {config.LAB_CA_ROOT} (MISSING — mount ./data/pki/certs and run setup.sh --with-ca)")
         return 1

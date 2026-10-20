@@ -108,6 +108,7 @@ def logout():
 CA_CHOICES = [
     ("letsencrypt", "Let's Encrypt (production)"),
     ("letsencrypt_test", "Let's Encrypt (staging)"),
+    (config.LAB_CA_ID, "Lab CA (bundled step-ca)"),
 ]
 KEY_CHOICES = ["rsa2048", "rsa3072", "rsa4096"]
 _ALLOWED_CA = {v for v, _ in CA_CHOICES}
@@ -134,9 +135,11 @@ def _is_renewing(server_id: str) -> bool:
 
 # ============================= certificate state =============================
 def environment_of(issuer: str | None) -> str | None:
-    """'staging' / 'production' from an issuer DN, or None if unknown."""
+    """'lab' / 'staging' / 'production' from an issuer DN, or None if unknown."""
     if not issuer:
         return None
+    if issuer in config.lab_ca_issuer_names():
+        return "lab"
     up = issuer.upper()
     if "STAGING" in up or "FAKE" in up or "ERSATZ" in up:
         return "staging"
@@ -204,7 +207,7 @@ def invalidate_served_cache() -> None:
 
 def lifecycle(server, issued: dict, served: dict) -> dict:
     """Activation state: does the appliance serve the certificate we issued?"""
-    configured_env = "staging" if config.is_staging_ca(server.acme_ca) else "production"
+    configured_env = config.ca_environment(server.acme_ca)
     if not issued.get("present"):
         return {"state": "none", "configured_env": configured_env,
                 "message": "No certificate issued yet — run Force renew."}
@@ -214,8 +217,10 @@ def lifecycle(server, issued: dict, served: dict) -> dict:
                            f"({served.get('error') or 'no certificate'})."}
     if served.get("serial") == issued.get("serial"):
         msg = "The issued certificate is live on the appliance."
-        if issued.get("environment") == "staging" and configured_env == "production":
-            msg += " It is a STAGING certificate while the server is set to production — run Force renew."
+        ienv = issued.get("environment")
+        if ienv and ienv != configured_env:
+            msg += (f" It was issued by the {ienv.upper()} CA while the server is set to "
+                    f"{configured_env} — run Force renew to issue from the configured CA.")
         return {"state": "live", "configured_env": configured_env, "message": msg}
     ienv = (issued.get("environment") or "unknown").capitalize()
     senv = served.get("environment") or "a different"
@@ -274,8 +279,8 @@ def health(row: dict) -> dict:
         reasons.append("issued certificate not yet served")
     if cert.get("present") and cert.get("days_left") is not None and cert["days_left"] <= 30:
         reasons.append(f"expires in {cert['days_left']} days")
-    if cert.get("environment") == "staging" and lc["configured_env"] == "production":
-        reasons.append("staging certificate while configured for production")
+    if cert.get("environment") and cert["environment"] != lc["configured_env"]:
+        reasons.append(f"{cert['environment']} certificate while configured for {lc['configured_env']}")
     if cert.get("environment") == "staging" and lc["state"] == "live":
         reasons.append("serving a staging certificate")
     if reasons:
@@ -319,7 +324,7 @@ def _row_for(s, with_served: bool = True) -> dict:
     row = {
         "id": s.id, "name": s.name, "domain": s.domain,
         "host": s.orchestrator_host, "ca": s.acme_ca,
-        "ca_env": "staging" if config.is_staging_ca(s.acme_ca) else "production",
+        "ca_env": config.ca_environment(s.acme_ca),
         "verify_ssl": s.verify_ssl, "ca_bundle": s.ca_bundle,
         "ssh_user": s.ssh_user, "ssh_key_path": s.ssh_key_path,
         "ssh_known_hosts": s.ssh_known_hosts, "ssh_port": s.ssh_port,
@@ -362,6 +367,9 @@ def _system() -> dict:
     rep = preflight.run(strict=False)
     d = rep.as_dict()
     d["problems"] = [f.as_dict() for f in rep.findings if f.level in ("fatal", "warn")]
+    d["lab_ca"] = {"configured": config.lab_ca_available(), "host": config.LAB_CA_HOST,
+                   "url": config.lab_ca_base_url(),
+                   "fingerprint": config.lab_ca_root_fingerprint() if config.LAB_CA_ROOT.is_file() else ""}
     return d
 
 
@@ -566,6 +574,9 @@ def _validate(flat: dict, is_new: bool) -> list[str]:
         errors.append("ACME email is required — Let's Encrypt needs it for registration.")
     if flat["acme_ca"] not in _ALLOWED_CA:
         errors.append("Invalid certificate authority selection.")
+    elif config.is_lab_ca(flat["acme_ca"]) and not config.lab_ca_available():
+        errors.append("The bundled lab CA is not configured on this host: run ./setup.sh --with-ca "
+                      "--lab-domain <zone>, then select it.")
     if flat["key_type"] not in _ALLOWED_KEY:
         errors.append("Invalid key type.")
     try:

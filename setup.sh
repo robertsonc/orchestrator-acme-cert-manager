@@ -41,6 +41,12 @@ ACME_EMAIL="${ACME_EMAIL:-}"
 ORCH_RESTART_CMD="${ORCH_RESTART_CMD:-/bin/systemctl restart --no-block gms.service}"
 ORCH_NGINX_RELOAD_CMD="${ORCH_NGINX_RELOAD_CMD:-/bin/systemctl reload nginx}"
 KEY_TYPE="${KEY_TYPE:-rsa}"
+LAB_CA_DOMAIN="${LAB_CA_DOMAIN:-}"
+LAB_CA_HOST="${LAB_CA_HOST:-}"
+LAB_CA_NAME="${LAB_CA_NAME:-Lab CA}"
+LAB_CA_PORT="${LAB_CA_PORT:-9000}"
+LAB_CA_IMAGE="${LAB_CA_IMAGE:-smallstep/step-ca:0.30.2}"
+with_ca=0
 non_interactive=0
 trust_host_key=0
 skip_docker=0
@@ -64,6 +70,13 @@ Target:
   --email EMAIL          ACME account email (required to write servers.json)
   --key-type rsa|ed25519 SSH key type to generate (default: rsa, 4096 bit — tested against Orchestrator)
 
+Bundled lab CA (optional):
+  --with-ca              Initialise the bundled step-ca (ACME DNS-01 + CRL) under ./data/pki and enable
+                         the 'lab-ca' compose profile. Requires a reachable Docker daemon.
+  --lab-domain DOMAIN    DNS domain the lab CA may issue for (name constraint), e.g. lab.example.net
+  --ca-host HOST         The CA's own hostname (default: ca.<lab-domain>); needs a DNS record to this host
+  --ca-name NAME         Display name of the CA (default: "${LAB_CA_NAME}")
+
 Behaviour:
   --non-interactive      Never prompt. Docker install is auto-approved; anything needing a human
                          (host-key confirmation without --trust-host-key, password-based key install)
@@ -79,6 +92,7 @@ Behaviour:
 
 Environment equivalents: ORCH_HOST ORCH_DOMAIN ORCH_SSH_USER ORCH_SSH_PORT ORCH_SERVER_ID
                          ORCH_SERVER_NAME ACME_EMAIL ORCH_RESTART_CMD ORCH_NGINX_RELOAD_CMD KEY_TYPE
+                         LAB_CA_DOMAIN LAB_CA_HOST LAB_CA_NAME LAB_CA_PORT LAB_CA_IMAGE
 EOF
 }
 
@@ -92,6 +106,10 @@ while [[ $# -gt 0 ]]; do
     --name) ORCH_SERVER_NAME="$2"; shift 2 ;;
     --email) ACME_EMAIL="$2"; shift 2 ;;
     --key-type) KEY_TYPE="$2"; shift 2 ;;
+    --with-ca) with_ca=1; shift ;;
+    --lab-domain) LAB_CA_DOMAIN="$2"; shift 2 ;;
+    --ca-host) LAB_CA_HOST="$2"; shift 2 ;;
+    --ca-name) LAB_CA_NAME="$2"; shift 2 ;;
     --non-interactive) non_interactive=1; shift ;;
     --trust-host-key) trust_host_key=1; shift ;;
     --install-sudoers) install_sudoers=1; shift ;;
@@ -290,6 +308,62 @@ ensure_env() {
   fi
 }
 
+set_env_kv() {
+  local key="$1" val="$2" f="${here}/.env"
+  if grep -q "^#\?${key}=" "$f"; then
+    sed -i "s|^#\?${key}=.*|${key}=${val}|" "$f"
+  else
+    printf '%s=%s\n' "$key" "$val" >> "$f"
+  fi
+}
+
+# ---- 4b. bundled lab CA -------------------------------------------------------
+ensure_lab_ca() {
+  step "Bundled lab CA (step-ca)"
+  [[ -n "$LAB_CA_DOMAIN" ]] || die "--with-ca needs --lab-domain <dns-domain the CA may issue for>"
+  [[ "$LAB_CA_DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] || die "invalid --lab-domain '${LAB_CA_DOMAIN}'"
+  [[ -n "$LAB_CA_HOST" ]] || LAB_CA_HOST="ca.${LAB_CA_DOMAIN}"
+  [[ "$LAB_CA_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || die "invalid --ca-host '${LAB_CA_HOST}'"
+  [[ "$LAB_CA_HOST" == *".${LAB_CA_DOMAIN}" ]] || die "--ca-host must be a name under --lab-domain (the CA's own certificate is name-constrained)"
+  [[ "$LAB_CA_NAME" != *'"'* && "$LAB_CA_NAME" != *'\'* ]] || die "--ca-name may not contain quotes or backslashes"
+  local pki="${data}/pki" dcmd="docker"
+  if docker info >/dev/null 2>&1; then dcmd="docker"
+  elif [[ $EUID -ne 0 ]] && sudo -n docker info >/dev/null 2>&1; then dcmd="sudo docker"
+  else die "the lab CA is initialised inside the step-ca image, which needs a reachable Docker daemon (see the Docker step above; or re-run after 'docker info' works)"; fi
+  mkdir -p "${pki}/certs" "${pki}/secrets" "${pki}/config" "${pki}/db"
+  chmod 700 "${pki}/secrets"
+  local uid gid; uid="$(id -u)"; gid="$(id -g)"
+  if [[ -f "${pki}/config/ca.json" ]]; then
+    ok "lab CA already initialised in ${pki}"
+  else
+    echo "  Initialising with ${LAB_CA_IMAGE} (name constraint: .${LAB_CA_DOMAIN}; CA host ${LAB_CA_HOST})"
+    $dcmd run --rm --entrypoint bash -u "${uid}:${gid}" \
+      -e STEPPATH=/home/step -e HOME=/home/step \
+      -e LAB_CA_NAME="$LAB_CA_NAME" -e LAB_CA_HOST="$LAB_CA_HOST" -e LAB_CA_DOMAIN="$LAB_CA_DOMAIN" \
+      -v "${pki}:/home/step" -v "${here}/pki:/pki-init:ro" \
+      "$LAB_CA_IMAGE" /pki-init/lab-ca-init.sh || die "lab CA initialisation failed"
+    ok "lab CA initialised in ${pki}"
+  fi
+  set_env_kv COMPOSE_PROFILES lab-ca
+  set_env_kv LAB_CA_DOMAIN "$LAB_CA_DOMAIN"
+  set_env_kv LAB_CA_HOST "$LAB_CA_HOST"
+  set_env_kv LAB_CA_PORT "$LAB_CA_PORT"
+  set_env_kv LAB_CA_UID "$uid"
+  set_env_kv LAB_CA_GID "$gid"
+  ok ".env: COMPOSE_PROFILES=lab-ca, LAB_CA_HOST=${LAB_CA_HOST}, LAB_CA_DOMAIN=${LAB_CA_DOMAIN}"
+  local fp="(see ${pki}/certs/root_ca.fingerprint)"
+  [[ -f "${pki}/certs/root_ca.fingerprint" ]] && fp="$(cat "${pki}/certs/root_ca.fingerprint")"
+  cat <<EOF
+  Root CA fingerprint (SHA-256): ${fp}
+  Before anything trusts this root, confirm that fingerprint out of band on each client.
+  Required DNS: ${LAB_CA_HOST} -> this host's private address (Cloudflare, DNS-only). The CA's own
+  certificate is issued for that name; clients (and this tool) reach it as https://${LAB_CA_HOST}:${LAB_CA_PORT}
+  Root download: https://${LAB_CA_HOST}:${LAB_CA_PORT}/roots.pem   CRL: https://${LAB_CA_HOST}:${LAB_CA_PORT}/1.0/crl
+  Root key: ${pki}/secrets/root_ca_key is encrypted with ${pki}/secrets/password. The running CA only
+  needs the intermediate key; move the root key off this host once the CA works (keep the password with it).
+EOF
+}
+
 ensure_servers_json() {
   step "Server configuration"
   local f="${cfg}/servers.json"
@@ -474,6 +548,7 @@ fi
 [[ -n "$ORCH_DOMAIN" ]] || ORCH_DOMAIN="$ORCH_HOST"
 
 ensure_env
+if [[ $with_ca -eq 1 ]]; then ensure_lab_ca; fi
 remote_ok=1
 if [[ -z "$ORCH_HOST" ]]; then
   warn "no Orchestrator host given — skipping config generation and remote steps (re-run with --host)"
@@ -503,6 +578,10 @@ cat <<EOF
   5. Tunnel to the UI: ssh -L 8090:localhost:8090 <user>@<this-host>  →  http://localhost:8090
   6. Run a STAGING renewal first, confirm 'Activation: live', then switch the CA to production.
 EOF
+if [[ $with_ca -eq 1 ]]; then
+  echo "  7. Lab CA: distribute the root (README: 'Bundled lab CA'), then pick 'Lab CA' as the server's CA."
+  echo "     Check it from inside the container: docker compose exec -T orchestrator-acme-cert-manager python -m app.cli ca-info"
+fi
 [[ $remote_ok -eq 1 ]] || warn "the SSH/sudo check did not pass — activation will fail until it does (see above)"
 [[ $docker_ready -eq 1 ]] || warn "the docker daemon was not reachable — fix that before 'docker compose up' (see the Docker step above)"
 

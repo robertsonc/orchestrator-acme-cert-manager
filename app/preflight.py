@@ -183,6 +183,10 @@ def check_servers() -> tuple[list[Finding], dict[str, list[str]]]:
             ssh_problems[s.id] = probs
             out.append(Finding("warn", "ssh-config",
                                f"{s.id}: SSH activation will fail until fixed: " + " | ".join(probs)))
+        if config.is_lab_ca(s.acme_ca) and not config.lab_ca_available():
+            out.append(Finding("warn", "lab-ca-missing",
+                               f"{s.id}: the bundled lab CA is selected but LAB_CA_HOST is unset or "
+                               f"{config.LAB_CA_ROOT} is missing; run ./setup.sh --with-ca."))
         if not s.verify_ssl:
             out.append(Finding("info", "tls-unverified",
                                f"{s.id}: verify_ssl is off; Orchestrator API calls do not verify the "

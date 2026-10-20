@@ -98,7 +98,9 @@ def test_api_status_reports_paths(layout, monkeypatch):
     c = _client(layout, monkeypatch)
     j = c.get("/api/status").get_json()
     assert j["servers_file"] == str(config.SERVERS_FILE)
-    assert "findings" in j
+    assert "findings" in j and "lab_ca" in j
+    assert c.get("/settings").status_code == 200
+    assert c.get("/settings/new").status_code == 200
 
 
 def test_login_next_cannot_be_offsite(layout, monkeypatch):
@@ -156,3 +158,21 @@ def test_server_partial_and_api(layout, server, monkeypatch):
     j = c.get("/api/server/orch-test").get_json()
     assert j["server"]["health"]["state"] in ("none", "unknown")
     assert "history" in j
+
+
+def test_environment_of_lab_and_form_choice(layout, monkeypatch):
+    from tests.test_config_persistence import _lab_pki
+    root, inter = _lab_pki(layout, monkeypatch)
+    assert web.environment_of(inter.subject.rfc4514_string()) == "lab"
+    assert web.environment_of("CN=YR2,O=Let's Encrypt,C=US") == "production"
+    s = make_server(acme_ca="lab")
+    issued = {"present": True, "serial": "AA", "environment": "lab"}
+    live = web.lifecycle(s, issued, {"present": True, "serial": "AA", "environment": "lab", "error": None})
+    assert live["state"] == "live" and live["configured_env"] == "lab" and "run Force renew" not in live["message"]
+    mismatch = web.lifecycle(make_server(acme_ca="letsencrypt"), issued,
+                             {"present": True, "serial": "AA", "environment": "lab", "error": None})
+    assert "issued by the LAB CA" in mismatch["message"]
+    flat = web._flat_blank(); flat.update(id="l1", orchestrator_host="orch.lab.example.net", acme_email="a@b.c", acme_ca="lab")
+    assert not any("lab CA is not configured" in e for e in web._validate(flat, is_new=True))
+    monkeypatch.setattr(config, "LAB_CA_HOST", "")
+    assert any("lab CA is not configured" in e for e in web._validate(flat, is_new=True))

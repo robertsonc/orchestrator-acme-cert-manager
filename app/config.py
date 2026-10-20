@@ -35,6 +35,15 @@ DEFAULT_NGINX_RELOAD_COMMAND = "sudo /bin/systemctl reload nginx"
 
 CF_TOKEN_ENV = "CF_DNS_API_TOKEN"  # env var Lego reads for the Cloudflare DNS-01 challenge
 
+# Bundled lab CA (step-ca), optional. See README "Bundled lab CA".
+LAB_CA_ID = "lab"                                  # acme.ca value that selects it
+LAB_CA_HOST = os.environ.get("LAB_CA_HOST", "")
+LAB_CA_PORT = int(os.environ.get("LAB_CA_PORT", "9000") or 9000)
+LAB_CA_PROVISIONER = os.environ.get("LAB_CA_PROVISIONER", "lab")
+LAB_CA_CERTS_DIR = Path(os.environ.get("LAB_CA_CERTS_DIR", str(DATA_DIR / "pki" / "certs")))
+LAB_CA_ROOT = LAB_CA_CERTS_DIR / "root_ca.crt"
+LAB_CA_INTERMEDIATE = LAB_CA_CERTS_DIR / "intermediate_ca.crt"
+
 
 class ConfigError(Exception):
     pass
@@ -211,3 +220,64 @@ def leaf_path_for(server: ServerConfig) -> Path:
 def is_staging_ca(acme_ca: str) -> bool:
     ca = (acme_ca or "").strip().lower()
     return ca == "letsencrypt_test" or "staging" in ca
+
+
+def is_lab_ca(acme_ca: str) -> bool:
+    return (acme_ca or "").strip().lower() == LAB_CA_ID
+
+
+def ca_environment(acme_ca: str) -> str:
+    """'lab' | 'staging' | 'production' for a configured acme.ca value."""
+    if is_lab_ca(acme_ca):
+        return "lab"
+    return "staging" if is_staging_ca(acme_ca) else "production"
+
+
+def lab_ca_base_url() -> str:
+    return f"https://{LAB_CA_HOST}:{LAB_CA_PORT}" if LAB_CA_HOST else ""
+
+
+def lab_ca_acme_url() -> str:
+    """ACME directory of the bundled CA, or '' when it is not configured."""
+    base = lab_ca_base_url()
+    return f"{base}/acme/{LAB_CA_PROVISIONER}/directory" if base else ""
+
+
+def lab_ca_available() -> bool:
+    return bool(LAB_CA_HOST) and LAB_CA_ROOT.is_file()
+
+
+_LAB_ISSUERS: tuple[float, frozenset[str]] = (-1.0, frozenset())
+
+
+def lab_ca_issuer_names() -> frozenset[str]:
+    """RFC 4514 subject names of the lab root and intermediate (cached by mtime).
+
+    A certificate whose issuer is one of these was issued by the lab CA.
+    """
+    global _LAB_ISSUERS
+    files = [f for f in (LAB_CA_ROOT, LAB_CA_INTERMEDIATE) if f.is_file()]
+    if not files:
+        return frozenset()
+    stamp = max(f.stat().st_mtime for f in files)
+    if stamp == _LAB_ISSUERS[0]:
+        return _LAB_ISSUERS[1]
+    from cryptography import x509  # lazy import
+    names = set()
+    for f in files:
+        try:
+            names.add(x509.load_pem_x509_certificate(f.read_bytes()).subject.rfc4514_string())
+        except (ValueError, OSError):
+            continue
+    _LAB_ISSUERS = (stamp, frozenset(names))
+    return _LAB_ISSUERS[1]
+
+
+def lab_ca_root_fingerprint() -> str:
+    """SHA-256 of the root certificate in DER form (same value `step certificate fingerprint` prints)."""
+    if not LAB_CA_ROOT.is_file():
+        return ""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    cert = x509.load_pem_x509_certificate(LAB_CA_ROOT.read_bytes())
+    return cert.fingerprint(hashes.SHA256()).hex()

@@ -20,6 +20,7 @@ It is the Orchestrator counterpart to the [ClearPass ACME Certificate Manager](h
 - [Configuration persistence](#configuration-persistence)
 - [How It Works](#how-it-works)
 - [Staging to production](#staging-to-production)
+- [Bundled lab CA](#bundled-lab-ca)
 - [Configuration Reference](#configuration-reference)
 - [Web UI](#web-ui)
 - [CLI](#cli)
@@ -39,6 +40,7 @@ It is the Orchestrator counterpart to the [ClearPass ACME Certificate Manager](h
 - **Verified activation**: after reloading the web service, the tool reads the certificate the appliance is *actually serving* and confirms its serial matches what was installed. "Port is up" is not treated as success.
 - **Automatic rollback**: if activation can't be verified, the previous working certificate is re‑deployed and re‑verified, so a bad renewal never takes the appliance offline.
 - **Rate‑limit‑safe re‑deploy**: a **Force deploy** action re‑pushes the certificate already on disk without contacting the CA, so you can recover a deployment without spending a Let's Encrypt issuance.
+- **Bundled lab CA (optional)**: a name-constrained `step-ca` in the same Compose stack issues browser-trustable certificates for every management interface in the lab over ACME (DNS-01 via Cloudflare), with a CRL and a root you distribute once. Picked per server like staging or production.
 - **Guided host setup**: `setup.sh` installs Docker if needed, generates a dedicated SSH key, pins the Orchestrator host key, installs the public key, checks the `sudo` rule, and verifies the whole SSH path before the container ever starts.
 - **Preflight checks**: the container refuses to start on a configuration that would silently lose changes; SSH settings are validated when saved and before every activation; a **Test SSH** button verifies authentication and `sudo` authorization without restarting anything.
 - **Deployment diagnostics**: every API failure records the phase (validation / install), HTTP status, attempt count, elapsed time and a redacted response excerpt; transient `502/503/504` answers to the validation call are retried with backoff, without ever re‑issuing.
@@ -95,6 +97,10 @@ orchestrator-acme-cert-manager/
 │   ├── certs/<domain>/        # issued certs, Lego account, rollback snapshot
 │   ├── logs/
 │   └── ssh/                   # orch_restart (private key), orch_restart.pub, known_hosts
+├── pki/
+│   ├── lab-ca-init.sh         # one-time step-ca init (run inside the step-ca image by setup.sh --with-ca)
+│   └── intermediate.tpl       # name-constrained issuing-CA template
+├── data/pki/                  # lab CA state (gitignored): certs/, secrets/, config/, db/
 ├── tests/                     # pytest suite
 ├── Dockerfile
 ├── docker-compose.yml
@@ -396,6 +402,59 @@ If the Issued badge says **staging** while the server is configured for producti
 
 ---
 
+## Bundled lab CA
+
+Public CAs cannot issue for names that resolve to private addresses in a way every lab client trusts without warnings, and ClearPass's EST cannot issue server certificates. The bundled CA fills that gap for the lab: a `step-ca` container next to the cert manager, issuing over ACME with the same Cloudflare DNS-01 flow this tool already uses. Trust its one root on your clients and every management interface the tool manages gets a clean padlock.
+
+### What it is, and what keeps it lab-safe
+
+- **Root + name-constrained intermediate.** The issuing CA carries a *critical* X.509 name constraint: it can only sign names under `LAB_CA_DOMAIN` and never IP addresses. A client that trusts the root will reject a lab-CA certificate for any other name, so a leaked issuing key cannot impersonate public sites. The root key is encrypted at rest and is not needed while the CA runs; move it off the host once things work.
+- **ACME with DNS-01 only.** HTTP-01 and TLS-ALPN-01 are disabled on the provisioner, so a certificate is only issued to whoever controls the DNS zone, exactly as with Let's Encrypt. Private hosts need nothing exposed.
+- **CRL** enabled and regenerated on revoke; leaf lifetime 90 days so the renewal window logic is unchanged.
+- **Its own name is constrained too.** The CA serves at `https://<LAB_CA_HOST>:9000` with a certificate from its own intermediate, so `LAB_CA_HOST` must be a name under `LAB_CA_DOMAIN` with a DNS record (Cloudflare, DNS-only) pointing at the runner's private address. That record is the one piece of DNS the lab CA needs.
+
+Not provided yet: EST enrollment for devices (AOS-CX, EdgeConnect). That is the next phase and builds on this CA.
+
+### Set it up
+
+```bash
+./setup.sh --with-ca --lab-domain lab.example.net           # CA host defaults to ca.lab.example.net
+docker compose up -d                                         # COMPOSE_PROFILES=lab-ca is now in .env
+docker compose exec -T orchestrator-acme-cert-manager python -m app.cli ca-info
+```
+
+`setup.sh --with-ca` initialises `./data/pki` inside the pinned `step-ca` image (root, constrained intermediate, DNS-01 ACME provisioner, CRL), writes `LAB_CA_*` and the Compose profile into `.env`, and prints the **root fingerprint**. It needs a reachable Docker daemon; it is idempotent.
+
+Then, per server: **Settings → Edit → CA → Lab CA (bundled step-ca) → Save → Force renew**. The cert manager reaches the CA by its name on the Compose network, trusts the lab root for the ACME directory and, when `verify_ssl` is on, for the Orchestrator API automatically (no `ca_bundle` needed). The dashboard shows a `lab` badge next to `staging` and `production`.
+
+### Distribute the root
+
+Confirm the fingerprint from `ca-info` (or `data/pki/certs/root_ca.fingerprint`) out of band before trusting the root anywhere. Download it from `https://<LAB_CA_HOST>:9000/roots.pem` (or copy `data/pki/certs/root_ca.crt`).
+
+| Client | How |
+|---|---|
+| Windows | `certutil -addstore -f Root root_ca.crt`, or push with Group Policy (Computer Configuration → Policies → Windows Settings → Security Settings → Public Key Policies → Trusted Root CAs). |
+| macOS | Keychain Access → System → import, set *Always Trust*; or an MDM configuration profile. |
+| Linux | Debian/Ubuntu: copy to `/usr/local/share/ca-certificates/lab-root.crt`, `update-ca-certificates`. RHEL-family: `/etc/pki/ca-trust/source/anchors/`, `update-ca-trust`. |
+| Firefox | Uses its own store unless `security.enterprise_roots.enabled` is true; otherwise import under Settings → Certificates. |
+| ClearPass | Administration → Certificates → Trust List → add the root (enable for the services that will talk to lab-CA hosts). |
+| Orchestrator / EdgeConnect | Add the root to the appliance trust store where it validates outbound TLS (needed only when they call lab-CA hosts). |
+
+### Operate
+
+- **Revoke**: from the runner, `docker compose exec lab-ca step ca revoke <serial> --ca-url https://localhost:9000 --root /home/step/certs/root_ca.crt --provisioner lab-admin` (the provisioner password is `data/pki/secrets/password`). The CRL at `/1.0/crl` is regenerated on revoke.
+- **Inventory**: `docker compose exec lab-ca step ca admin ...` is not enabled (no remote management); issued certificates are in the step-ca database under `data/pki/db`. A dashboard view is planned.
+- **Back up** `data/pki` with the rest of `data/` (see [Maintenance](#maintenance)); without `secrets/password` the keys are unusable.
+- **Rotate / rebuild**: remove `data/pki` and re-run `setup.sh --with-ca`; every client must then trust the new root.
+
+### Limits
+
+- Only names under `LAB_CA_DOMAIN`, no IP SANs, by design.
+- Lab quality: single container, local database, no HSM, no OCSP (CRL only). Do not use it for anything a browser outside the lab must trust.
+- Certificates from the lab CA are only trusted where the root is installed; the dashboard cannot tell you which clients have it.
+
+---
+
 ## Configuration Reference
 
 ### `config/servers.json`
@@ -435,7 +494,7 @@ If the Issued badge says **staging** while the server is configured for producti
 | `domain`            | Hostname the certificate is issued for (defaults to the host).                                            |
 | `verify_ssl`        | Verify the Orchestrator's own TLS cert on API calls. Leave `false` only while the appliance still serves its factory self‑signed certificate; enable once production is live. |
 | `ca_bundle`         | Optional PEM bundle (path inside the container) used for API verification when the appliance chains to a private CA. |
-| `acme.ca`           | `letsencrypt` (production) or `letsencrypt_test` (staging). A full ACME directory URL is also accepted.   |
+| `acme.ca`           | `letsencrypt` (production), `letsencrypt_test` (staging), or `lab` (the [bundled lab CA](#bundled-lab-ca)). A full ACME directory URL is also accepted. |
 | `acme.email`        | Account email for Let's Encrypt (required).                                                               |
 | `acme.key_type`     | `rsa2048`, `rsa3072`, or `rsa4096`. Orchestrator serves a single RSA cert.                                |
 | `dns.provider`      | Only `cloudflare` is wired up today.                                                                      |
@@ -466,6 +525,9 @@ If the Issued badge says **staging** while the server is configured for producti
 | `DEPLOY_RETRY_BACKOFF`       | Base backoff in seconds between validation attempts, doubled each time (default 5).         |
 | `DEPLOY_HTTP_TIMEOUT`        | Per‑request timeout for the Orchestrator API (default 30).                                  |
 | `LOG_LEVEL`, `TZ`            | Logging verbosity; container timezone (affects cron and logs).                              |
+| `COMPOSE_PROFILES`           | `lab-ca` enables the bundled CA service (written by `setup.sh --with-ca`).                  |
+| `LAB_CA_HOST`, `LAB_CA_PORT`, `LAB_CA_DOMAIN`, `LAB_CA_PROVISIONER` | The lab CA's name (under `LAB_CA_DOMAIN`), port (9000), issuing scope, ACME provisioner (`lab`). |
+| `LAB_CA_UID`, `LAB_CA_GID`   | uid/gid the step-ca container runs as; must own `./data/pki` (set by `setup.sh`).           |
 
 ### Volumes (`docker-compose.yml`)
 
@@ -509,6 +571,7 @@ All commands run inside the container: `docker compose exec -T orchestrator-acme
 | `list` | Configured servers, their CA and last outcome, plus the active configuration path. |
 | `check [--json] [--lenient]` | Preflight: configuration path and persistence, legacy‑file detection, per‑server SSH validation, credential presence. Exit 1 on fatal findings. |
 | `ssh-test <id>` | Connect with the pinned host key and probe `sudo -n -l` for both activation commands. Restarts nothing. |
+| `ca-info` | Bundled lab CA endpoints, root fingerprint and issuer names. |
 | `issue <id>` / `deploy <id>` / `restart <id>` | Run a single stage. |
 | `renew <id> [--force]` | Full pipeline for one server (contacts the CA). |
 | `redeploy <id>` | Deploy → activate from the certificate already on disk (no CA contact). |
@@ -579,6 +642,18 @@ docker info >/dev/null && echo ok
 ```
 
 `Unit docker.service not found` means Docker did not come from Docker's repository (snap: `sudo snap start docker`; Docker Desktop: start the app). `permission denied` on the socket means the `docker` group membership has not reached your session yet: `newgrp docker` or log out and back in.
+
+### Lab CA: `DNS name "…" is not permitted by any constraint`
+
+step-ca issues its own TLS certificate from the name-constrained intermediate, so `LAB_CA_HOST` must be a name under `LAB_CA_DOMAIN` (no IP addresses). Fix `.env`, remove `data/pki` if it was initialised with the wrong name, and re-run `setup.sh --with-ca`.
+
+### Lab CA certificate is live but browsers still warn
+
+The client does not trust the lab root. Confirm the fingerprint from `ca-info`, then install the root per [Distribute the root](#distribute-the-root). Firefox needs its own import or the enterprise-roots setting.
+
+### `lego … failed` with `x509: certificate signed by unknown authority` against the lab CA
+
+The cert manager cannot find the lab root. `./data/pki/certs` must be mounted at `/data/pki/certs` (the shipped Compose file does this) and `LAB_CA_HOST` must be set; `python -m app.cli ca-info` reports what it sees.
 
 ### Container exits at start with `preflight FAILED`
 

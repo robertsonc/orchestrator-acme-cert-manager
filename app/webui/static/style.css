@@ -273,3 +273,4 @@ td .kind { white-space: nowrap; }
   .detail-head .actions { width: 100%; justify-content: flex-start; flex-wrap: wrap; }
 }
 .ghost-link, .user { white-space: nowrap; }
+.pill.lab { background: var(--accent-soft); color: var(--accent); border-color: rgba(57,135,229,.35); }

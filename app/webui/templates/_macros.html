@@ -6,6 +6,7 @@
 {% macro env_pill(env) -%}
   {%- if env == 'staging' %}<span class="pill staging">staging</span>
   {%- elif env == 'production' %}<span class="pill prod">production</span>
+  {%- elif env == 'lab' %}<span class="pill lab" title="Issued by the bundled lab CA">lab</span>
   {%- else %}<span class="pill quiet">—</span>{% endif -%}
 {%- endmacro %}
 

@@ -116,3 +116,63 @@ def test_is_staging_ca():
     assert config.is_staging_ca("letsencrypt_test")
     assert config.is_staging_ca("https://acme-staging-v02.api.letsencrypt.org/directory")
     assert not config.is_staging_ca("letsencrypt")
+
+
+def test_lab_ca_helpers(layout, monkeypatch):
+    monkeypatch.setattr(config, "LAB_CA_HOST", "ca.lab.example.net")
+    monkeypatch.setattr(config, "LAB_CA_PORT", 9000)
+    monkeypatch.setattr(config, "LAB_CA_PROVISIONER", "lab")
+    assert config.is_lab_ca("lab") and not config.is_lab_ca("letsencrypt")
+    assert config.ca_environment("lab") == "lab"
+    assert config.ca_environment("letsencrypt_test") == "staging"
+    assert config.ca_environment("letsencrypt") == "production"
+    assert config.lab_ca_acme_url() == "https://ca.lab.example.net:9000/acme/lab/directory"
+    monkeypatch.setattr(config, "LAB_CA_ROOT", layout["data"] / "pki" / "certs" / "root_ca.crt")
+    assert not config.lab_ca_available()
+
+
+def _lab_pki(layout, monkeypatch):
+    """Write a tiny root + intermediate and point config at them; return their subject names."""
+    import datetime as dt
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.x509.oid import NameOID
+    d = layout["data"] / "pki" / "certs"
+    d.mkdir(parents=True)
+    now = dt.datetime.now(dt.timezone.utc)
+
+    def mk(cn, issuer_name=None, signer=None):
+        key = ec.generate_private_key(ec.SECP256R1())
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+        b = (x509.CertificateBuilder().subject_name(name).issuer_name(issuer_name or name)
+             .public_key(key.public_key()).serial_number(x509.random_serial_number())
+             .not_valid_before(now).not_valid_after(now + dt.timedelta(days=30)))
+        return b.sign(signer or key, hashes.SHA256()), key
+
+    root, rkey = mk("Lab CA Root CA")
+    inter, _ = mk("Lab CA Intermediate CA", root.subject, rkey)
+    (d / "root_ca.crt").write_bytes(root.public_bytes(serialization.Encoding.PEM))
+    (d / "intermediate_ca.crt").write_bytes(inter.public_bytes(serialization.Encoding.PEM))
+    monkeypatch.setattr(config, "LAB_CA_CERTS_DIR", d)
+    monkeypatch.setattr(config, "LAB_CA_ROOT", d / "root_ca.crt")
+    monkeypatch.setattr(config, "LAB_CA_INTERMEDIATE", d / "intermediate_ca.crt")
+    monkeypatch.setattr(config, "LAB_CA_HOST", "ca.lab.example.net")
+    monkeypatch.setattr(config, "_LAB_ISSUERS", (-1.0, frozenset()))
+    return root, inter
+
+
+def test_lab_ca_issuer_names_and_fingerprint(layout, monkeypatch):
+    root, inter = _lab_pki(layout, monkeypatch)
+    names = config.lab_ca_issuer_names()
+    assert inter.subject.rfc4514_string() in names and root.subject.rfc4514_string() in names
+    assert config.lab_ca_available()
+    assert len(config.lab_ca_root_fingerprint()) == 64
+
+
+def test_preflight_warns_when_lab_ca_selected_but_missing(layout, monkeypatch):
+    monkeypatch.setattr(config, "LAB_CA_HOST", "")
+    config.upsert_server(make_server(acme_ca="lab", ssh_key_path="/nope"))
+    codes = {f.code for f in preflight.run(strict=False).findings}
+    assert "lab-ca-missing" in codes

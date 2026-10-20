@@ -68,6 +68,28 @@ def cmd_ssh_test(args: argparse.Namespace) -> int:
     return 0 if res.ok else 1
 
 
+def cmd_ca_info(_: argparse.Namespace) -> int:
+    """Bundled lab CA: endpoints, root fingerprint, trust-store hints."""
+    if not config.LAB_CA_HOST:
+        print("Lab CA not configured (LAB_CA_HOST unset). Run ./setup.sh --with-ca --lab-domain <zone>.")
+        return 1
+    base = config.lab_ca_base_url()
+    print(f"Lab CA:          {base}")
+    print(f"ACME directory:  {config.lab_ca_acme_url()}")
+    print(f"Root download:   {base}/roots.pem")
+    print(f"CRL:             {base}/1.0/crl")
+    if config.LAB_CA_ROOT.is_file():
+        print(f"Root file:       {config.LAB_CA_ROOT}")
+        print(f"Root SHA-256:    {config.lab_ca_root_fingerprint()}")
+        names = sorted(config.lab_ca_issuer_names())
+        print("Issuers:         " + "; ".join(names))
+    else:
+        print(f"Root file:       {config.LAB_CA_ROOT} (MISSING — mount ./data/pki/certs and run setup.sh --with-ca)")
+        return 1
+    print("Trust the root on clients after confirming the fingerprint out of band (see README 'Bundled lab CA').")
+    return 0
+
+
 def _renew_one(args: argparse.Namespace) -> int:
     from . import renew
     server = config.get_server(args.server_id)
@@ -110,6 +132,8 @@ def main(argv: list[str] | None = None) -> int:
     ck.add_argument("--json", action="store_true", help="machine-readable output")
     ck.add_argument("--lenient", action="store_true", help="report fatal findings as warnings")
     ck.set_defaults(func=cmd_check)
+
+    sub.add_parser("ca-info", help="bundled lab CA endpoints and root fingerprint").set_defaults(func=cmd_ca_info)
 
     st = sub.add_parser("ssh-test", help="verify SSH key auth and sudo authorization (no restart)")
     st.add_argument("server_id")

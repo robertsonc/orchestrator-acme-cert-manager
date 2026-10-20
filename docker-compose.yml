@@ -20,9 +20,43 @@ services:
       - ./data/certs:/data/certs
       - ./data/logs:/data/logs
       - ./data/ssh:/data/ssh:ro       # private key + pinned known_hosts, read-only in the container
+      - ./data/pki/certs:/data/pki/certs:ro   # lab CA root/intermediate (empty unless setup.sh --with-ca)
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=5).status == 200 else 1)"]
       interval: 60s
       timeout: 10s
       retries: 3
       start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Optional bundled lab CA (step-ca). Enabled by COMPOSE_PROFILES=lab-ca in .env,
+  # initialised once by `./setup.sh --with-ca --lab-domain <zone>`.
+  # ACME (DNS-01 only) for this tool and anything ACME-capable; CRL; root at
+  # /roots.pem. The issuing CA is name-constrained to LAB_CA_DOMAIN.
+  # Port 9000 is published on the LAN because ACME/EST clients and trust-store
+  # downloads must reach it; the alias lets this container reach it by its
+  # certificate name without leaving the compose network.
+  # ---------------------------------------------------------------------------
+  lab-ca:
+    image: smallstep/step-ca:0.30.2
+    container_name: lab-ca
+    profiles: ["lab-ca"]
+    restart: unless-stopped
+    user: "${LAB_CA_UID:-1000}:${LAB_CA_GID:-1000}"
+    environment:
+      STEPPATH: /home/step
+      HOME: /home/step
+    volumes:
+      - ./data/pki:/home/step
+    ports:
+      - "${LAB_CA_PORT:-9000}:9000"
+    networks:
+      default:
+        aliases:
+          - "${LAB_CA_HOST:-ca.lab.invalid}"
+    healthcheck:
+      test: ["CMD", "step", "ca", "health", "--ca-url", "https://localhost:9000", "--root", "/home/step/certs/root_ca.crt"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

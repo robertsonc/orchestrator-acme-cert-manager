@@ -128,3 +128,40 @@ def test_failed_deploy_is_recorded_as_failed_with_detail(layout, monkeypatch):
     assert rec.outcome == "failed"
     assert [s["step"] for s in rec.steps] == ["deploy"]
     assert rec.steps[0]["detail"]["status"] == 502
+
+
+def test_lego_uses_lab_ca_directory_and_trust(layout, monkeypatch):
+    from app import config as cfg
+    monkeypatch.setattr(cfg, "LAB_CA_HOST", "ca.lab.example.net")
+    monkeypatch.setattr(cfg, "LAB_CA_PORT", 9000)
+    monkeypatch.setattr(cfg, "LAB_CA_PROVISIONER", "lab")
+    monkeypatch.setattr(cfg, "LAB_CA_ROOT", layout["data"] / "pki" / "certs" / "root_ca.crt")
+    s = make_server(acme_ca="lab")
+    assert issue._acme_url(s) == "https://ca.lab.example.net:9000/acme/lab/directory"
+    env = issue.lego_environment(s, "tok")
+    assert env["LEGO_CA_CERTIFICATES"] == str(cfg.LAB_CA_ROOT)
+    assert env[cfg.CF_TOKEN_ENV] == "tok"
+    assert "LEGO_CA_CERTIFICATES" not in issue.lego_environment(make_server(acme_ca="letsencrypt"), "tok")
+    # not configured -> issuance refuses with guidance before running lego
+    res = issue.issue_or_renew(s, force=True)
+    assert not res.ok and "setup.sh --with-ca" in res.message
+
+
+def test_deploy_verifies_against_lab_root(layout, monkeypatch):
+    from app import config as cfg
+    root = layout["data"] / "pki" / "certs" / "root_ca.crt"
+    root.parent.mkdir(parents=True)
+    root.write_text("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n")
+    monkeypatch.setattr(cfg, "LAB_CA_ROOT", root)
+    seen = {}
+
+    def fake_post(url, json=None, headers=None, verify=None, timeout=None):
+        seen["verify"] = verify
+        return _Resp(200) if url.endswith("/validation") else _Resp(204)
+
+    monkeypatch.setattr(deploy.requests, "post", fake_post)
+    cert, key, ca = _files(layout)
+    res = deploy.deploy_paths(make_server(acme_ca="lab", verify_ssl=True), cert, key, ca)
+    assert res.ok and seen["verify"] == str(root)
+    deploy.deploy_paths(make_server(acme_ca="letsencrypt", verify_ssl=True), cert, key, ca)
+    assert seen["verify"] is True

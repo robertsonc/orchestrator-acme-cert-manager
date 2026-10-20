@@ -93,6 +93,8 @@ def deploy_paths(server: ServerConfig, cert_file: Path, key_file: Path, ca_file:
     headers = {"Content-Type": "application/json", "X-Auth-Token": api_key}
     base_url = server.base_url
     verify = server.requests_verify
+    if verify is True and config.is_lab_ca(server.acme_ca) and config.LAB_CA_ROOT.is_file():
+        verify = str(config.LAB_CA_ROOT)   # the appliance serves a lab-CA cert: trust the lab root
 
     if verify is False:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)

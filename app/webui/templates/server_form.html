@@ -3,6 +3,7 @@
 {% block title %}{{ 'Add' if is_new else 'Edit' }} server · Orchestrator ACME Cert Manager{% endblock %}
 {% block pageclass %}narrow{% endblock %}
 {% block content %}
+  {% import "_macros.html" as m %}
   <div class="crumbs"><a href="{{ url_for('settings') }}">Settings</a> / {{ 'new server' if is_new else form.id }}</div>
   <div class="section-head" style="margin-top:0"><h1 style="font-size:20px">{{ 'Add server' if is_new else 'Edit ' + form.name }}</h1></div>
 
@@ -41,13 +42,23 @@
         <input id="domain" name="domain" value="{{ form.domain }}" placeholder="defaults to the host above">
       </div>
       <div class="field check">
-        <label><input type="checkbox" name="verify_ssl" {% if form.verify_ssl %}checked{% endif %}> Verify the Orchestrator's TLS certificate on API calls</label>
+        <label><input type="checkbox" name="verify_ssl" {% if form.verify_ssl %}checked{% endif %}> Verify the Orchestrator's TLS certificate on API calls
+          {{ m.info('Without a CA bundle the trust is the system roots plus the lab root (when the lab CA is configured on the host), so public-to-lab migrations and rollback keep verifying.', 'lab root: ./setup.sh --with-ca on the host') }}</label>
         <p class="hint">Leave off only while the appliance still serves its factory self-signed certificate. Turn on once the production certificate is live.</p>
       </div>
-      <div class="field">
-        <label for="ca_bundle">CA bundle (optional)</label>
-        <input id="ca_bundle" name="ca_bundle" value="{{ form.ca_bundle }}" placeholder="/data/ssh/orchestrator-ca.pem">
-        <p class="hint">PEM bundle for API verification when the appliance chains to a private CA. Path inside the container.</p>
+      <div class="grid2">
+        <div class="field">
+          <label for="ca_bundle">CA bundle (optional) {{ m.info('The file must live inside a directory that docker-compose.yml mounts (./data/ssh or ./config on the host) and the path is the one inside the container.', 'cp bundle.pem data/ssh/  →  /data/ssh/bundle.pem') }}</label>
+          <input id="ca_bundle" name="ca_bundle" value="{{ form.ca_bundle }}" placeholder="/data/ssh/orchestrator-ca.pem">
+          <p class="hint">PEM bundle for API verification when the appliance chains to a private CA. Path inside the container.</p>
+        </div>
+        <div class="field">
+          <label for="ca_bundle_mode">Bundle mode</label>
+          <select id="ca_bundle_mode" name="ca_bundle_mode">
+            {% for mode in ca_bundle_modes %}<option value="{{ mode }}" {% if form.ca_bundle_mode == mode %}selected{% endif %}>{{ mode }}</option>{% endfor %}
+          </select>
+          <p class="hint"><strong>exclusive</strong>: the bundle is the only trust. <strong>additive</strong>: bundle + system roots + lab root.</p>
+        </div>
       </div>
     </fieldset>
 
@@ -55,11 +66,16 @@
       <legend>Certificate authority</legend>
       <div class="grid2">
         <div class="field">
-          <label for="acme_ca">CA</label>
+          <label for="acme_ca">CA {{ m.info('Let\'s Encrypt needs nothing on the host. The lab CA must be initialised on the Docker host first; its identity is pinned there and written to .env.', './setup.sh --with-ca --lab-domain <zone>') }}</label>
           <select id="acme_ca" name="acme_ca">
-            {% for value, label in ca_choices %}<option value="{{ value }}" {% if form.acme_ca == value %}selected{% endif %}>{{ label }}</option>{% endfor %}
+            {% for value, label in ca_choices %}<option value="{{ value }}" {% if form.acme_ca == value %}selected{% endif %}>{{ label }}{% if value == 'lab' and not lab_ca.available %} — not initialised on this host{% endif %}</option>{% endfor %}
           </select>
           <p class="hint">Staging has high rate limits but issues browser-untrusted certs. Test there, then switch to production. <strong>Lab CA</strong> issues from the bundled step-ca (DNS-01 via Cloudflare, names under the lab domain only); clients must trust its root.</p>
+          <p class="lab-state">
+            {% if lab_ca.available %}<span class="check good"><span class="g">●</span>Lab CA ready at <span class="mono">{{ lab_ca.url }}</span></span>
+            {% elif lab_ca.configured %}<span class="check bad"><span class="g">✕</span>Lab CA configured (<span class="mono">{{ lab_ca.url }}</span>) but its root is not readable in the container</span> {{ m.info('The ./data/pki/certs mount is missing or the init did not finish.', './setup.sh --with-ca && docker compose down && docker compose up -d') }}
+            {% else %}<span class="muted">Lab CA not configured on this host</span> {{ m.info('Initialise it on the Docker host, then select it here. The System page shows its state once configured.', './setup.sh --with-ca --lab-domain <zone> && docker compose up -d') }}{% endif %}
+          </p>
         </div>
         <div class="field">
           <label for="key_type">Key type</label>
@@ -80,17 +96,20 @@
         <label for="dns_api_token">Cloudflare API token</label>
         <input id="dns_api_token" name="dns_api_token" type="password" autocomplete="new-password" value="">
         <p class="hint">{% if cf_token_set %}<span class="stored">A token is stored.</span> Leave blank to keep it, or type a new one to replace it.
-          {% else %}Scoped to edit DNS on the zone. Blank falls back to the <code>CF_DNS_API_TOKEN</code> env var.{% endif %}</p>
+          {% else %}Scoped to edit DNS on the zone. Blank falls back to the <code>CF_DNS_API_TOKEN</code> env var
+          ({% if cf_env_set %}<span class="stored">set on the host</span>{% else %}<strong>not set on the host</strong>{% endif %}).{% endif %}
+          {{ m.info('The fallback lives in .env on the Docker host and needs a restart to change; a value entered here is stored in servers.json (mode 600) and wins.', 'CF_DNS_API_TOKEN=… in .env; docker compose down && docker compose up -d') }}</p>
       </div>
       <div class="grid2">
         <div class="field">
           <label for="api_key">Orchestrator API key</label>
           <input id="api_key" name="api_key" type="password" autocomplete="new-password" value="">
           <p class="hint">{% if api_key_set %}<span class="stored">A key is stored.</span> Leave blank to keep it, or type a new one to replace it.
-            {% else %}Read-Write key. Blank falls back to the env var on the right.{% endif %}</p>
+            {% else %}Read-Write key. Blank falls back to the env var on the right
+            ({% if api_env_set %}<span class="stored">set on the host</span>{% else %}<strong>not set on the host</strong>{% endif %}).{% endif %}</p>
         </div>
         <div class="field">
-          <label for="api_key_env">API key env var</label>
+          <label for="api_key_env">API key env var {{ m.info('Name of a variable in .env on the Docker host. Its value is never shown here.', '<NAME>=… in .env; docker compose down && docker compose up -d') }}</label>
           <input id="api_key_env" name="api_key_env" value="{{ form.api_key_env }}">
         </div>
       </div>
@@ -99,23 +118,24 @@
 
     <fieldset>
       <legend>SSH (activation)</legend>
-      <p class="hint" style="margin-top:4px">Public-key authentication only. The user needs passwordless <code>sudo</code> scoped to the two commands below. <code>./setup.sh</code> prepares all of this; the settings are validated when you save.</p>
+      <p class="hint" style="margin-top:4px">Public-key authentication only. The user needs passwordless <code>sudo</code> scoped to the two commands below. <code>./setup.sh</code> prepares all of this on the Docker host; the settings are validated when you save and the <a href="{{ url_for('system_page') }}">System</a> page shows the key and pinned hosts.</p>
       <div class="grid2">
-        <div class="field"><label for="ssh_user">SSH user</label><input id="ssh_user" name="ssh_user" value="{{ form.ssh_user }}"></div>
-        <div class="field"><label for="ssh_port">SSH port</label><input id="ssh_port" name="ssh_port" value="{{ form.ssh_port }}"></div>
+        <div class="field"><label for="ssh_user">SSH user {{ m.info('This account on the appliance must hold the public key and the NOPASSWD sudoers rule for the two activation commands.', './setup.sh --host <orchestrator> --ssh-user <user> [--install-sudoers]') }}</label><input id="ssh_user" name="ssh_user" value="{{ form.ssh_user }}"></div>
+        <div class="field"><label for="ssh_port">SSH port {{ m.info('A non-default port changes the known_hosts entry name to [host]:port; pin it with the same port.', './setup.sh --host <orchestrator> --ssh-port <port>') }}</label><input id="ssh_port" name="ssh_port" value="{{ form.ssh_port }}"></div>
       </div>
       <div class="field">
-        <label for="ssh_key_path">Private key path</label>
+        <label for="ssh_key_path">Private key path {{ m.info('Generated on the host as data/ssh/orch_restart (RSA-4096, no passphrase) and mounted read-only; the container cannot create keys.', './setup.sh [--key-type ed25519]') }}</label>
         <input id="ssh_key_path" name="ssh_key_path" value="{{ form.ssh_key_path }}" placeholder="{{ default_key }}">
         <p class="hint">Path <strong>inside the container</strong>; <code>./data/ssh</code> on the host is mounted read-only at <code>/data/ssh</code>.</p>
       </div>
       <div class="field">
-        <label for="ssh_known_hosts">Known hosts path</label>
+        <label for="ssh_known_hosts">Known hosts path {{ m.info('The appliance host key is pinned on the host after you confirm its fingerprint; the container never trusts a host on first use.', './setup.sh --host <orchestrator> [--trust-host-key]') }}</label>
         <input id="ssh_known_hosts" name="ssh_known_hosts" value="{{ form.ssh_known_hosts }}" placeholder="{{ default_known_hosts }}">
         <p class="hint">Pinned Orchestrator host key (strict checking). Must contain an entry for the host above.</p>
       </div>
       <details class="advanced">
         <summary>Activation commands</summary>
+        <p class="hint">Both commands must match the sudoers rule on the appliance word for word {{ m.info('setup.sh prints the exact rule, or installs it as a drop-in under /etc/sudoers.d after confirmation and visudo validation.', './setup.sh --host <orchestrator> --install-sudoers') }}</p>
         <div class="field"><label for="restart_command">Restart command</label><input id="restart_command" name="restart_command" value="{{ form.restart_command }}"></div>
         <div class="field"><label for="nginx_reload_command">Nginx reload command</label><input id="nginx_reload_command" name="nginx_reload_command" value="{{ form.nginx_reload_command }}"></div>
       </details>

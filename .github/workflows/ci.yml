@@ -34,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-      - run: bash -n setup.sh app/entrypoint.sh pki/lab-ca-init.sh && shellcheck -S warning setup.sh pki/lab-ca-init.sh
+      - run: bash -n setup.sh upgrade-check.sh app/entrypoint.sh pki/lab-ca-init.sh && shellcheck -S warning setup.sh upgrade-check.sh pki/lab-ca-init.sh
 
   lab-ca-smoke:
     # Starts the real step-ca container the way setup.sh does: init on a

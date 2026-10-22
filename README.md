@@ -164,7 +164,7 @@ The script is idempotent and safe to re‑run. In order it:
 | `sudo` rule | Probes `sudo -n -l` for both activation commands. If not permitted, prints the exact `sudoers` line an administrator must add. With `--install-sudoers` it offers to write that drop‑in itself, after confirmation and `visudo` validation. | Only with `--install-sudoers` |
 | Final test | Key authentication + `sudo -n -l` for both commands. Nothing is restarted. | Read only |
 
-Useful flags: `--non-interactive` (no prompts; anything that needs a human is reported and skipped), `--trust-host-key` (pin without the prompt, only after you verified the fingerprint), `--skip-docker`, `--skip-remote` (print the manual steps instead), `--start` (run `docker compose up -d --build` at the end), `--ssh-port`, `--server-id`, `--key-type ed25519`. Run `./setup.sh --help` for the full list. Every option also has an environment variable (`ORCH_HOST`, `ORCH_SSH_USER`, `ACME_EMAIL`, …) for scripted use.
+Useful flags: `--non-interactive` (no prompts; anything that needs a human is reported and skipped), `--trust-host-key` (pin without the prompt, only after you verified the fingerprint), `--skip-docker`, `--skip-remote` (print the manual steps instead), `--start` (run `docker compose up -d` at the end; add `--build` to build the image from the checkout), `--ssh-port`, `--server-id`, `--key-type ed25519`. Run `./setup.sh --help` for the full list. Every option also has an environment variable (`ORCH_HOST`, `ORCH_SSH_USER`, `ACME_EMAIL`, …) for scripted use.
 
 If you prefer to do the SSH steps by hand, follow [Configure SSH key authentication](#configure-ssh-key-authentication) and run `./setup.sh --skip-remote`.
 
@@ -357,7 +357,7 @@ chmod 600 config/servers.json
 rm config/servers.from-container.json
 
 # 4. Recreate with the new image (the preflight now verifies the path is persistent).
-docker compose down && docker compose up -d --build
+docker compose down && docker compose up -d
 docker compose exec -T orchestrator-acme-cert-manager python -m app.cli check
 ```
 

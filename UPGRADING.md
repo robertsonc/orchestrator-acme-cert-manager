@@ -240,6 +240,6 @@ Set the CA back to **Let's Encrypt (production)** and **Force renew**. This spen
 ./setup.sh --backup ../oacm-full.tgz --include-root             # also data/pki-root (keep this one offline)
 ```
 
-On the new host: clone the repository, `./setup.sh --restore ../oacm-….tgz` (stops if the container is running or the current `config/servers.json` is newer, unless `--force-restore`), then `./setup.sh --host …` to re-check the host key and sudo rule, then `docker compose up -d --build`. Inside the container, `python -m app.cli backup /config/backup.tgz` and `python -m app.cli restore /config/backup.tgz` do the same for what the container can see (config, certificates, SSH material; the lab CA online state is only visible from the host), optionally encrypted with `--encrypt` and `BACKUP_PASSPHRASE`.
+On the new host: clone the repository, `./setup.sh --restore ../oacm-….tgz` (stops if the container is running or the current `config/servers.json` is newer, unless `--force-restore`), then `./setup.sh --host …` to re-check the host key and sudo rule, then `docker compose up -d`. Inside the container, `python -m app.cli backup /config/backup.tgz` and `python -m app.cli restore /config/backup.tgz` do the same for what the container can see (config, certificates, SSH material; the lab CA online state is only visible from the host), optionally encrypted with `--encrypt` and `BACKUP_PASSPHRASE`.
 
 ---

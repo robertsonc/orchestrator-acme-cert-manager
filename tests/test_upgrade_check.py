@@ -117,7 +117,9 @@ SERVERS = """{"servers": [{"id": "orch-1", "name": "Orch", "orchestrator_host": 
   "dns": {"provider": "cloudflare", "api_token": ""},
   "ssh": {"user": "admin", "key_path": "/data/ssh/orch_restart", "known_hosts": "/data/ssh/known_hosts", "port": 22}}]}
 """
-ENV_OK = "SERVERS_FILE=/config/servers.json\nCF_DNS_API_TOKEN=cf-token-value\nORCH_API_KEY=orch-key-value\nTZ=UTC\n"
+ENV_OK = (f"SERVERS_FILE=/config/servers.json\nCF_DNS_API_TOKEN=cf-token-value\nORCH_API_KEY=orch-key-value\nTZ=UTC\n"
+          f"OACM_UID={os.getuid()}\nOACM_GID={os.getgid()}\n")
+ENV_PRE13 = "SERVERS_FILE=/config/servers.json\nCF_DNS_API_TOKEN=cf-token-value\nORCH_API_KEY=orch-key-value\nTZ=UTC\n"
 
 
 def test_bare_checkout_is_not_ready_and_names_setup(tmp_path):
@@ -223,3 +225,14 @@ def test_help_and_bad_option(tmp_path):
     work = _repo(tmp_path)
     assert _run(work, "--help").returncode == 0
     assert _run(work, "--bogus").returncode == 2
+
+
+def test_missing_service_uid_blocks_with_the_setup_fix(tmp_path):
+    """A 1.2 .env has no OACM_UID/OACM_GID: the unprivileged 1.3 container could not write config/."""
+    work = _repo(tmp_path, env=ENV_PRE13)
+    before = _tree(work)
+    r = _run(work)
+    assert r.returncode == 1
+    assert "OACM_UID/OACM_GID not set in .env" in r.stdout
+    assert f"OACM_UID={os.getuid()} OACM_GID={os.getgid()}" in r.stdout
+    assert _tree(work) == before

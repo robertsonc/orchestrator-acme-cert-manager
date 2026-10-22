@@ -101,17 +101,30 @@ try:
 except Exception as exc:  # noqa: BLE001
     print(f"__ERROR__\t{exc}")
     sys.exit(0)
-entries = raw.get("servers", []) if isinstance(raw, dict) else raw
-for s in entries:
-    ssh = s.get("ssh") or {}
-    acme = s.get("acme") or {}
-    dns = s.get("dns") or {}
+def row(sid, host, ssh, has_api, dns, acme):
     print("\t".join([
-        str(s.get("id", "?")), str(s.get("orchestrator_host", "")), str(ssh.get("port") or 22),
+        str(sid), str(host), str(ssh.get("port") or 22),
         str(ssh.get("key_path") or ""), str(ssh.get("known_hosts") or "/data/ssh/known_hosts"),
-        "1" if s.get("api_key") else "0", "1" if dns.get("api_token") else "0",
+        "1" if has_api else "0", "1" if (dns.get("api_token") or dns.get("env")) else "0",
         str(acme.get("ca", "letsencrypt")),
     ]))
+
+if isinstance(raw, dict) and "certificates" in raw:          # 1.3+ shape: certificates with targets
+    for c in raw.get("certificates") or []:
+        acme, dns = c.get("acme") or {}, c.get("dns") or {}
+        for t in c.get("targets") or []:
+            s = t.get("settings") or {}
+            if t.get("driver") == "orchestrator":
+                row(t.get("id", "?"), s.get("orchestrator_host", ""), s.get("ssh") or {}, s.get("api_key"), dns, acme)
+            elif t.get("driver") == "ssh":
+                row(t.get("id", "?"), s.get("host", ""),
+                    {"port": s.get("ssh_port"), "key_path": s.get("ssh_key_path"), "known_hosts": s.get("ssh_known_hosts")},
+                    True, dns, acme)
+else:                                                          # pre-1.3 shape: servers list
+    entries = raw.get("servers", []) if isinstance(raw, dict) else raw
+    for s in entries:
+        row(s.get("id", "?"), s.get("orchestrator_host", ""), s.get("ssh") or {}, s.get("api_key"),
+            s.get("dns") or {}, s.get("acme") or {})
 PY
 }
 
@@ -245,6 +258,12 @@ else
   if placeholder "$ok_key" && [[ $inline_api -eq 0 ]]; then
     fail "no Orchestrator API key: ORCH_API_KEY is unset/placeholder and no server has an inline key" "set ORCH_API_KEY in .env, or enter it per server in Settings"
   else pass "Orchestrator API key available ($( [[ $inline_api -eq 1 ]] && echo inline || echo .env ))"; fi
+  ouid="$(env_get OACM_UID "$envf")"; ogid="$(env_get OACM_GID "$envf")"
+  if [[ -z "$ouid" || -z "$ogid" ]]; then
+    fail "OACM_UID/OACM_GID not set in .env — since 1.3 the container runs unprivileged (uid 10001 by default) and cannot write config/ or data/ owned by you" "./setup.sh writes OACM_UID=$(id -u) OACM_GID=$(id -g) to .env (or add them by hand), then docker compose down && docker compose up -d"
+  elif [[ "$ouid" != "$(id -u)" ]]; then
+    warn "OACM_UID=${ouid} in .env differs from your uid $(id -u): config/ and data/ must be owned by uid ${ouid}" "set OACM_UID/OACM_GID to your ids (./setup.sh) or chown config data/certs data/logs to ${ouid}:${ogid}"
+  else pass "OACM_UID/OACM_GID=${ouid}/${ogid} match your ids (the container can write config/ and data/)"; fi
   profiles="$(env_get COMPOSE_PROFILES "$envf")"
   lab_host_env="$(env_get LAB_CA_HOST "$envf")"
   if [[ "$profiles" == *lab-ca* ]]; then with_ca=1; pass "COMPOSE_PROFILES=${profiles} (lab CA service enabled)"; fi

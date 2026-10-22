@@ -1,10 +1,14 @@
 services:
   orchestrator-acme-cert-manager:
     build: .
-    image: orchestrator-acme-cert-manager:1.2.0
+    image: orchestrator-acme-cert-manager:1.3.0
     container_name: orchestrator-acme-cert-manager
     restart: unless-stopped
     env_file: .env
+    # Runs unprivileged. setup.sh writes your own uid/gid into .env so the bind
+    # mounts below stay writable without a chown; the image default (10001)
+    # applies when they are absent and preflight then names the exact fix.
+    user: "${OACM_UID:-10001}:${OACM_GID:-10001}"
     environment:
       # The server list, admin credential, session secret and renewal history
       # all live in /config, which is bind-mounted below so UI changes survive
@@ -22,6 +26,9 @@ services:
       - ./data/ssh:/data/ssh:ro       # private key + pinned known_hosts, read-only in the container
       - ./data/pki/certs:/data/pki/certs:ro   # lab CA root/intermediate (empty unless setup.sh --with-ca)
     healthcheck:
+      # /healthz is 200 only while the web UI answers AND a scheduled run has
+      # happened within twice the cron interval (the entrypoint also exits when
+      # either process dies, so restart: unless-stopped recovers it).
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=5).status == 200 else 1)"]
       interval: 60s
       timeout: 10s

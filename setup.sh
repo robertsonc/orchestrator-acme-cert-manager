@@ -48,6 +48,10 @@ LAB_CA_PORT="${LAB_CA_PORT:-}"        # empty = unspecified: taken from an exist
 LAB_CA_IMAGE="${LAB_CA_IMAGE:-smallstep/step-ca:0.30.2}"
 with_ca=0
 rotate_root=0
+backup_file=""
+restore_file=""
+include_root=0
+force_restore=0
 non_interactive=0
 trust_host_key=0
 skip_docker=0
@@ -84,6 +88,14 @@ Bundled lab CA (optional):
                          On a re-run, values you do not pass are taken from the initialised CA; values
                          you do pass must match it (a CA cannot be renamed in place).
 
+Backup / restore (host side; sees everything, including the lab CA online state):
+  --backup FILE          Write .env, config/ and data/ (logs excluded; data/pki-root only with
+                         --include-root) to FILE as a tar.gz with permissions preserved, then exit.
+  --include-root         With --backup: also include the lab CA OFFLINE root (data/pki-root).
+  --restore FILE         Restore an archive made by --backup into this checkout (stop the stack first).
+                         Refuses to overwrite a newer config/servers.json unless --force-restore.
+  --force-restore        With --restore: overwrite even if the current config is newer.
+
 Behaviour:
   --non-interactive      Never prompt. Docker install is auto-approved; anything needing a human
                          (host-key confirmation without --trust-host-key, password-based key install)
@@ -115,6 +127,10 @@ while [[ $# -gt 0 ]]; do
     --key-type) KEY_TYPE="$2"; shift 2 ;;
     --with-ca) with_ca=1; shift ;;
     --rotate-root) with_ca=1; rotate_root=1; shift ;;
+    --backup) backup_file="$2"; shift 2 ;;
+    --include-root) include_root=1; shift ;;
+    --restore) restore_file="$2"; shift 2 ;;
+    --force-restore) force_restore=1; shift ;;
     --lab-domain) LAB_CA_DOMAIN="$2"; shift 2 ;;
     --ca-host) LAB_CA_HOST="$2"; shift 2 ;;
     --ca-name) LAB_CA_NAME="$2"; shift 2 ;;
@@ -321,6 +337,69 @@ ensure_env() {
   elif ! grep -q '^SERVERS_FILE=/config/servers.json$' "${here}/.env"; then
     warn ".env sets SERVERS_FILE to something other than /config/servers.json — only /config is persistently mounted by docker-compose.yml"
   fi
+  # The cert manager container runs unprivileged as OACM_UID:OACM_GID (1.3+). Using your
+  # own ids keeps the bind mounts writable without any chown.
+  local uid gid; uid="$(id -u)"; gid="$(id -g)"
+  if ! grep -q '^OACM_UID=' "${here}/.env"; then
+    set_env_kv OACM_UID "$uid"; set_env_kv OACM_GID "$gid"
+    ok "set OACM_UID=${uid} OACM_GID=${gid} in .env (the container runs as you; config/ and data/ need no chown)"
+  else
+    local cur; cur="$(grep '^OACM_UID=' "${here}/.env" | tail -1 | cut -d= -f2-)"
+    if [[ "$cur" != "$uid" ]]; then
+      warn "OACM_UID=${cur} in .env but you are uid ${uid}; config/ and data/ must be owned by uid ${cur} (or change OACM_UID and chown)"
+    else ok "OACM_UID/OACM_GID match your ids"; fi
+  fi
+}
+
+# ---- backup / restore (host side) --------------------------------------------
+do_backup() {
+  step "Backup"
+  local out="$1" excl=(--exclude='data/logs' --exclude='config/trust' --exclude='config/locks')
+  [[ $include_root -eq 1 ]] || excl+=(--exclude='data/pki-root')
+  [[ -e "$out" ]] && die "refusing to overwrite existing ${out}"
+  local parts=() p
+  for p in .env config data docker-compose.override.yml; do [[ -e "${here}/${p}" ]] && parts+=("$p"); done
+  [[ ${#parts[@]} -gt 0 ]] || die "nothing to back up in ${here}"
+  ( umask 077; tar -C "$here" "${excl[@]}" -czf "$out" "${parts[@]}" )
+  chmod 600 "$out"
+  ok "wrote ${out} ($(du -h "$out" | cut -f1)): ${parts[*]}$( [[ $include_root -eq 1 ]] && echo ' + data/pki-root' || echo ' (offline root excluded)')"
+  [[ -d "${here}/data/pki-root" && $include_root -eq 0 ]] && warn "data/pki-root is still on this host and was NOT included; move it offline or re-run with --include-root"
+  echo "  Restore on another host: git clone … && ./setup.sh --restore ${out} && ./setup.sh --host … && docker compose up -d --build"
+}
+
+do_restore() {
+  step "Restore"
+  local in="$1"
+  [[ -f "$in" ]] || die "archive ${in} not found"
+  tar -tzf "$in" >/dev/null 2>&1 || die "${in} is not a readable tar.gz (an encrypted archive from 'cli backup --encrypt' must be restored with 'cli restore')"
+  if docker_daemon_quiet && [[ -n "$($dcmd ps -q -f name='^orchestrator-acme-cert-manager$' 2>/dev/null)" ]]; then
+    die "the cert manager container is running; stop it first: docker compose down"
+  fi
+  if tar -tzf "$in" | grep -qx 'config/servers.json' && [[ -f "${cfg}/servers.json" && $force_restore -eq 0 ]]; then
+    local cur arc
+    cur="$(stat -c %Y "${cfg}/servers.json")"
+    arc="$(tar -tvzf "$in" config/servers.json | awk '{print $4" "$5}')"
+    arc="$(date -d "$arc" +%s 2>/dev/null || echo 0)"
+    if (( cur > arc + 1 )); then
+      die "config/servers.json on this host is newer than the archived copy; re-run with --force-restore to overwrite it"
+    fi
+  fi
+  local stamp; stamp="$(date +%Y%m%d%H%M%S)"
+  local p
+  for p in config data .env; do
+    [[ -e "${here}/${p}" ]] && { mv "${here}/${p}" "${here}/${p}.pre-restore-${stamp}"; ok "moved existing ${p} aside as ${p}.pre-restore-${stamp}"; }
+  done
+  tar -C "$here" -xzf "$in"
+  chmod 700 "${here}/data/ssh" 2>/dev/null || true
+  chmod 600 "${here}/config/servers.json" "${here}/.env" 2>/dev/null || true
+  ok "restored from ${in}; run ./setup.sh --host <orchestrator> … next (re-pins the host key, checks the sudo rule), then docker compose up -d --build"
+}
+
+docker_daemon_quiet() {
+  dcmd="docker"
+  docker info >/dev/null 2>&1 && return 0
+  if [[ $EUID -ne 0 ]] && sudo -n docker info >/dev/null 2>&1; then dcmd="sudo docker"; return 0; fi
+  return 1
 }
 
 set_env_kv() {
@@ -603,6 +682,8 @@ final_test() {
 # ---- main --------------------------------------------------------------------
 cd "$here"
 echo "${c_bold}orchestrator-acme-cert-manager — host setup${c_off}"
+if [[ -n "$backup_file" ]]; then do_backup "$backup_file"; exit 0; fi
+if [[ -n "$restore_file" ]]; then do_restore "$restore_file"; exit 0; fi
 ensure_docker
 ensure_dirs
 ensure_key

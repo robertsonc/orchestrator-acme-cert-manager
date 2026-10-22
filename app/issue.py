@@ -328,5 +328,5 @@ def _split_pem(text: str) -> list[str]:
 def _read_cert(leaf_path: Path) -> tuple[str, str]:
     """Return (expiry_iso, serial_hex) for the leaf certificate."""
     cert = x509.load_pem_x509_certificate(leaf_path.read_bytes())
-    not_after = getattr(cert, "not_valid_after_utc", None) or cert.not_valid_after
+    not_after = getattr(cert, "not_valid_after_utc", None)
     return not_after.isoformat(), format(cert.serial_number, "x")

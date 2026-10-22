@@ -272,9 +272,13 @@ def promote_snapshot(d: Path, bundle: CertBundle) -> None:
     matches the certificate; an earlier snapshot stays intact until then.
     """
     from cryptography import x509
+    from cryptography.exceptions import UnsupportedAlgorithm
     from cryptography.hazmat.primitives import serialization
     leaf = x509.load_pem_x509_certificate(bundle.cert.read_bytes())
-    key = serialization.load_pem_private_key(bundle.key.read_bytes(), password=None)
+    try:
+        key = serialization.load_pem_private_key(bundle.key.read_bytes(), password=None)
+    except UnsupportedAlgorithm as exc:
+        raise ValueError(f"refusing to snapshot: unsupported private key algorithm ({exc})") from exc
     if leaf.public_key().public_numbers() != key.public_key().public_numbers():
         raise ValueError("refusing to snapshot: the private key does not match the certificate")
     d.parent.mkdir(parents=True, exist_ok=True)

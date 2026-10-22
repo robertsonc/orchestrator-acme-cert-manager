@@ -7,6 +7,7 @@ module-level constants are re-pointed per test by the `layout` fixture.
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -80,3 +81,25 @@ def make_server(**overrides) -> ServerConfig:
 @pytest.fixture
 def server(layout, rsa_key, known_hosts):
     return make_server(ssh_key_path=str(rsa_key[0]), ssh_known_hosts=str(known_hosts))
+
+
+@pytest.fixture(autouse=True)
+def _reset_webui_state():
+    """Clear the web UI's in-memory login-failure and pending-run registries before and after every test.
+
+    The module is looked up in sys.modules instead of being imported, so a test that never
+    touches the web UI does not pull in Flask; once it is loaded, a lockout or a pending run
+    left behind by one test can no longer leak into the next.
+    """
+    def _clear():
+        web = sys.modules.get("app.webui.server")
+        if web is None:
+            return
+        with web._FAIL_LOCK:
+            web._FAILURES.clear()
+        with web._PENDING_LOCK:
+            web._PENDING.clear()
+
+    _clear()
+    yield
+    _clear()

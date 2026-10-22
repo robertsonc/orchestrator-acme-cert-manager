@@ -95,6 +95,18 @@ All notable changes to this project are documented here. The format follows
 - The compose service image is `ghcr.io/robertsonc/orchestrator-acme-cert-manager:<version>`;
   `setup.sh --start` pulls it (`--build` builds locally). CI pins actions by commit SHA.
 
+- Dependencies moved to current releases: Flask 3.1.3, requests 2.34.2, paramiko 5.0.1,
+  cryptography 50.0.2, certifi 2026.10.19 (every advisory on the previous pins cleared);
+  pip installs wheels only. supercronic 0.2.51. **paramiko 5 no longer speaks SHA-1 SSH
+  algorithms** (ssh-rsa host-key signatures, diffie-hellman-*-sha1, DSS keys): RSA keys still
+  work through rsa-sha2-256/512, which every OpenSSH since 7.2 offers, and the SSH test
+  explains the failure when a server offers nothing else.
+- Validation answered with HTTP 401/403 is reported as an API-key problem (`auth`), not as a
+  rejected payload; a redirect names the host it pointed to and never stores its query string.
+- Alerts name the targets of the run; a history write failure no longer suppresses the alert.
+- `logout` revokes by generation, so a login in the same second as the logout cannot survive it.
+- A `scheduler.json` whose top level is not an object is discarded instead of aborting the run.
+
 ### Fixed
 - A scheduled renewal and a Force renew/deploy from the UI could run on the
   same server at once. (#5)

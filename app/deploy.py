@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import time
+from urllib.parse import urlsplit
 from pathlib import Path
 
 import requests
@@ -47,6 +48,20 @@ _DATA_URI_RE = re.compile(r"data:[\w/+.-]+;base64,[A-Za-z0-9+/=]+")
 _LONG_B64_RE = re.compile(r"[A-Za-z0-9+/=]{48,}")
 _SECRET_FIELD_RE = re.compile(r'("(?:password|passPhrase|keyData|certificateData|'
                               r'intermediateCertFileContent|token|apiKey)"\s*:\s*)"[^"]*"', re.I)
+
+
+def _location_summary(location: str) -> str:
+    """scheme://host[:port]/path of a redirect target: no userinfo, query or fragment (they may echo the token)."""
+    if not location:
+        return "<none>"
+    try:
+        u = urlsplit(location)
+    except ValueError:
+        return "<unparseable>"
+    host = u.hostname or ""
+    if u.port:
+        host = f"{host}:{u.port}"
+    return f"{u.scheme}://{host}{u.path}" if u.scheme or host else (u.path or "<none>")
 
 
 def redact(text: str, limit: int = _EXCERPT_LEN) -> str:
@@ -156,7 +171,7 @@ def _call(server: ServerConfig, phase: str, url: str, payload: dict, headers: di
             status = resp.status_code
             if 300 <= status < 400:
                 last = _failure(server, phase, endpoint, "redirect", status, attempt, attempts, elapsed,
-                                excerpt=redact(f"Location: {resp.headers.get('Location', '')}"))
+                                excerpt=f"Location: {_location_summary(resp.headers.get('Location', ''))}")
                 retryable = False
                 break
             if resp.ok:
@@ -166,7 +181,14 @@ def _call(server: ServerConfig, phase: str, url: str, payload: dict, headers: di
                                   detail={"phase": phase, "status": status, "attempts": attempt,
                                           "elapsed_ms": elapsed,
                                           "response_excerpt": redact(resp.text)})
-            kind = "transient" if status in TRANSIENT_STATUSES else ("rejected" if status < 500 else "http")
+            if status in TRANSIENT_STATUSES:
+                kind = "transient"
+            elif status in (401, 403):
+                kind = "auth"
+            elif status < 500:
+                kind = "rejected"
+            else:
+                kind = "http"
             last = _failure(server, phase, endpoint, kind, status, attempt, attempts, elapsed,
                             excerpt=redact(resp.text), request_id=resp.headers.get("X-Request-Id"))
             retryable = kind == "transient" and attempts > 1
@@ -192,8 +214,8 @@ def _failure(server: ServerConfig, phase: str, endpoint: str, kind: str, status:
     if kind == "redirect":
         headline = "Certificate validation failed" if phase == "validation" else "Certificate install failed"
         message = (f"{headline} on {server.id}: {status_txt} ({kind}) on {endpoint} — the Orchestrator answered with a "
-                   f"redirect, which this tool never follows (it would send the private key and API key elsewhere). "
-                   f"Check orchestrator_host; not retried.")
+                   f"redirect to {excerpt.removeprefix('Location: ')}, which this tool never follows (it would send the "
+                   f"private key and API key elsewhere). Check orchestrator_host; not retried.")
         return StepResult(STEP, ok=False, message=message, detail={
             "phase": phase, "kind": kind, "endpoint": endpoint, "status": status, "attempt": attempt,
             "attempts": attempts, "elapsed_ms": elapsed_ms, "response_excerpt": excerpt,
@@ -216,6 +238,10 @@ def _failure(server: ServerConfig, phase: str, endpoint: str, kind: str, status:
                        "backend is probably restarting or overloaded")
             nxt = ("retry with Force deploy (reuses the issued certificate; no CA contact)"
                    if attempt >= attempts else "retrying after backoff")
+        elif kind == "auth":
+            explain = "the Orchestrator refused the API key"
+            nxt = ("check the API key (X-Auth-Token): it must exist, be unexpired, allow this source address and "
+                   "hold READ_WRITE for certificate management; not retried")
         elif kind == "rejected":
             explain = "the Orchestrator rejected the certificate/key/chain payload"
             nxt = "check the response excerpt; verify the key matches the certificate and the chain is complete"
@@ -232,6 +258,9 @@ def _failure(server: ServerConfig, phase: str, endpoint: str, kind: str, status:
             explain = ("the install request did not complete — the appliance may or may not have "
                        "applied it")
             nxt = "do not re-issue; run Force deploy to re-validate and re-install, then verify the served serial"
+        elif kind == "auth":
+            explain = "the Orchestrator refused the API key during install"
+            nxt = "check the API key (X-Auth-Token): validity, expiry, source-address allow list and READ_WRITE role; no certificate was activated"
         elif kind == "rejected":
             explain = "the Orchestrator rejected the install request"
             nxt = "check the response excerpt and the API key's role"

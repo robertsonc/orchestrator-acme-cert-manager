@@ -70,6 +70,8 @@ def _format(record: RenewalRecord) -> str:
     lines = [f"{head}: {record.server_id}", f"time: {record.timestamp}"]
     if record.actor or record.source:
         lines.append(f"started by: {record.actor or '?'} via {record.source or '?'}")
+    if record.targets:
+        lines.append(f"targets: {', '.join(record.targets)}")
 
     if record.outcome == "failed":
         bad = next((s for s in record.steps if not s.get("ok", True)), None)

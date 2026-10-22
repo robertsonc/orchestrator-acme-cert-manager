@@ -54,7 +54,7 @@ def _leaf_meta(leaf: Path) -> tuple[str | None, str | None]:
         return None, None
     try:
         cert = x509.load_pem_x509_certificate(leaf.read_bytes())
-        na = getattr(cert, "not_valid_after_utc", None) or cert.not_valid_after
+        na = getattr(cert, "not_valid_after_utc", None)
         return na.isoformat(), format(cert.serial_number, "x")
     except Exception as exc:  # noqa: BLE001
         log.warning("could not read leaf cert %s: %s", leaf, exc)
@@ -128,7 +128,10 @@ def _finish(cert: Certificate, targets: list[Target], steps: list[dict], outcome
         elapsed_s=round(time.monotonic() - t_start, 1),
         actor=actor, source=source, targets=[t.id for t in targets],
     )
-    store.add_record(record)
+    try:
+        store.add_record(record)
+    except OSError as exc:
+        log.error("renew(%s): could not write the history record: %s (the run outcome is %s)", cert.id, exc, outcome)
     notify.send(record)
     return record
 

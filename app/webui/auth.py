@@ -151,20 +151,41 @@ def _session_secret() -> bytes:
     return sec
 
 
-def _revoked_before() -> int:
+def _revocation() -> tuple[int, int]:
+    """(generation, timestamp) of the last revoke_all(); a pre-1.3 file holds the bare timestamp."""
     try:
-        return int(_revoked_path().read_text().strip() or 0)
-    except (OSError, ValueError):
-        return 0
+        raw = _revoked_path().read_text().strip()
+    except OSError:
+        return 0, 0
+    if not raw:
+        return 0, 0
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return 0, 0
+    if isinstance(data, dict):
+        return int(data.get("gen", 0)), int(data.get("at", 0))
+    return 0, int(data) if isinstance(data, (int, float)) else 0
+
+
+def _revoked_before() -> int:
+    return _revocation()[1]
 
 
 def revoke_all() -> None:
-    """Invalidate every token issued so far (logout)."""
-    _write_private(_revoked_path(), str(int(time.time())).encode())
+    """Invalidate every token issued so far (logout).
+
+    Tokens carry the revocation generation they were minted under; bumping it
+    rejects every earlier token even when the logout and a fresh login share
+    the same wall-clock second.
+    """
+    gen, _ = _revocation()
+    _write_private(_revoked_path(), json.dumps({"gen": gen + 1, "at": int(time.time())}).encode())
 
 
 def make_token(username: str) -> str:
-    payload = json.dumps({"u": username, "t": int(time.time()), "c": credential_fingerprint()}, separators=(",", ":"))
+    payload = json.dumps({"u": username, "t": int(time.time()), "c": credential_fingerprint(), "g": _revocation()[0]},
+                         separators=(",", ":"))
     sig = hmac.new(_session_secret(), payload.encode(), hashlib.sha256).hexdigest()
     b64 = base64.urlsafe_b64encode(payload.encode()).decode()
     return f"{b64}.{sig}"
@@ -185,7 +206,8 @@ def read_token(token: str) -> str | None:
         now = int(time.time())
         if now - ts > SESSION_TTL or ts > now + 60:
             return None
-        if ts < _revoked_before():
+        gen, at = _revocation()
+        if int(data.get("g", 0)) < gen or ts < at:
             return None
         if not hmac.compare_digest(fp, credential_fingerprint()):
             return None

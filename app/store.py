@@ -36,9 +36,10 @@ def scheduler_file() -> Path:
 
 def scheduler_state() -> dict:
     try:
-        return json.loads(scheduler_file().read_text())
+        data = json.loads(scheduler_file().read_text())
     except (OSError, ValueError):
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _write_scheduler(state: dict) -> None:

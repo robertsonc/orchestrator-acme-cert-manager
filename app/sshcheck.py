@@ -185,6 +185,11 @@ def classify_connect_error(exc: Exception, ep: Endpoint) -> str:
         if "not found in known_hosts" in msg or "Unknown server" in msg:
             return (f"SSH host key for {name} is not pinned in {ep.known_hosts}; "
                     f"add it after verifying the fingerprint.")
+        if "no acceptable" in msg.lower() or "incompatible ssh peer" in msg.lower():
+            return (f"SSH negotiation with {name} failed: {msg}. The server offers only algorithms this client no "
+                    f"longer speaks (typically SHA-1: an ssh-rsa host key signature, diffie-hellman-*-sha1 key exchange "
+                    f"or a DSS key). Enable rsa-sha2-256/512, ecdsa or ed25519 host keys and a SHA-2 key exchange on "
+                    f"the server; this tool does not re-enable SHA-1.")
         return f"SSH negotiation with {name} failed: {msg}"
     if isinstance(exc, socket.timeout):
         return f"SSH connection to {name} timed out after {_CONNECT_TIMEOUT}s."

@@ -587,7 +587,11 @@ def build_pkcs12(bundle: CertBundle, name: str) -> tuple[bytes, str]:
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import ec, rsa
     from cryptography.hazmat.primitives.serialization import pkcs12
-    key = serialization.load_pem_private_key(bundle.key.read_bytes(), password=None)
+    from cryptography.exceptions import UnsupportedAlgorithm
+    try:
+        key = serialization.load_pem_private_key(bundle.key.read_bytes(), password=None)
+    except UnsupportedAlgorithm as exc:
+        raise ValueError(f"unsupported private key algorithm: {exc}") from exc
     leaf = x509.load_pem_x509_certificate(bundle.cert.read_bytes())
     if leaf.public_key().public_numbers() != key.public_key().public_numbers():
         raise ValueError("the private key does not match the certificate")

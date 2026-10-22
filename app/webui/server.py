@@ -28,6 +28,7 @@ from . import auth
 
 log = logging.getLogger("webui")
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024   # forms only; no uploads
 
 # Endpoints reachable without a session: the auth pages, static assets, health.
 _OPEN_ENDPOINTS = {"login", "setup", "logout", "healthz", "static"}

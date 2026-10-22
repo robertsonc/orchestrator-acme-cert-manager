@@ -6,8 +6,15 @@ updates:
     groups:
       python: { patterns: ["*"] }
   - package-ecosystem: docker
-    directory: /
+    directory: /                 # Dockerfile base image
     schedule: { interval: weekly }
+  - package-ecosystem: docker-compose
+    directory: /                 # smallstep/step-ca pin; our own image tag is owned by scripts/check-version.py
+    schedule: { interval: weekly }
+    ignore:
+      - dependency-name: "ghcr.io/robertsonc/orchestrator-acme-cert-manager"
   - package-ecosystem: github-actions
-    directory: /
+    directory: /                 # SHA-pinned actions; Dependabot keeps the pin and the version comment
     schedule: { interval: weekly }
+    groups:
+      actions: { patterns: ["*"] }

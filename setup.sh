@@ -106,7 +106,9 @@ Behaviour:
                          (shows the exact content, asks for confirmation, validates with visudo).
   --skip-docker          Do not install Docker.
   --skip-remote          Do not connect to the Orchestrator (prints the manual steps instead).
-  --start                Run 'docker compose up -d --build' at the end.
+  --start                Run 'docker compose up -d' at the end (pulls the published image;
+                         builds from this checkout only if the tag is not published).
+  --build                With --start: always build the image from this checkout.
   -h, --help             This text.
 
 Environment equivalents: ORCH_HOST ORCH_DOMAIN ORCH_SSH_USER ORCH_SSH_PORT ORCH_SERVER_ID
@@ -141,6 +143,7 @@ while [[ $# -gt 0 ]]; do
     --skip-docker) skip_docker=1; shift ;;
     --skip-remote) skip_remote=1; shift ;;
     --start) start_stack=1; shift ;;
+    --build) build_image=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -262,7 +265,7 @@ ensure_daemon() {
   err "could not reach the docker daemon."
   echo "  Check: systemctl status docker  (or: journalctl -u docker --no-pager | tail -20)"
   echo "  If Docker came from snap: sudo snap start docker.  Docker Desktop: start it from the app."
-  echo "  Then re-run ./setup.sh, or 'docker compose up -d --build' once 'docker info' works."
+  echo "  Then re-run ./setup.sh, or 'docker compose up -d' once 'docker info' works."
   return 1
 }
 
@@ -367,7 +370,7 @@ do_backup() {
   chmod 600 "$out"
   ok "wrote ${out} ($(du -h "$out" | cut -f1)): ${parts[*]}$( [[ $include_root -eq 1 ]] && echo ' + data/pki-root' || echo ' (offline root excluded)')"
   [[ -d "${here}/data/pki-root" && $include_root -eq 0 ]] && warn "data/pki-root is still on this host and was NOT included; move it offline or re-run with --include-root"
-  echo "  Restore on another host: git clone … && ./setup.sh --restore ${out} && ./setup.sh --host … && docker compose up -d --build"
+  echo "  Restore on another host: git clone … && ./setup.sh --restore ${out} && ./setup.sh --host … && docker compose up -d"
 }
 
 do_restore() {
@@ -395,7 +398,7 @@ do_restore() {
   tar -C "$here" -xzf "$in"
   chmod 700 "${here}/data/ssh" 2>/dev/null || true
   chmod 600 "${here}/config/servers.json" "${here}/.env" 2>/dev/null || true
-  ok "restored from ${in}; run ./setup.sh --host <orchestrator> … next (re-pins the host key, checks the sudo rule), then docker compose up -d --build"
+  ok "restored from ${in}; run ./setup.sh --host <orchestrator> … next (re-pins the host key, checks the sudo rule), then docker compose up -d"
 }
 
 docker_daemon_quiet() {
@@ -736,7 +739,7 @@ fi
 step "Next steps"
 cat <<EOF
   1. Put the Cloudflare DNS token and Orchestrator API key in .env (or per server in the web UI).
-  2. Start:            docker compose up -d --build
+  2. Start:            docker compose up -d          (pulls the published image; --build builds from this checkout)
   3. Preflight:        docker compose exec -T orchestrator-acme-cert-manager python -m app.cli check
   4. SSH test:         docker compose exec -T orchestrator-acme-cert-manager python -m app.cli ssh-test ${ORCH_SERVER_ID}
   5. Tunnel to the UI: ssh -L 8090:localhost:8090 <user>@<this-host>  →  http://localhost:8090
@@ -752,6 +755,7 @@ fi
 if [[ $start_stack -eq 1 ]]; then
   step "Starting the stack"
   [[ $docker_ready -eq 1 ]] || die "cannot start: the docker daemon is not reachable"
-  if docker compose version >/dev/null 2>&1; then docker compose up -d --build
-  else sudo_cmd docker compose up -d --build; fi
+  up=(compose up -d); [[ ${build_image:-0} -eq 1 ]] && up+=(--build)
+  if docker compose version >/dev/null 2>&1; then docker "${up[@]}"
+  else sudo_cmd docker "${up[@]}"; fi
 fi

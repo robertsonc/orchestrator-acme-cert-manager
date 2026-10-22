@@ -172,12 +172,14 @@ If you prefer to do the SSH steps by hand, follow [Configure SSH key authenticat
 
 Edit `.env` and set `CF_DNS_API_TOKEN` and `ORCH_API_KEY`, **or** leave them blank and enter them per server in the web UI later (the inline value wins; the env var is the fallback). Keep values unquoted; if you edited the file on Windows, strip carriage returns with `sed -i 's/\r$//' .env`.
 
-### 4. Build and start
+### 4. Start
 
 ```bash
-docker compose up -d --build
+docker compose up -d            # pulls ghcr.io/robertsonc/orchestrator-acme-cert-manager:<version>
 docker compose logs --tail 50
 ```
+
+Every tagged release publishes a multi-arch image (linux/amd64, linux/arm64) to GHCR; `docker-compose.yml` pins the exact version, never `:latest`. If that tag is not published (you are running an unreleased checkout) Compose builds the image from the checkout instead; `docker compose up -d --build` always builds locally. See [Releases and the published image](#releases-and-the-published-image) to verify an image before running it.
 
 The container runs a **preflight** on start and exits with an explanation if the configuration path is not persistently mounted or a legacy `/data/servers.json` would be ignored (see [Configuration persistence](#configuration-persistence)). Confirm the checks and the SSH path from inside the container:
 
@@ -738,13 +740,27 @@ The host-side archive sees everything including the lab CA online state; the in-
 rm config/admin.json
 ```
 
-### Rebuild the image (state preserved)
+### Update the image (state preserved)
 
 ```bash
-docker compose up -d --build
+git pull                        # brings the new pinned tag in docker-compose.yml
+docker compose pull && docker compose up -d
+# or, to build from this checkout instead of pulling: docker compose up -d --build
 ```
 
 Certificates, history, and config live in the mounted volumes. A volume, `.env` or Compose change requires `docker compose down && docker compose up -d`.
+
+### Releases and the published image
+
+A release is a git tag `vX.Y.Z` on `main`. The `release` workflow refuses the tag unless `__version__` in `app/__init__.py`, the image tag in `docker-compose.yml` and the dated `CHANGELOG.md` heading all agree (`python3 scripts/check-version.py --tag vX.Y.Z` runs the same check locally), then runs the full CI, builds `linux/amd64` and `linux/arm64`, pushes `ghcr.io/robertsonc/orchestrator-acme-cert-manager:X.Y.Z` and `:X.Y`, attaches a BuildKit SBOM and provenance to the image index, signs a build-provenance attestation and creates the GitHub Release from the CHANGELOG section. There is no `:latest` tag by design: an upgrade is a reviewed change to the pinned tag.
+
+Verify an image before you run it (needs the `gh` CLI):
+
+```bash
+gh attestation verify oci://ghcr.io/robertsonc/orchestrator-acme-cert-manager:1.3.0 -R robertsonc/orchestrator-acme-cert-manager
+```
+
+Cutting a release: bump `__version__`, the compose tag and the CHANGELOG heading in one commit on `main`, then `git tag -a v1.3.0 -m 'v1.3.0' && git push origin v1.3.0`.
 
 ---
 

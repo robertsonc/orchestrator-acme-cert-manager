@@ -1,7 +1,11 @@
 services:
   orchestrator-acme-cert-manager:
+    # Released images are published by .github/workflows/release.yml on each v* tag
+    # (linux/amd64 + linux/arm64, never :latest). `docker compose up -d` pulls this
+    # tag and falls back to building from this checkout only when the tag is not
+    # published; `docker compose up -d --build` always builds from the checkout.
+    image: ghcr.io/robertsonc/orchestrator-acme-cert-manager:1.3.0
     build: .
-    image: orchestrator-acme-cert-manager:1.3.0
     container_name: orchestrator-acme-cert-manager
     restart: unless-stopped
     env_file: .env

@@ -90,11 +90,12 @@ Nothing on the appliance is restarted.
 
 ### 3.3 Recreate the container
 
-`docker compose up -d --build` alone is not enough when `.env`, the environment block or the volumes changed; the container has to be recreated:
+`docker compose up -d` alone is not enough when `.env`, the environment block or the volumes changed; the container has to be recreated:
 
 ```bash
 docker compose down
-docker compose up -d --build
+docker compose pull            # the released image for the tag pinned in docker-compose.yml (or: up -d --build to build here)
+docker compose up -d
 docker compose logs --tail 60
 ```
 
@@ -124,7 +125,7 @@ The upgrade is a code change plus a container recreate; data on disk is forward-
 ```bash
 git checkout <previous commit or tag>
 tar -xzf ../oacm-backup-<stamp>.tgz          # only if you need the old .env/config back
-docker compose down && docker compose up -d --build
+docker compose down && docker compose up -d   # the previous checkout pins its own image tag
 ```
 
 Certificates, the renewal history and the admin account are unchanged by either direction. If you roll back to 1.0.x, `config/servers.json` on the host is still read because `.env` now sets `SERVERS_FILE=/config/servers.json`.
@@ -215,6 +216,7 @@ Set the CA back to **Let's Encrypt (production)** and **Force renew**. This spen
 - **Locks.** A scheduled run and a Force renew/deploy cannot overlap on one certificate. If the upgrade is done while a run is in flight, wait for it: the lock lives in `config/locks/` and is released with the process.
 - **CSRF.** Every button in the UI carries a token tied to a `csrf` cookie. Scripts that POSTed to `/renew/<id>` or `/deploy/<id>` with only the session cookie get 403; use the CLI inside the container instead (`python -m app.cli renew <id> --force`, `redeploy <id>`).
 - **Health check.** `/healthz` reports 503 when no scheduled pass finished within twice the cron interval (24 h with the shipped crontab). On the first start after the upgrade it stays healthy until two intervals have passed. The entrypoint now exits when either the web UI or supercronic dies, so `docker compose ps` shows a restart instead of a half-dead container.
+- **Published image.** The compose service now references `ghcr.io/robertsonc/orchestrator-acme-cert-manager:<version>`; `docker compose up -d` pulls it and only builds when that tag is not published (`up -d --build` always builds from the checkout). The image you built as `orchestrator-acme-cert-manager:1.2.0` is no longer referenced: `docker image rm orchestrator-acme-cert-manager:1.2.0` once 1.3 runs.
 - **New in the UI and CLI.** Deploy targets with drivers (Orchestrator, generic SSH/SCP, ClearPass, EdgeConnect-via-Orchestrator), `python -m app.cli probe <target>`, `backup` / `restore`, actor/source on every run. Nothing needs configuring for an existing Orchestrator entry.
 
 ---

@@ -56,6 +56,13 @@ All notable changes to this project are documented here. The format follows
 - `python -m app.cli probe <target>` (alias `ssh-test`), `--source` /
   `--actor` on `renew`, `redeploy`, `renew-all`.
 
+- **Published, verifiable images.** A `v*` tag runs `.github/workflows/release.yml`: version
+  consistency check (`scripts/check-version.py`), the full CI, a multi-arch build
+  (linux/amd64, linux/arm64) pushed to `ghcr.io/robertsonc/orchestrator-acme-cert-manager:<version>`
+  with SBOM, provenance and a signed attestation, and a GitHub Release from this file.
+  No `:latest` tag. `docker compose up -d` pulls the pinned image and only builds when
+  the tag is unpublished (#10).
+
 ### Changed
 - **The container runs unprivileged** (uid/gid 10001 by default).
   `docker-compose.yml` takes `OACM_UID`/`OACM_GID` from `.env`; `setup.sh`
@@ -84,6 +91,9 @@ All notable changes to this project are documented here. The format follows
   certificate's DNS variables, Cloudflare's for Cloudflare certificates):
   the container's own API keys never reach a DNS provider script.
 - Certificates with a lifetime of 10 days or less renew at half the lifetime.
+
+- The compose service image is `ghcr.io/robertsonc/orchestrator-acme-cert-manager:<version>`;
+  `setup.sh --start` pulls it (`--build` builds locally). CI pins actions by commit SHA.
 
 ### Fixed
 - A scheduled renewal and a Force renew/deploy from the UI could run on the

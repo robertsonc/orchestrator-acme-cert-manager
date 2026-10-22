@@ -4,17 +4,32 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:           # release.yml reuses this workflow as its test gate
+
+permissions:
+  contents: read
 
 env:
   STEP_CLI_VERSION: "0.31.0"
   STEP_CA_IMAGE: "smallstep/step-ca:0.30.2"
 
 jobs:
+  version:
+    # __version__, the compose image tag and the CHANGELOG heading must agree on every PR.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 scripts/check-version.py
+
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
       - name: Install the pinned step CLI (the lab CA tests run it natively)
@@ -36,7 +51,9 @@ jobs:
     # Dockerfile or entrypoint regression fails here, not on an operator's host.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: docker build -t oacm-ci:test .
       - name: Unprivileged container runs preflight and the CLI
         run: |
@@ -53,7 +70,9 @@ jobs:
   shell:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       - run: bash -n setup.sh upgrade-check.sh pki/lab-ca-init.sh && dash -n app/entrypoint.sh && shellcheck -S warning setup.sh upgrade-check.sh pki/lab-ca-init.sh && shellcheck -S warning -s sh app/entrypoint.sh
 
@@ -64,7 +83,9 @@ jobs:
     # the CRL by the CA's constrained name. No ACME issuance (needs DNS-01).
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Initialise the lab CA in the pinned image
         run: |
           set -euo pipefail

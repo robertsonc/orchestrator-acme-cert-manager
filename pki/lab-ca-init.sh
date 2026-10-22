@@ -47,6 +47,18 @@ CRL_URL="https://${LAB_CA_HOST}:${LAB_CA_PORT}/1.0/crl"
 
 die() { echo "lab-ca-init: $*" >&2; exit "${2:-1}"; }
 
+# The offline root is all three files or none: none is the documented steady
+# state (the operator moved $OFFLINE off the host), a partial set is a botched
+# move, a deleted file or tampering. Sets root_present (0..3) and root_missing
+# (the names that are absent or empty).
+offline_root_scan() {
+  local f
+  root_present=0; root_missing=()
+  for f in root_ca.crt root_ca_key root_password; do
+    if [[ -s "$OFFLINE/$f" ]]; then root_present=$((root_present + 1)); else root_missing+=("$f"); fi
+  done
+}
+
 case "$LAB_CA_HOST" in
   *".${LAB_CA_DOMAIN}") ;;
   *) die "LAB_CA_HOST ($LAB_CA_HOST) must be a name under LAB_CA_DOMAIN ($LAB_CA_DOMAIN): the CA's own TLS certificate is issued by the name-constrained intermediate." 2 ;;
@@ -80,6 +92,22 @@ if [[ -f config/ca.json ]]; then
     die "the persisted CA identity differs from the requested one (above). A CA cannot be renamed in place: to rebuild, stop the lab-ca service, move $STEPPATH aside (and $OFFLINE if you want a new root), re-run, and re-distribute the root." 3
   fi
   [[ -f secrets/root_ca_key ]] && die "secrets/root_ca_key is present in the ONLINE volume; move it to $OFFLINE (with its password) before continuing." 4
+  # A partial offline root next to an initialised CA is refused here, before
+  # anything else: left alone, the next rebuild of the online half would
+  # discard what is left and mint a new root that no client trusts.
+  offline_root_scan
+  if [[ $root_present -ne 0 && $root_present -ne 3 ]]; then
+    cat >&2 <<EOF
+lab-ca-init: the offline root in $OFFLINE is incomplete while this CA is initialised: $root_present of 3 files present, missing or empty: ${root_missing[*]}
+  root_ca.crt, root_ca_key and root_password belong together: keep all three in $OFFLINE, or none once the root has been moved off the host.
+  Refusing to continue; nothing was changed. To recover, do ONE of:
+    1. Restore the missing file(s) into $OFFLINE from the copy you moved off the host, then re-run.
+    2. If the root was moved off the host on purpose, move the remaining file(s) off as well (leave $OFFLINE empty), then re-run.
+    3. If no complete copy exists, this CA can never re-issue its intermediate and must be rebuilt:
+       stop the lab-ca service, move $STEPPATH and $OFFLINE aside, re-run, and re-distribute the new root to every client.
+EOF
+    exit 6
+  fi
   echo "lab CA already initialised at $STEPPATH; identity verified against $META; nothing to do."
   exit 0
 fi
@@ -93,17 +121,15 @@ echo "started $(date -u +%Y-%m-%dT%H:%M:%SZ) for ${LAB_CA_HOST}:${LAB_CA_PORT}" 
 
 # Offline root: all three files, or none. Generated in a staging directory and
 # promoted only when complete, so an interrupted run never leaves a half root
-# that later runs trip over.
-root_present=0
-for f in root_ca.crt root_ca_key root_password; do [[ -s "$OFFLINE/$f" ]] && root_present=$((root_present + 1)); done
+# that later runs trip over. No CA exists at this point (the re-run block above
+# always exits, and refuses a partial root next to an initialised CA), so a
+# partial set here is abandoned material from an earlier attempt: discard it.
+offline_root_scan
 STAGING="$OFFLINE/.staging"
 if [[ $root_present -eq 3 ]]; then
   echo ">> reusing the existing offline root in $OFFLINE"
 elif [[ $root_present -ne 0 ]]; then
-  if [[ -f config/ca.json ]]; then
-    die "offline root material in $OFFLINE is incomplete ($root_present of 3 files: root_ca.crt, root_ca_key, root_password) while a CA already exists. Restore the missing file(s) from your offline copy; if that copy is lost, this CA cannot re-issue its intermediate and must be rebuilt (move $STEPPATH and $OFFLINE aside, re-run, re-distribute the root)." 6
-  fi
-  echo ">> offline root material in $OFFLINE is incomplete and no CA exists yet; discarding it and generating a new root"
+  echo ">> offline root material in $OFFLINE is incomplete (missing or empty: ${root_missing[*]}) and no CA exists yet; discarding it and generating a new root"
   rm -f "$OFFLINE/root_ca.crt" "$OFFLINE/root_ca_key" "$OFFLINE/root_password"
   root_present=0
 fi

@@ -139,6 +139,11 @@ def _call(server: ServerConfig, phase: str, url: str, payload: dict, headers: di
         t0 = time.monotonic()
         try:
             resp = requests.post(url, json=payload, headers=headers, verify=verify, timeout=_TIMEOUT)
+        except requests.exceptions.SSLError as exc:
+            elapsed = int((time.monotonic() - t0) * 1000)
+            last = _failure(server, phase, endpoint, "tls", None, attempt, attempts, elapsed,
+                            excerpt=redact(str(exc)))
+            retryable = False        # a trust problem does not fix itself between attempts
         except requests.RequestException as exc:
             elapsed = int((time.monotonic() - t0) * 1000)
             kind = "transport"
@@ -178,6 +183,18 @@ def _failure(server: ServerConfig, phase: str, endpoint: str, kind: str, status:
              attempt: int, attempts: int, elapsed_ms: int, excerpt: str,
              request_id: str | None = None) -> StepResult:
     status_txt = f"HTTP {status}" if status is not None else "no HTTP response"
+    if kind == "tls":
+        headline = "Certificate validation failed" if phase == "validation" else "Certificate install failed"
+        explain = ("TLS verification of the Orchestrator API failed: the appliance certificate does not chain "
+                   "to a trusted root (a staging or self-signed certificate is still being served)")
+        nxt = ("turn off verify_ssl for this target until the production certificate is live, or set "
+               "ca_bundle to the CA that issued the appliance certificate; not retried")
+        message = (f"{headline} on {server.id}: {status_txt} ({kind}) on {endpoint}, "
+                   f"attempt {attempt} of {attempts} — {explain}. Next: {nxt}.")
+        return StepResult(STEP, ok=False, message=message, detail={
+            "phase": phase, "kind": kind, "endpoint": endpoint, "status": status, "attempt": attempt,
+            "attempts": attempts, "elapsed_ms": elapsed_ms, "response_excerpt": excerpt,
+            "next_action": nxt, "server_id": server.id, "host": server.orchestrator_host})
     if phase == "validation":
         if kind == "transient":
             explain = ("transient gateway error from the Orchestrator reverse proxy — the GMS "

@@ -11,6 +11,14 @@ Earlier releases defaulted SERVERS_FILE to DATA_DIR/servers.json, which is
 *not* covered by the documented bind mounts, so UI edits were lost when the
 container was recreated. LEGACY_SERVERS_FILE is kept only so preflight can
 detect that situation and tell the operator how to migrate.
+
+File shapes
+-----------
+``{"servers": [...]}`` (1.0 - 1.2) holds one Orchestrator per entry.
+``{"version": 2, "certificates": [...]}`` (1.3+) holds certificates, each with
+a ``targets`` list (driver + settings). A v1 file is migrated in memory on every
+load (one certificate + one Orchestrator target per entry, same id for both)
+and is written back in the v2 shape only when something is saved.
 """
 from __future__ import annotations
 
@@ -18,7 +26,7 @@ import json
 import os
 from pathlib import Path
 
-from .models import ServerConfig
+from .models import ORCHESTRATOR_DRIVER, Certificate, ServerConfig, Target
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", "/config"))
@@ -77,6 +85,8 @@ def _one(s: dict) -> ServerConfig:
             verify_ssl=bool(s.get("verify_ssl", False)),
             ca_bundle=(s.get("ca_bundle") or "").strip(),
             ca_bundle_mode=(s.get("ca_bundle_mode") or "exclusive").strip().lower(),
+            allow_cross_env_rollback=bool(s.get("allow_cross_env_rollback", False)),
+            dns_env={str(k): str(v) for k, v in (dns.get("env") or {}).items()},
         )
     except KeyError as exc:
         raise ConfigError(f"server entry missing required field: {exc}") from exc
@@ -96,8 +106,9 @@ def _to_dict(s: ServerConfig) -> dict:
         "verify_ssl": s.verify_ssl,
         "ca_bundle": s.ca_bundle,
         "ca_bundle_mode": s.ca_bundle_mode,
+        "allow_cross_env_rollback": s.allow_cross_env_rollback,
         "acme": {"ca": s.acme_ca, "email": s.acme_email, "key_type": s.key_type},
-        "dns": {"provider": s.dns_provider, "api_token": s.dns_api_token},
+        "dns": {"provider": s.dns_provider, "api_token": s.dns_api_token, "env": dict(s.dns_env)},
         "ssh": {
             "user": s.ssh_user,
             "key_path": s.ssh_key_path,
@@ -114,27 +125,148 @@ def server_from_dict(s: dict) -> ServerConfig:
     return _one(s)
 
 
+CONFIG_VERSION = 2
+
+
 def _parse_servers_file(path: Path) -> list[dict]:
+    """Legacy accessor: the raw v1 entries (or v2 certificates flattened to v1 shape)."""
+    return [_v1_entry(c, t) for c in _read_certificates(path) for t in c.orchestrator_targets()]
+
+
+def _v1_entry(cert: Certificate, target: Target) -> dict:
+    return _to_dict(ServerConfig.from_parts(cert, target))
+
+
+def _read_raw(path: Path):
     try:
         raw = json.loads(path.read_text())
     except json.JSONDecodeError as exc:
         raise ConfigError(f"{path} is not valid JSON: {exc}") from exc
     except OSError as exc:
         raise ConfigError(f"cannot read {path}: {exc}") from exc
-    entries = raw.get("servers", []) if isinstance(raw, dict) else raw
-    if not isinstance(entries, list):
-        raise ConfigError(f"{path}: expected a 'servers' list")
-    return entries
+    return raw
 
 
-def load_servers(path: Path | None = None) -> list[ServerConfig]:
+def file_version(path: Path | None = None) -> int | None:
+    """1 for the legacy ``servers`` shape, 2 for ``certificates``, None when absent."""
+    path = path or SERVERS_FILE
+    if not path.exists():
+        return None
+    raw = _read_raw(path)
+    if isinstance(raw, dict) and "certificates" in raw:
+        return 2
+    return 1
+
+
+def _normalize_target(cert_id: str, t: dict) -> Target:
+    if not isinstance(t, dict) or not t.get("id") or not t.get("driver"):
+        raise ConfigError(f"certificate {cert_id!r}: every target needs an id and a driver")
+    settings = dict(t.get("settings") or {})
+    if t["driver"] == ORCHESTRATOR_DRIVER:
+        # Same defaults the v1 loader applied, so a hand-edited v2 file behaves the same.
+        ssh = dict(settings.get("ssh") or {})
+        ssh.setdefault("known_hosts", DEFAULT_KNOWN_HOSTS)
+        ssh.setdefault("restart_command", DEFAULT_RESTART_COMMAND)
+        ssh.setdefault("nginx_reload_command", DEFAULT_NGINX_RELOAD_COMMAND)
+        ssh["user"] = (ssh.get("user") or "").strip()
+        ssh["key_path"] = (ssh.get("key_path") or "").strip()
+        ssh["known_hosts"] = (ssh.get("known_hosts") or DEFAULT_KNOWN_HOSTS).strip()
+        try:
+            ssh["port"] = int(ssh.get("port") or 22)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"target {t['id']!r}: ssh.port is not a number: {exc}") from exc
+        settings["ssh"] = ssh
+        settings.setdefault("api_key_env", "ORCH_API_KEY")
+        settings.setdefault("api_key", "")
+        settings["verify_ssl"] = bool(settings.get("verify_ssl", False))
+        settings["ca_bundle"] = (settings.get("ca_bundle") or "").strip()
+        settings["ca_bundle_mode"] = (settings.get("ca_bundle_mode") or "exclusive").strip().lower()
+        settings["allow_cross_env_rollback"] = bool(settings.get("allow_cross_env_rollback", False))
+        if not settings.get("orchestrator_host"):
+            raise ConfigError(f"target {t['id']!r}: orchestrator_host is required")
+    return Target(id=str(t["id"]), driver=str(t["driver"]), name=str(t.get("name") or ""),
+                  settings=settings, certificate_id=cert_id)
+
+
+def _cert_from_v2(c: dict) -> Certificate:
+    try:
+        acme = c.get("acme", {}) or {}
+        dns = c.get("dns", {}) or {}
+        cert = Certificate(
+            id=c["id"], name=c.get("name") or c["id"], domain=c["domain"],
+            acme_ca=acme.get("ca", "letsencrypt"), acme_email=acme.get("email", ""),
+            key_type=acme.get("key_type", "rsa2048"),
+            dns_provider=dns.get("provider", "cloudflare"), dns_api_token=dns.get("api_token", ""),
+            dns_env={str(k): str(v) for k, v in (dns.get("env") or {}).items()},
+        )
+    except KeyError as exc:
+        raise ConfigError(f"certificate entry missing required field: {exc}") from exc
+    cert.targets = [_normalize_target(cert.id, t) for t in (c.get("targets") or [])]
+    return cert.attach()
+
+
+def _read_certificates(path: Path) -> list[Certificate]:
+    raw = _read_raw(path)
+    if isinstance(raw, dict) and "certificates" in raw:
+        entries = raw.get("certificates") or []
+        if not isinstance(entries, list):
+            raise ConfigError(f"{path}: expected a 'certificates' list")
+        certs = [_cert_from_v2(c) for c in entries]
+    else:
+        entries = raw.get("servers", []) if isinstance(raw, dict) else raw
+        if not isinstance(entries, list):
+            raise ConfigError(f"{path}: expected a 'servers' list")
+        certs = [_one(s).to_certificate() for s in entries]
+    seen_c: set[str] = set()
+    seen_t: set[str] = set()
+    for c in certs:
+        if c.id in seen_c:
+            raise ConfigError(f"{path}: duplicate certificate id {c.id!r}")
+        seen_c.add(c.id)
+        for t in c.targets:
+            if t.id in seen_t:
+                raise ConfigError(f"{path}: duplicate target id {t.id!r} (target ids are global)")
+            seen_t.add(t.id)
+    return certs
+
+
+def load_certificates(path: Path | None = None) -> list[Certificate]:
+    """Every certificate with its targets; a v1 file is migrated in memory."""
     path = path or SERVERS_FILE
     if not path.exists():
         return []
-    return [_one(s) for s in _parse_servers_file(path)]
+    return _read_certificates(path)
+
+
+def load_servers(path: Path | None = None) -> list[ServerConfig]:
+    """The flattened legacy view: one entry per Orchestrator target."""
+    return [c.as_server(t) for c in load_certificates(path) for t in c.orchestrator_targets()]
+
+
+def get_certificate(cert_id: str) -> Certificate:
+    for c in load_certificates():
+        if c.id == cert_id:
+            return c
+    raise ConfigError(f"no certificate with id {cert_id!r}")
+
+
+def all_targets() -> list[tuple[Certificate, Target]]:
+    return [(c, t) for c in load_certificates() for t in c.targets]
+
+
+def get_target(target_id: str) -> tuple[Certificate, Target]:
+    for c, t in all_targets():
+        if t.id == target_id:
+            return c, t
+    raise ConfigError(f"no target with id {target_id!r}")
+
+
+def target_exists(target_id: str) -> bool:
+    return any(t.id == target_id for _, t in all_targets())
 
 
 def get_server(server_id: str) -> ServerConfig:
+    """The Orchestrator target with this id, flattened with its certificate."""
     for s in load_servers():
         if s.id == server_id:
             return s
@@ -142,7 +274,9 @@ def get_server(server_id: str) -> ServerConfig:
 
 
 def server_exists(server_id: str) -> bool:
-    return any(s.id == server_id for s in load_servers())
+    """True when any certificate or target already uses this id."""
+    certs = load_certificates()
+    return any(c.id == server_id for c in certs) or any(t.id == server_id for c in certs for t in c.targets)
 
 
 def _lock_down(path: Path) -> None:
@@ -153,16 +287,16 @@ def _lock_down(path: Path) -> None:
         pass
 
 
-def save_servers(servers: list[ServerConfig]) -> None:
-    """Write the full server list back to servers.json.
+def save_certificates(certs: list[Certificate]) -> None:
+    """Write the full configuration back to servers.json in the v2 shape.
 
     Writes in place rather than renaming a temp file over the target, because
     servers.json may be an individual Docker bind mount — os.replace() onto a
     mount point fails with EBUSY. A .bak copy is kept so a mid-write failure is
-    still recoverable. Both files are chmod 600 because they now hold secrets.
+    still recoverable. Both files are chmod 600 because they hold secrets.
     """
     SERVERS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"servers": [_to_dict(s) for s in servers]}
+    payload = {"version": CONFIG_VERSION, "certificates": [c.as_dict() for c in certs]}
     text = json.dumps(payload, indent=2) + "\n"
     if SERVERS_FILE.exists():
         bak = SERVERS_FILE.with_suffix(".json.bak")
@@ -172,25 +306,86 @@ def save_servers(servers: list[ServerConfig]) -> None:
     _lock_down(SERVERS_FILE)
 
 
-def upsert_server(server: ServerConfig) -> None:
-    """Insert a new server or replace an existing one in place (preserving order)."""
-    servers = load_servers()
-    for i, s in enumerate(servers):
-        if s.id == server.id:
-            servers[i] = server
+def save_servers(servers: list[ServerConfig]) -> None:
+    """Legacy writer: each entry becomes one certificate with one Orchestrator target."""
+    save_certificates([s.to_certificate() for s in servers])
+
+
+def upsert_certificate(cert: Certificate) -> None:
+    """Insert a certificate or replace the one with the same id (preserving order)."""
+    certs = load_certificates()
+    for i, c in enumerate(certs):
+        if c.id == cert.id:
+            certs[i] = cert
             break
     else:
-        servers.append(server)
-    save_servers(servers)
+        certs.append(cert)
+    for t in cert.targets:
+        t.certificate_id = cert.id
+    save_certificates(certs)
+
+
+def upsert_target(cert_id: str, target: Target) -> None:
+    """Insert or replace one target of an existing certificate."""
+    certs = load_certificates()
+    cert = next((c for c in certs if c.id == cert_id), None)
+    if cert is None:
+        raise ConfigError(f"no certificate with id {cert_id!r}")
+    for c in certs:
+        for t in c.targets:
+            if t.id == target.id and c.id != cert_id:
+                raise ConfigError(f"target id {target.id!r} is already used by certificate {c.id!r}")
+    target.certificate_id = cert_id
+    for i, t in enumerate(cert.targets):
+        if t.id == target.id:
+            cert.targets[i] = target
+            break
+    else:
+        cert.targets.append(target)
+    cert.attach()
+    save_certificates(certs)
+
+
+def delete_target(target_id: str) -> bool:
+    """Remove one target; a certificate left without targets is removed too."""
+    certs = load_certificates()
+    changed = False
+    for c in certs:
+        before = len(c.targets)
+        c.targets = [t for t in c.targets if t.id != target_id]
+        changed = changed or len(c.targets) != before
+    if not changed:
+        return False
+    save_certificates([c for c in certs if c.targets])
+    return True
+
+
+def upsert_server(server: ServerConfig) -> None:
+    """Insert a new Orchestrator entry or replace an existing one in place.
+
+    The certificate's other targets (if any) are kept; only the Orchestrator
+    target with this id and the certificate's own fields are replaced.
+    """
+    certs = load_certificates()
+    new = server.to_certificate()
+    cert = next((c for c in certs if c.id == new.id), None)
+    if cert is None:
+        certs.append(new)
+    else:
+        others = [t for t in cert.targets if t.id != server.id]
+        new.targets = new.targets + others
+        new.attach()
+        certs[certs.index(cert)] = new
+    save_certificates(certs)
 
 
 def delete_server(server_id: str) -> bool:
-    """Remove a server by id. Returns True if something was removed."""
-    servers = load_servers()
-    remaining = [s for s in servers if s.id != server_id]
-    if len(remaining) == len(servers):
+    """Remove a certificate (and all its targets) by id. Returns True if something was removed."""
+    certs = load_certificates()
+    remaining = [c for c in certs if c.id != server_id]
+    if len(remaining) == len(certs):
         return False
-    save_servers(remaining)
+    save_certificates(remaining)
     return True
 
 
@@ -205,20 +400,24 @@ def api_key_for(server: ServerConfig) -> str:
     return key
 
 
-def cf_token_for(server: ServerConfig) -> str:
-    """Resolve the Cloudflare DNS token: inline value first, then the env var."""
-    return server.dns_api_token or os.environ.get(CF_TOKEN_ENV, "")
+def cf_token_for(cert) -> str:
+    """Resolve the Cloudflare DNS token: inline value first, then the env var.
+
+    Accepts a Certificate or the flattened ServerConfig (both carry dns_api_token).
+    """
+    return cert.dns_api_token or os.environ.get(CF_TOKEN_ENV, "")
 
 
-def cert_dir_for(server: ServerConfig) -> Path:
-    d = CERTS_DIR / server.domain
+def cert_dir_for(cert) -> Path:
+    """Per-certificate directory (Lego state, flattened files, rollback snapshot)."""
+    d = CERTS_DIR / cert.domain
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def leaf_path_for(server: ServerConfig) -> Path:
-    """The flattened leaf certificate for this server (may not exist yet)."""
-    return CERTS_DIR / server.domain / f"{server.domain}.cer"
+def leaf_path_for(cert) -> Path:
+    """The flattened leaf certificate for this certificate (may not exist yet)."""
+    return CERTS_DIR / cert.domain / f"{cert.domain}.cer"
 
 
 def is_staging_ca(acme_ca: str) -> bool:

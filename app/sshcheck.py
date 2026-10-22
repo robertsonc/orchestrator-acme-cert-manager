@@ -6,9 +6,14 @@ actionable message instead of a low-level traceback such as
 "[Errno 2] No such file or directory: ''".
 
 validate(server)      -> list of human-readable problems (empty == OK)
+warnings(server)      -> list of non-fatal smells in the activation commands
 load_private_key(p)   -> paramiko PKey, or raises SSHConfigError
 test_connection(s)    -> StepResult: authenticates and checks sudo
                          authorization with `sudo -n -l` (never restarts anything)
+
+The ``*_endpoint`` functions take the SSH parameters explicitly so the generic
+SSH/SCP driver shares them; the ``server``-taking functions are the
+Orchestrator view of the same checks.
 """
 from __future__ import annotations
 
@@ -16,6 +21,7 @@ import logging
 import os
 import shlex
 import socket
+from dataclasses import dataclass
 from pathlib import Path
 
 import paramiko
@@ -33,6 +39,22 @@ _KEY_CLASSES = (paramiko.RSAKey, paramiko.Ed25519Key, paramiko.ECDSAKey)
 
 class SSHConfigError(Exception):
     """A problem with the SSH settings that must be fixed by the operator."""
+
+
+@dataclass
+class Endpoint:
+    """The SSH parameters of one target."""
+    label: str
+    host: str
+    port: int
+    user: str
+    key_path: str
+    known_hosts: str
+
+    @classmethod
+    def of(cls, server: ServerConfig) -> "Endpoint":
+        return cls(server.id, server.orchestrator_host, int(server.ssh_port), server.ssh_user,
+                   server.ssh_key_path, server.ssh_known_hosts)
 
 
 # --------------------------------------------------------------------------- static checks
@@ -67,69 +89,101 @@ def load_private_key(path: str) -> paramiko.PKey:
         f"(is it a *private* key in OpenSSH/PEM format?): {last}")
 
 
-def validate(server: ServerConfig) -> list[str]:
-    """Return every SSH configuration problem for this server (empty list == OK)."""
+def validate_endpoint(ep: Endpoint) -> list[str]:
+    """Every SSH configuration problem for one endpoint (empty list == OK)."""
     problems: list[str] = []
 
-    if not server.ssh_user:
-        problems.append("ssh.user is empty — set the Orchestrator login the activation commands run as.")
+    if not ep.user:
+        problems.append("ssh.user is empty — set the login the activation commands run as.")
 
-    if not server.ssh_key_path:
+    if not ep.key_path:
         problems.append(f"ssh.key_path is empty — configure a private key path, for example "
                         f"{config.DEFAULT_SSH_KEY}.")
     else:
         try:
-            load_private_key(server.ssh_key_path)
+            load_private_key(ep.key_path)
         except SSHConfigError as exc:
             problems.append(str(exc))
 
-    if not (1 <= int(server.ssh_port) <= 65535):
-        problems.append(f"ssh.port {server.ssh_port} is out of range.")
+    if not (1 <= int(ep.port) <= 65535):
+        problems.append(f"ssh.port {ep.port} is out of range.")
 
-    if not server.ssh_known_hosts:
-        problems.append(f"ssh.known_hosts is empty — pin the Orchestrator host key, for example "
+    if not ep.known_hosts:
+        problems.append(f"ssh.known_hosts is empty — pin the host key, for example "
                         f"{config.DEFAULT_KNOWN_HOSTS}.")
     else:
-        kh = Path(server.ssh_known_hosts)
+        kh = Path(ep.known_hosts)
         if not kh.is_file():
-            problems.append(f"known_hosts not found at {server.ssh_known_hosts} — run setup.sh "
+            problems.append(f"known_hosts not found at {ep.known_hosts} — run setup.sh "
                             f"(or ssh-keyscan) and verify the fingerprint before trusting it.")
         elif not os.access(kh, os.R_OK):
-            problems.append(f"known_hosts at {server.ssh_known_hosts} is not readable by the service user.")
+            problems.append(f"known_hosts at {ep.known_hosts} is not readable by the service user.")
         else:
             try:
                 hk = paramiko.HostKeys(str(kh))
             except (paramiko.SSHException, OSError, ValueError) as exc:
-                problems.append(f"known_hosts at {server.ssh_known_hosts} could not be parsed: {exc}")
+                problems.append(f"known_hosts at {ep.known_hosts} could not be parsed: {exc}")
             else:
-                name = known_hosts_entry_name(server.orchestrator_host, server.ssh_port)
+                name = known_hosts_entry_name(ep.host, ep.port)
                 if not hk.lookup(name):
                     problems.append(
-                        f"known_hosts at {server.ssh_known_hosts} has no entry for {name!r} — "
+                        f"known_hosts at {ep.known_hosts} has no entry for {name!r} — "
                         f"the entry must match the host (and port) the tool connects to.")
+    return problems
 
+
+def validate(server: ServerConfig) -> list[str]:
+    """Return every SSH configuration problem for this server (empty list == OK)."""
+    problems = validate_endpoint(Endpoint.of(server))
     if not server.restart_command and not server.nginx_reload_command:
         problems.append("no restart or nginx reload command is configured; nothing would activate the certificate.")
-
     return problems
+
+
+def command_warnings(label: str, command: str, expect_no_block: bool = False) -> list[str]:
+    """Non-fatal smells in an activation command (issue #15)."""
+    out: list[str] = []
+    cmd = (command or "").strip()
+    if not cmd:
+        return out
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        return [f"{label} could not be parsed as a shell command: {cmd!r}"]
+    if parts and parts[0] != "sudo":
+        out.append(f"{label} does not start with sudo — it will run unprivileged and the sudoers rule is not probed: {cmd!r}")
+    base = [p for p in parts if p != "sudo" and not p.startswith("-")] or parts
+    prog = os.path.basename(base[0]) if base else ""
+    if prog == "service":
+        out.append(f"{label} uses the 'service' wrapper, which prints 'Redirecting to ...' before the real error "
+                   f"and cannot restart without blocking; prefer '/bin/systemctl restart --no-block <unit>': {cmd!r}")
+    if expect_no_block and prog == "systemctl" and "restart" in parts and "--no-block" not in parts:
+        out.append(f"{label} is a systemctl restart without --no-block: the SSH command blocks until GMS has "
+                   f"restarted and can hit the command timeout: {cmd!r}")
+    return out
+
+
+def warnings(server: ServerConfig) -> list[str]:
+    return (command_warnings("restart_command", server.restart_command, expect_no_block=True)
+            + command_warnings("nginx_reload_command", server.nginx_reload_command))
 
 
 # --------------------------------------------------------------------------- connection
 
-def _classify_connect_error(exc: Exception, server: ServerConfig) -> str:
-    name = known_hosts_entry_name(server.orchestrator_host, server.ssh_port)
+def classify_connect_error(exc: Exception, ep: Endpoint) -> str:
+    name = known_hosts_entry_name(ep.host, ep.port)
     if isinstance(exc, paramiko.BadHostKeyException):
         return (f"SSH host key for {name} does not match the pinned entry in "
-                f"{server.ssh_known_hosts}. If the appliance was rebuilt, re-pin it after "
+                f"{ep.known_hosts}. If the appliance was rebuilt, re-pin it after "
                 f"verifying the new fingerprint out of band; never disable host-key checking.")
     if isinstance(exc, paramiko.AuthenticationException):
-        return (f"SSH authentication failed for {server.ssh_user}@{name}: the public half of "
-                f"{server.ssh_key_path} is not in that account's authorized_keys, or the account "
+        return (f"SSH authentication failed for {ep.user}@{name}: the public half of "
+                f"{ep.key_path} is not in that account's authorized_keys, or the account "
                 f"does not permit key authentication.")
     if isinstance(exc, paramiko.SSHException):
         msg = str(exc)
         if "not found in known_hosts" in msg or "Unknown server" in msg:
-            return (f"SSH host key for {name} is not pinned in {server.ssh_known_hosts}; "
+            return (f"SSH host key for {name} is not pinned in {ep.known_hosts}; "
                     f"add it after verifying the fingerprint.")
         return f"SSH negotiation with {name} failed: {msg}"
     if isinstance(exc, socket.timeout):
@@ -139,28 +193,29 @@ def _classify_connect_error(exc: Exception, server: ServerConfig) -> str:
     return f"SSH connection to {name} failed: {exc!r}"
 
 
-def open_client(server: ServerConfig) -> paramiko.SSHClient:
-    """Validate the SSH settings and return a connected client.
+def _classify_connect_error(exc: Exception, server: ServerConfig) -> str:
+    return classify_connect_error(exc, Endpoint.of(server))
 
-    Raises SSHConfigError with an operator-facing message on any failure.
-    """
-    problems = validate(server)
+
+def connect(ep: Endpoint, extra_problems: list[str] | None = None) -> paramiko.SSHClient:
+    """Validate the endpoint and return a connected client; SSHConfigError on any failure."""
+    problems = validate_endpoint(ep) + list(extra_problems or [])
     if problems:
         raise SSHConfigError(
-            f"SSH configuration invalid for {server.id}:\n  - " + "\n  - ".join(problems))
+            f"SSH configuration invalid for {ep.label}:\n  - " + "\n  - ".join(problems))
 
-    pkey = load_private_key(server.ssh_key_path)
+    pkey = load_private_key(ep.key_path)
     client = paramiko.SSHClient()
     try:
-        client.load_host_keys(server.ssh_known_hosts)
+        client.load_host_keys(ep.known_hosts)
     except (OSError, paramiko.SSHException) as exc:
-        raise SSHConfigError(f"cannot load known_hosts {server.ssh_known_hosts}: {exc}") from exc
+        raise SSHConfigError(f"cannot load known_hosts {ep.known_hosts}: {exc}") from exc
     client.set_missing_host_key_policy(paramiko.RejectPolicy())
     try:
         client.connect(
-            hostname=server.orchestrator_host,
-            port=int(server.ssh_port),
-            username=server.ssh_user,
+            hostname=ep.host,
+            port=int(ep.port),
+            username=ep.user,
             pkey=pkey,
             timeout=_CONNECT_TIMEOUT,
             banner_timeout=_CONNECT_TIMEOUT,
@@ -170,8 +225,18 @@ def open_client(server: ServerConfig) -> paramiko.SSHClient:
         )
     except (paramiko.SSHException, OSError) as exc:
         client.close()
-        raise SSHConfigError(_classify_connect_error(exc, server)) from exc
+        raise SSHConfigError(classify_connect_error(exc, ep)) from exc
     return client
+
+
+def open_client(server: ServerConfig) -> paramiko.SSHClient:
+    """Validate the SSH settings and return a connected client.
+
+    Raises SSHConfigError with an operator-facing message on any failure.
+    """
+    extra = [] if (server.restart_command or server.nginx_reload_command) else \
+        ["no restart or nginx reload command is configured; nothing would activate the certificate."]
+    return connect(Endpoint.of(server), extra)
 
 
 def run(client: paramiko.SSHClient, cmd: str, timeout: int = _CMD_TIMEOUT) -> tuple[int, str, str]:
@@ -200,6 +265,37 @@ def authorization_probe(command: str) -> str | None:
     return "sudo -n -l " + " ".join(shlex.quote(p) for p in rest)
 
 
+def probe_commands(client: paramiko.SSHClient, user: str, commands: list[tuple[str, str]]) -> tuple[bool, list[dict]]:
+    """Run `sudo -n -l <command>` for each (label, command); (all_ok, checks)."""
+    checks: list[dict] = []
+    ok = True
+    for label, cmd in commands:
+        if not cmd:
+            continue
+        probe = authorization_probe(cmd)
+        if probe is None:
+            checks.append({"command": cmd, "ok": True, "note": "not using sudo; authorization not probed"})
+            continue
+        try:
+            rc, out, err = run(client, probe)
+        except (paramiko.SSHException, socket.timeout, OSError) as exc:
+            ok = False
+            checks.append({"command": cmd, "ok": False, "error": f"probe failed: {exc}"})
+            continue
+        passed = rc == 0
+        ok = ok and passed
+        entry = {"command": cmd, "ok": passed, "probe": probe, "exit": rc,
+                 "stdout": out[:500], "stderr": err[:500]}
+        if not passed:
+            if "password" in (err + out).lower():
+                entry["hint"] = (f"sudo wants a password for {user}: add a NOPASSWD "
+                                 f"sudoers rule scoped to exactly this command.")
+            else:
+                entry["hint"] = "sudoers does not permit this exact command for this user."
+        checks.append(entry)
+    return ok, checks
+
+
 def test_connection(server: ServerConfig) -> StepResult:
     """Authenticate and verify sudo authorization for the activation commands.
 
@@ -212,34 +308,10 @@ def test_connection(server: ServerConfig) -> StepResult:
     except SSHConfigError as exc:
         return StepResult(STEP, ok=False, message=str(exc), detail={"phase": "connect"})
 
-    checks: list[dict] = []
-    ok = True
     try:
-        for label, cmd in (("restart_command", server.restart_command),
-                           ("nginx_reload_command", server.nginx_reload_command)):
-            if not cmd:
-                continue
-            probe = authorization_probe(cmd)
-            if probe is None:
-                checks.append({"command": cmd, "ok": True, "note": "not using sudo; authorization not probed"})
-                continue
-            try:
-                rc, out, err = run(client, probe)
-            except (paramiko.SSHException, socket.timeout, OSError) as exc:
-                ok = False
-                checks.append({"command": cmd, "ok": False, "error": f"probe failed: {exc}"})
-                continue
-            passed = rc == 0
-            ok = ok and passed
-            entry = {"command": cmd, "ok": passed, "probe": probe, "exit": rc,
-                     "stdout": out[:500], "stderr": err[:500]}
-            if not passed:
-                if "password" in (err + out).lower():
-                    entry["hint"] = (f"sudo wants a password for {server.ssh_user}: add a NOPASSWD "
-                                     f"sudoers rule scoped to exactly this command.")
-                else:
-                    entry["hint"] = "sudoers does not permit this exact command for this user."
-            checks.append(entry)
+        ok, checks = probe_commands(client, server.ssh_user,
+                                    [("restart_command", server.restart_command),
+                                     ("nginx_reload_command", server.nginx_reload_command)])
     finally:
         client.close()
 

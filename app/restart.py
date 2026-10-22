@@ -24,6 +24,7 @@ import paramiko
 from cryptography import x509
 
 from . import config, deploy, sshcheck
+from .drivers import base as drv
 from .models import ServerConfig, StepResult
 
 log = logging.getLogger("restart")
@@ -136,7 +137,13 @@ def _run(client: paramiko.SSHClient, cmd: str):
 
 
 def _first_line(text: str) -> str:
-    return (text or "").strip().splitlines()[0] if (text or "").strip() else "no output"
+    """The last non-empty line: wrappers such as `service` print 'Redirecting to ...' first
+    and the real error last. The full output stays in the step detail."""
+    lines = [ln for ln in (text or "").strip().splitlines() if ln.strip()]
+    return lines[-1] if lines else "no output"
+
+
+_last_line = _first_line
 
 
 # --------------------------------------------------------------------------- rollback
@@ -160,6 +167,8 @@ def _promote_known_good(server: ServerConfig) -> None:
         shutil.copyfile(src / f"{server.domain}.key", d / f"{server.domain}.key")
         shutil.copyfile(src / "ca.cer", d / "ca.cer")
         os.chmod(d / f"{server.domain}.key", 0o600)
+        drv.write_snapshot_meta(d, drv.CertBundle.from_paths(
+            d / f"{server.domain}.cer", d / f"{server.domain}.key", d / "ca.cer"))
     except OSError as exc:
         log.warning("could not save known-good cert for %s: %s", server.id, exc)
 
@@ -171,6 +180,16 @@ def _attempt_rollback(server: ServerConfig, failed_serial: int) -> StepResult:
                           message="activation failed and no previous certificate exists to roll back to",
                           detail={"rolled_back": False, "reason": "no known-good snapshot",
                                   "failed_serial": format(failed_serial, "x")})
+
+    snap = drv.CertBundle.from_paths(cert, key, ca)
+    failed = drv.CertBundle.for_certificate(server)
+    refusal = drv.cross_environment_refusal(server.to_target(), snap, failed)
+    if refusal:
+        log.error("restart(%s): %s", server.id, refusal)
+        return StepResult(STEP, ok=False, message=refusal,
+                          detail={"rolled_back": False, "reason": "cross-environment rollback refused",
+                                  "failed_serial": format(failed_serial, "x"), "snapshot_serial": snap.serial_hex,
+                                  "snapshot_environment": snap.environment, "failed_environment": failed.environment})
 
     log.warning("restart(%s): activation failed — rolling back to last-known-good", server.id)
     dres = deploy.deploy_paths(server, cert, key, ca)
@@ -187,13 +206,19 @@ def _attempt_rollback(server: ServerConfig, failed_serial: int) -> StepResult:
 
     prev_serial = _deployed_serial_from(cert)
     ok, _ = _wait_for_served_serial(server, prev_serial, _ROLLBACK_POLL_TIMEOUT)
+    crossed = bool(snap.environment and failed.environment and snap.environment != failed.environment)
+    msg = ("activation verification failed — rolled back to previous certificate" if ok
+           else "activation failed and rollback did not verify")
+    if ok and crossed:
+        msg += (f" (CROSS-ENVIRONMENT: restored a {snap.environment} certificate in place of a "
+                f"{failed.environment} one, as allowed by this target's rollback policy)")
     return StepResult(STEP, ok=False,
-                      message=("activation verification failed — rolled back to previous certificate"
-                               if ok else
-                               "activation failed and rollback did not verify"),
+                      message=msg,
                       detail={"rolled_back": ok,
                               "restored_serial": format(prev_serial, "x"),
-                              "failed_serial": format(failed_serial, "x")})
+                              "failed_serial": format(failed_serial, "x"),
+                              "cross_environment": crossed,
+                              "snapshot_environment": snap.environment})
 
 
 # --------------------------------------------------------------------------- cert helpers

@@ -16,7 +16,7 @@ import logging
 import os
 from pathlib import Path
 
-from . import __version__, config, sshcheck, store
+from . import __version__, config, drivers, locks, sshcheck, store
 
 log = logging.getLogger("sysinfo")
 
@@ -31,7 +31,9 @@ ENV_SPEC: list[tuple[str, str, str, str, str]] = [
     ("ORCH_API_KEY", "secret", "", "Orchestrator API key used when a server has no inline key.", HOST_ENV),
     ("NOTIFY_WEBHOOK_URL", "secret", "", "Incoming webhook for failure alerts (blank disables alerts).", HOST_ENV),
     ("NOTIFY_ON", "value", "failed", "Alert on 'failed' runs only, or 'all'.", HOST_ENV),
-    ("RENEW_WINDOW_DAYS", "value", "30", "Scheduled renewals issue when this many days or fewer remain.", HOST_ENV),
+    ("RENEW_WINDOW_DAYS", "value", "1/3 of lifetime", "Absolute renewal window in days. Unset: renew when a third of the certificate's lifetime remains (30 days for a 90-day certificate).", HOST_ENV),
+    ("OACM_UID", "value", "10001", "uid the cert manager container runs as; must own config/ and data/ (setup.sh sets it).", "./setup.sh writes OACM_UID/OACM_GID to .env"),
+    ("OACM_GID", "value", "10001", "gid the cert manager container runs as.", "./setup.sh writes OACM_UID/OACM_GID to .env"),
     ("STRICT_STARTUP", "value", "true", "Refuse to start on an unmounted or legacy-only configuration.", HOST_ENV),
     ("DEPLOY_VALIDATION_ATTEMPTS", "value", "3", "Retries for transient 502/503/504 answers during validation.", HOST_ENV),
     ("DEPLOY_RETRY_BACKOFF", "value", "5", "Base seconds between validation retries, doubled each time.", HOST_ENV),
@@ -92,14 +94,54 @@ def scheduler() -> dict:
         pass
     last = next((r for r in store.all_records() if (r.get("kind") or "renew") == "scheduled"), None)
     nxt = min((e["next_run"] for e in entries if e["next_run"]), default=None)
+    state = store.scheduler_state()
+    interval_h = interval_hours(entries)
     return {
         "crontab": str(CRONTAB), "entries": entries, "next_run": nxt,
-        "window_days": os.environ.get("RENEW_WINDOW_DAYS", "30"),
+        "window_days": os.environ.get("RENEW_WINDOW_DAYS", "") or "1/3 of lifetime",
         "tz": os.environ.get("TZ", "UTC"),
         "last_scheduled": {"timestamp": last.get("timestamp"), "outcome": last.get("outcome"),
                            "server_id": last.get("server_id")} if last else None,
+        "state": state, "interval_hours": interval_h,
+        "stale": scheduler_stale(state, interval_h),
         "via": "config/crontab in the image (rebuild to change); RENEW_WINDOW_DAYS in .env",
     }
+
+
+def interval_hours(entries: list[dict]) -> float:
+    """Longest gap between daily fixed-time entries (24 h for a single one)."""
+    hours = sorted({int(e["expr"].split()[1]) + int(e["expr"].split()[0]) / 60 for e in entries
+                    if e.get("next_run")})
+    if not hours:
+        return 24.0
+    if len(hours) == 1:
+        return 24.0
+    gaps = [b - a for a, b in zip(hours, hours[1:])] + [24 - hours[-1] + hours[0]]
+    return float(max(gaps))
+
+
+_PROCESS_STARTED = datetime.datetime.now(datetime.timezone.utc)
+
+
+def scheduler_stale(state: dict, interval_h: float) -> bool:
+    """True when no scheduled run finished within twice the cron interval (issue #11).
+
+    The web process start is the baseline, so a fresh container is healthy
+    until it has missed two scheduled runs.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    baseline = _PROCESS_STARTED
+    for key in ("finished", "started"):
+        raw = state.get(key)
+        if raw:
+            try:
+                d = datetime.datetime.fromisoformat(raw)
+                if d.tzinfo is None:
+                    d = d.replace(tzinfo=datetime.timezone.utc)
+                baseline = max(baseline, d)
+            except ValueError:
+                pass
+    return (now - baseline).total_seconds() > 2 * interval_h * 3600
 
 
 # ----------------------------------------------------------------------------- SSH material
@@ -134,24 +176,37 @@ def _known_hosts_info(path: str) -> dict:
     return info
 
 
-def ssh_material() -> dict:
-    """The default key and known_hosts, plus any other paths servers reference."""
-    servers = []
+def _ssh_endpoints() -> list[tuple[str, sshcheck.Endpoint, list[str]]]:
+    """(target id, endpoint, driver preflight problems) for every SSH-based target."""
+    out = []
     try:
-        loaded = config.load_servers()
+        pairs = config.all_targets()
     except config.ConfigError:
-        loaded = []
+        return out
+    for cert, t in pairs:
+        if t.driver == "orchestrator":
+            s = cert.as_server(t)
+            out.append((t.id, sshcheck.Endpoint.of(s), sshcheck.validate(s)))
+        elif t.driver == "ssh":
+            drv = drivers.get("ssh")
+            out.append((t.id, drv.endpoint(t), drv.preflight(t)))
+    return out
+
+
+def ssh_material() -> dict:
+    """The default key and known_hosts, plus any other paths targets reference."""
+    servers = []
     keys: dict[str, dict] = {}
     khs: dict[str, dict] = {}
-    for s in loaded:
-        kp = s.ssh_key_path or config.DEFAULT_SSH_KEY
-        kh = s.ssh_known_hosts or config.DEFAULT_KNOWN_HOSTS
+    for tid, ep, problems in _ssh_endpoints():
+        kp = ep.key_path or config.DEFAULT_SSH_KEY
+        kh = ep.known_hosts or config.DEFAULT_KNOWN_HOSTS
         keys.setdefault(kp, _key_info(kp))
         khs.setdefault(kh, _known_hosts_info(kh))
-        name = sshcheck.known_hosts_entry_name(s.orchestrator_host, s.ssh_port)
-        servers.append({"id": s.id, "host": s.orchestrator_host, "port": s.ssh_port, "user": s.ssh_user,
+        name = sshcheck.known_hosts_entry_name(ep.host, ep.port)
+        servers.append({"id": tid, "host": ep.host, "port": ep.port, "user": ep.user,
                         "key_path": kp, "known_hosts": kh, "entry": name,
-                        "pinned": name in khs[kh]["hosts"], "problems": sshcheck.validate(s)})
+                        "pinned": name in khs[kh]["hosts"], "problems": problems})
     keys.setdefault(config.DEFAULT_SSH_KEY, _key_info(config.DEFAULT_SSH_KEY))
     khs.setdefault(config.DEFAULT_KNOWN_HOSTS, _known_hosts_info(config.DEFAULT_KNOWN_HOSTS))
     return {
@@ -223,6 +278,8 @@ HOST_OPERATIONS = [
     {"name": "Scoped sudoers rule", "cmd": "./setup.sh --host <orchestrator> --install-sudoers", "note": "Writes one drop-in under /etc/sudoers.d after confirmation and visudo validation."},
     {"name": "Environment variables", "cmd": "edit .env; docker compose down && docker compose up -d", "note": "Secrets, alerting, retry tuning, time zone. A restart is required."},
     {"name": "Reset the admin account", "cmd": "rm config/admin.json", "note": "The next visit shows the Setup page."},
+    {"name": "Backup / restore", "cmd": "docker compose exec -T orchestrator-acme-cert-manager python -m app.cli backup /config/backup.tgz",
+     "note": "Config + runtime state (certs, lab CA online state), logs excluded, offline root only with --include-root; restore with `python -m app.cli restore <file>`."},
     {"name": "Rebuild after a code update", "cmd": "git pull && docker compose up -d --build", "note": "See UPGRADING.md for the version-specific steps."},
 ]
 
@@ -242,4 +299,12 @@ def snapshot(report, probe_ca: bool = False) -> dict:
     d["ssh"] = ssh_material()
     d["lab_ca"] = lab_ca(probe=probe_ca)
     d["host_operations"] = HOST_OPERATIONS
+    d["uid"] = os.getuid()
+    d["gid"] = os.getgid()
+    try:
+        d["config_version"] = config.file_version()
+    except config.ConfigError:
+        d["config_version"] = None
+    d["locks"] = locks.active()
+    d["drivers"] = [{"name": drv.name, "label": drv.label, "steps": list(drv.steps)} for drv in drivers.all_drivers()]
     return d

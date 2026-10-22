@@ -344,10 +344,10 @@ class ClearPassDriver(Driver):
                         msg = (f"node {n['name'] or n['uuid']}: {other} is enabled and will keep serving its own certificate to "
                                f"{'ECC-capable' if other == 'HTTPS(ECC)' else 'RSA-only'} clients; update both slots "
                                f"(a second certificate with the other key type) or disable {other} in ClearPass")
-                        if policy == "block":
-                            raise ClearPassError("slots", msg + " (other_slot_policy=block)", kind="config")
                         if policy == "warn":
                             warnings.append(msg)
+                        elif policy != "ignore":
+                            raise ClearPassError("slots", msg + f" (other_slot_policy={policy})", kind="config")
         except ClearPassError as exc:
             return StepResult("deploy", ok=False, message=str(exc), detail={"phase": exc.phase, "kind": exc.kind, "status": exc.status})
         self._prepared[target.id] = {"p12": p12, "kind": kind, "nodes": nodes, "plan": plan, "serial": bundle.serial,
@@ -377,21 +377,40 @@ class ClearPassDriver(Driver):
         with CallbackServer(s.get("callback_bind") or "0.0.0.0", int(s["callback_port"]), s["callback_host"],
                             wrap_pkcs12(p12, passphrase), f"{(target.certificate.domain if target.certificate else 'cert')}.p12",
                             allowed, int(s.get("callback_ttl") or 300)) as cb:
-            for n in nodes:
+            for idx, n in enumerate(nodes):
                 node_res = {"node": n["name"] or n["uuid"], "uuid": n["uuid"], "services": {}, "ok": True}
+                verify_anyway = False
                 for svc in self.services(target):
-                    if self.slots(sess, base, n, svc) is None:
+                    try:
+                        present = self.slots(sess, base, n, svc) is not None
+                    except ClearPassError as exc:
+                        node_res["services"][svc] = f"api error before the PUT: {exc}"
+                        node_res["ok"] = False
+                        break
+                    if not present:
                         node_res["services"][svc] = "skipped (no slot)"
                         continue
                     status, text = self._put(sess, f"{base}/server-cert/name/{n['uuid']}/{svc}",
                                              {"pkcs12_file_url": cb.url, "pkcs12_passphrase": passphrase})
+                    if status == 0:
+                        # The response was lost (timeout, reset while the node restarted its web service):
+                        # the PUT may well have landed. Verification decides; the node counts as changed.
+                        node_res["services"][svc] = f"unknown (response lost: {redact(text)})"
+                        node_res["unknown"] = True
+                        verify_anyway = True
+                        break
                     if status not in (200, 201, 204):
                         node_res["services"][svc] = f"HTTP {status}: {redact(text)}"
                         node_res["ok"] = False
                         break
                     node_res["services"][svc] = f"HTTP {status}"
-                if node_res["ok"]:
-                    ok, waited, how = self._verify_node(sess, base, target, n, bundle.serial, timeout)
+                if idx == len(nodes) - 1:
+                    cb.stop()        # the last PUT is out; nothing else may fetch the PKCS#12
+                if node_res["ok"] or verify_anyway:
+                    try:
+                        ok, waited, how = self._verify_node(sess, base, target, n, bundle.serial, timeout)
+                    except ClearPassError as exc:
+                        ok, waited, how = False, 0, f"api error during verification: {exc}"
                     node_res["verified"] = ok
                     node_res["verify"] = how
                     node_res["wait_seconds"] = waited
@@ -428,8 +447,16 @@ class ClearPassDriver(Driver):
         want_https = [x for x in svc if x.startswith("HTTPS")]
         while True:
             api_ok = True
+            how = "api"
             for s in svc:
-                slot = self.slots(sess, base, node, s)
+                try:
+                    slot = self.slots(sess, base, node, s)
+                except ClearPassError as exc:
+                    if exc.kind == "rejected":
+                        raise
+                    api_ok = False
+                    how = f"api unreachable while verifying: {exc}"
+                    break
                 if slot is None:
                     continue
                 info = _slot_info(slot)
@@ -437,7 +464,6 @@ class ClearPassDriver(Driver):
                     api_ok = False
                     break
             served_ok = True
-            how = "api"
             if api_ok and want_https and target.settings.get("verify_served", True):
                 host = node.get("management_ip") or node.get("fqdn") or target.settings["host"]
                 sni = target.certificate.domain if target.certificate else host
@@ -448,7 +474,7 @@ class ClearPassDriver(Driver):
             if api_ok and served_ok:
                 return True, waited, how
             if time.time() >= deadline:
-                return False, waited, how if api_ok else "api-reported certificate unchanged"
+                return False, waited, how if (api_ok or how != "api") else "api-reported certificate unchanged"
             time.sleep(_POLL_INTERVAL)
             waited += _POLL_INTERVAL
 
@@ -470,21 +496,51 @@ class ClearPassDriver(Driver):
             return False, 0
 
     def served_info(self, target: Target) -> dict[str, Any]:
+        """The certificate the entry node reports in the first selected slot, plus a per-node summary.
+
+        Nodes are addressed by their real server_uuid from GET /api/cluster/server; the
+        literal "this" is documented only for the cluster endpoint.
+        """
         try:
             sess, base = self._session(target)
             svc = self.services(target)
-            slot = self.slots(sess, base, {"uuid": "this", "name": "this"}, svc[0] if svc else "HTTPS(RSA)")
-            if slot is None:
+            service = svc[0] if svc else "HTTPS(RSA)"
+            nodes = self.nodes(sess, base, target)
+            host = (target.settings.get("host") or "").lower()
+            entry = next((n for n in nodes if host and host in {n["fqdn"].lower(), str(n["management_ip"]).lower(),
+                                                                str(n["server_ip"]).lower()}), None) or nodes[-1]
+            per_node = []
+            info = None
+            for n in nodes:
+                try:
+                    slot = self.slots(sess, base, n, service)
+                except ClearPassError as exc:
+                    per_node.append({"node": n["name"] or n["uuid"], "error": str(exc)[:160]})
+                    continue
+                if slot is None:
+                    per_node.append({"node": n["name"] or n["uuid"], "error": "slot not present"})
+                    continue
+                pem = slot.get("cert_file") or ""
+                if "BEGIN CERTIFICATE" not in pem:
+                    per_node.append({"node": n["name"] or n["uuid"], "error": "no cert_file in the API response"})
+                    continue
+                parsed = certs.parse_pem(pem.encode())
+                per_node.append({"node": n["name"] or n["uuid"], "serial": parsed.get("serial"), "not_after": parsed.get("not_after"),
+                                 "enabled": _slot_info(slot).get("enabled", True)})
+                if n is entry:
+                    info = parsed
+            if info is None:
                 info = dict(certs.ABSENT)
-                info["error"] = "slot not present"
-                return info
-            pem = slot.get("cert_file") or ""
-            if "BEGIN CERTIFICATE" in pem:
-                info = certs.parse_pem(pem.encode())
+                mine = next((p for p in per_node if p["node"] == (entry["name"] or entry["uuid"])), {})
+                info["error"] = mine.get("error") or "slot not present"
+            else:
                 info["error"] = None
-                return info
-            info = dict(certs.ABSENT)
-            info["error"] = "no cert_file in the API response"
+            serials = {p.get("serial") for p in per_node if p.get("serial")}
+            info["nodes"] = per_node
+            info["service"] = service
+            if len(serials) > 1:
+                info["warning"] = f"nodes serve different certificates in {service}: " + ", ".join(
+                    f"{p['node']} {p.get('serial') or p.get('error')}" for p in per_node)
             return info
         except (ClearPassError, ValueError) as exc:
             info = dict(certs.ABSENT)
@@ -510,7 +566,7 @@ class ClearPassDriver(Driver):
             return StepResult("activate", ok=True,
                               message=f"New certificate installed and verified on {len(results)} node(s) of {target.settings['host']}.",
                               detail={"serial": bundle.serial_hex, "nodes": results, "warnings": (prep or {}).get("warnings", [])})
-        changed = [r for r in results if any(v.startswith("HTTP 2") for v in r["services"].values())]
+        changed = [r for r in results if r.get("unknown") or any(v.startswith("HTTP 2") for v in r["services"].values())]
         failed = results[-1] if results else {}
         base_msg = (f"activation failed on node {failed.get('node')}: "
                     + "; ".join(f"{k} {v}" for k, v in failed.get("services", {}).items() if not v.startswith("HTTP 2"))
@@ -658,8 +714,10 @@ class CallbackServer:
     def __init__(self, bind: str, port: int, public_host: str, data: bytes, name: str, allowed: set[str], ttl: int):
         self.path = f"/{secrets.token_hex(16)}/{name}"
         self.url = f"http://{public_host}:{port}{self.path}"
-        self.data, self.allowed, self.ttl = data, allowed, ttl
+        self.data, self.allowed, self.ttl = data, allowed, max(1, int(ttl))
         self.fetches = 0
+        self._deadline = 0.0
+        self._stopped = False
         self.rejected: set[str] = set()
         self._bind, self._port = bind, port
         self._srv = None
@@ -673,6 +731,8 @@ class CallbackServer:
                 pass
 
             def _allowed(self) -> bool:
+                if outer._stopped or time.monotonic() > outer._deadline:
+                    return False      # lifetime over: nothing is served, whoever asks
                 ip = self.client_address[0]
                 if outer.allowed and ip not in outer.allowed:
                     outer.rejected.add(ip)
@@ -701,12 +761,17 @@ class CallbackServer:
                 self.end_headers()
                 self.wfile.write(outer.data)
 
+        self._deadline = time.monotonic() + self.ttl
         http.server.ThreadingHTTPServer.allow_reuse_address = True
         self._srv = http.server.ThreadingHTTPServer((self._bind, self._port), Handler)
         self._srv.timeout = 1
         self._thread = threading.Thread(target=self._srv.serve_forever, kwargs={"poll_interval": 0.5}, daemon=True)
         self._thread.start()
         return self
+
+    def stop(self) -> None:
+        """Stop serving the PKCS#12 while the listener stays up for the diagnostics."""
+        self._stopped = True
 
     def __exit__(self, *exc):
         if self._srv:

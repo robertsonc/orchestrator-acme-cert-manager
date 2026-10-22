@@ -27,7 +27,7 @@ import json
 import os
 import stat
 import tarfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import __version__, config
@@ -50,6 +50,7 @@ class Result:
     size: int = 0
     encrypted: bool = False
     destination: str = ""
+    skipped: list = field(default_factory=list)
 
 
 def _parts(include_root: bool) -> list[tuple[str, Path, list[str]]]:
@@ -73,6 +74,8 @@ def create(path: str | os.PathLike, include_root: bool = False, passphrase: str 
     included, skipped = [], []
     buf = io.BytesIO()
     count = 0
+    out_resolved = out.resolve()
+    archive_suffixes = (".tgz", ".tar.gz", ".enc", ".tar")
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for prefix, src, excluded in _parts(include_root):
             if not src.is_dir() or not os.access(src, os.R_OK):
@@ -92,6 +95,9 @@ def create(path: str | os.PathLike, include_root: bool = False, passphrase: str 
                     full = Path(root) / name
                     if full.is_symlink():
                         continue
+                    if full.resolve() == out_resolved or name.endswith(archive_suffixes) or name.endswith((".lock", ".tmp")) \
+                            or name.startswith(".") and (".restore-tmp" in name or name.endswith(".tmp")):
+                        continue          # never nest earlier backups, the one being written, or scratch files
                     arc = str(Path(prefix) / rel_root / name)
                     try:
                         tar.add(full, arcname=arc, recursive=False)
@@ -157,6 +163,11 @@ def restore(path: str | os.PathLike, force: bool = False, passphrase: str = "") 
             raise BackupError(f"{src}: manifest has no readable format number") from None
         if fmt > FORMAT:
             raise BackupError(f"{src}: backup format {fmt} is newer than this version understands ({FORMAT})")
+        src_resolved = src.resolve()
+        writable = {name: os.access(root, os.W_OK) if root.is_dir() else os.access(root.parent, os.W_OK) for name, root in roots.items()}
+        # Sub-mounts that are read-only inside the container (data/ssh, data/pki/certs in docker-compose.yml)
+        ro_prefixes = [p for p in ("data/ssh", "data/pki/certs", "data/pki", "data/certs", "config")
+                       if (lambda d: d.is_dir() and not os.access(d, os.W_OK))(roots[p.split("/")[0]].joinpath(*p.split("/")[1:]))]
         current = Path(config.SERVERS_FILE)
         archived = next((m for m in members if m.name == "config/servers.json"), None)
         if archived is not None and current.exists() and not force:
@@ -165,29 +176,43 @@ def restore(path: str | os.PathLike, force: bool = False, passphrase: str = "") 
                     f"{current} on this host is newer ({_ts(current.stat().st_mtime)}) than the archived copy "
                     f"({_ts(archived.mtime)}); pass --force to overwrite it")
         count = 0
+        skipped: list[dict] = []
         for m in members:
             if m.name == MANIFEST:
                 continue
             p = Path(m.name)
+            if not writable.get(p.parts[0], False):
+                raise BackupError(f"{roots[p.parts[0]]} is not writable from this process; nothing was restored")
             dest = roots[p.parts[0]].joinpath(*p.parts[1:])
-            if m.isdir():
-                dest.mkdir(parents=True, exist_ok=True)
+            ro = next((pre for pre in ro_prefixes if m.name == pre or m.name.startswith(pre + "/")), None)
+            if ro:
+                skipped.append({"member": m.name, "reason": f"{ro} is mounted read-only here; restore it on the host (setup.sh --restore)"})
                 continue
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            fh = tar.extractfile(m)
-            if fh is None:
+            if dest.resolve() == src_resolved:
+                skipped.append({"member": m.name, "reason": "is the archive being restored"})
                 continue
-            tmp = dest.with_name(f".{dest.name}.restore-tmp")
-            with open(tmp, "wb") as out:
-                out.write(fh.read())
-            mode = _SECRET_MODES.get(m.name, stat.S_IMODE(m.mode) or 0o644)
-            if p.parts[-1].endswith(".key") or "ssh" in p.parts and not p.parts[-1].endswith(".pub") and p.parts[-1] != "known_hosts":
-                mode = 0o600
-            os.chmod(tmp, mode)
-            os.replace(tmp, dest)
+            try:
+                if m.isdir():
+                    dest.mkdir(parents=True, exist_ok=True)
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                fh = tar.extractfile(m)
+                if fh is None:
+                    continue
+                tmp = dest.with_name(f".{dest.name}.restore-tmp")
+                with open(tmp, "wb") as out:
+                    out.write(fh.read())
+                mode = _SECRET_MODES.get(m.name, stat.S_IMODE(m.mode) or 0o644)
+                if p.parts[-1].endswith(".key") or "ssh" in p.parts and not p.parts[-1].endswith(".pub") and p.parts[-1] != "known_hosts":
+                    mode = 0o600
+                os.chmod(tmp, mode)
+                os.replace(tmp, dest)
+            except OSError as exc:
+                raise BackupError(f"cannot restore {m.name}: {exc} ({count} file(s) were already replaced; run the restore again "
+                                  f"once the cause is fixed)") from exc
             count += 1
     return Result(path=src, entries=count, destination=f"{roots['config']} and {roots['data']}",
-                  encrypted=bool(passphrase))
+                  encrypted=bool(passphrase), skipped=skipped)
 
 
 # --------------------------------------------------------------------------- crypto / io

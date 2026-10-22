@@ -147,7 +147,11 @@ _last_line = _first_line
 # --------------------------------------------------------------------------- rollback
 
 def _rollback_dir(server: ServerConfig) -> Path:
-    return config.cert_dir_for(server) / "rollback"
+    """rollback/ for the 1:1 entry; rollback/<target id>/ for an additional Orchestrator target on the same certificate."""
+    d = config.cert_dir_for(server) / "rollback"
+    if server.certificate_id and server.certificate_id != server.id:
+        d = d / server.id
+    return d
 
 
 def _rollback_files(server: ServerConfig):

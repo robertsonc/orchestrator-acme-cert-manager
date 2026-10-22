@@ -129,6 +129,12 @@ class Driver:
                     raise config.ConfigError(f"{f.label} must be a number") from exc
             else:
                 out[f.name] = (str(raw) if raw is not None else "").strip()
+                if f.kind == "select" and f.choices:
+                    allowed = [c[0] if isinstance(c, (tuple, list)) else c for c in f.choices]
+                    if out[f.name] == "" and f.default is not None:
+                        out[f.name] = str(f.default)
+                    if out[f.name] not in allowed:
+                        raise config.ConfigError(f"{f.label} must be one of {', '.join(map(str, allowed))}, not {out[f.name]!r}")
         return out
 
     def secret_fields(self) -> list[str]:
@@ -153,6 +159,14 @@ class Driver:
         return StepResult("probe", ok=True, message="nothing to probe for this driver")
 
     # ---- pipeline -----------------------------------------------------------
+    def deploy_disabled(self, target: Target) -> str | None:
+        """A reason when this target must not be written to (monitor-only); None when deploys are allowed.
+
+        A run skips such a target with a recorded step instead of failing, so one
+        monitor-only target never blocks the others.
+        """
+        return None
+
     def deploy(self, target: Target, bundle: CertBundle) -> StepResult:
         raise NotImplementedError
 

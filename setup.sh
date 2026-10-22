@@ -384,9 +384,11 @@ do_restore() {
   if tar -tzf "$in" | grep -qx 'config/servers.json' && [[ -f "${cfg}/servers.json" && $force_restore -eq 0 ]]; then
     local cur arc
     cur="$(stat -c %Y "${cfg}/servers.json")"
-    arc="$(tar -tvzf "$in" config/servers.json | awk '{print $4" "$5}')"
-    arc="$(date -d "$arc" +%s 2>/dev/null || echo 0)"
-    if (( cur > arc + 1 )); then
+    arc="$(tar --full-time -tvzf "$in" config/servers.json | awk '{print $4" "$5}')"
+    if ! arc="$(date -d "$arc" +%s 2>/dev/null)"; then
+      warn "could not read the archived servers.json timestamp (${arc:-empty}); not comparing"; arc=$cur
+    fi
+    if (( cur > arc + 1 )) && ! tar -xzOf "$in" config/servers.json | cmp -s - "${cfg}/servers.json"; then
       die "config/servers.json on this host is newer than the archived copy; re-run with --force-restore to overwrite it"
     fi
   fi

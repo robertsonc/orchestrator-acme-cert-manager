@@ -107,6 +107,20 @@ All notable changes to this project are documented here. The format follows
 - `logout` revokes by generation, so a login in the same second as the logout cannot survive it.
 - A `scheduler.json` whose top level is not an object is discarded instead of aborting the run.
 
+- Review round two: a scheduled run no longer re-deploys to a target that already serves the issued
+  certificate (hex/int serial mismatch), a failing or monitor-only target no longer blocks the
+  targets after it, the SSH driver creates the private key private before writing it, swaps files
+  atomically after staging all of them, sends the certificate's name as SNI and bounds SFTP; the
+  Orchestrator driver keeps one snapshot per target; ClearPass records API errors and lost PUT
+  responses per node (and rolls back), reads nodes by their real uuid and honours the callback
+  lifetime; ARI retries only on real CA wording; restore skips read-only mounts instead of dying
+  half-way, backups never nest, `restore` reads `BACKUP_PASSPHRASE`; deleting a target removes only
+  its own emptied certificate; the web UI replaces a foreign `csrf` cookie, refuses a duplicate
+  domain on edit too, keeps the primary target's name, accepts suffixed secret variable names,
+  invalidates the served-certificate cache on save and shows custom CA URLs with the right
+  environment; the cron job's exit status reaches supercronic; `TARGETARCH` comes from BuildKit so
+  the arm64 image gets arm64 binaries (CI now cross-builds it).
+
 ### Fixed
 - A scheduled renewal and a Force renew/deploy from the UI could run on the
   same server at once. (#5)

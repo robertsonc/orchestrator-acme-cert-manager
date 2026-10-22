@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -220,13 +221,17 @@ def issue_or_renew(cert, force: bool = False) -> StepResult:
     )
 
 
-_ARI_MARKERS = ("replaces", "ari", "renewal-info", "renewalinfo", "requester account did not request",
-                "alreadyreplaced", "already replaced", "being replaced")
+# What a CA says when it refuses the ARI "replaces" link (Boulder wording and the ACME error types);
+# a bare domain or e-mail that happens to contain "ari" must never match.
+_ARI_REJECTION_RE = re.compile(
+    r"alreadyreplaced|already replaced|certificate being replaced|requester account did not request"
+    r"|replaces[^\n]{0,80}(?:not (?:issued|found)|invalid|unknown|rejected|mismatch)"
+    r"|urn:ietf:params:acme:error:(?:alreadyReplaced|conflict)[^\n]{0,120}replace"
+    r"|renewalinfo[^\n]{0,80}(?:not supported|unsupported|unknown)", re.I)
 
 
 def _is_ari_rejection(output: str) -> bool:
-    low = (output or "").lower()
-    return any(m in low for m in _ARI_MARKERS) and ("replace" in low or "ari" in low)
+    return bool(_ARI_REJECTION_RE.search(output or ""))
 
 
 def _ca_verify(cert):

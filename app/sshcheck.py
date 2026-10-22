@@ -245,6 +245,10 @@ def open_client(server: ServerConfig) -> paramiko.SSHClient:
     return connect(Endpoint.of(server), extra)
 
 
+def command_timeout() -> int:
+    return _CMD_TIMEOUT
+
+
 def run(client: paramiko.SSHClient, cmd: str, timeout: int = _CMD_TIMEOUT) -> tuple[int, str, str]:
     """Run one command; returns (exit_status, stdout, stderr).
 

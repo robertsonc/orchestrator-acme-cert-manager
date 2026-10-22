@@ -64,8 +64,23 @@ jobs:
             -v "$PWD/ci-config:/config" -v "$PWD/ci-data/certs:/data/certs" -v "$PWD/ci-data/logs:/data/logs" \
             -v "$PWD/ci-data/ssh:/data/ssh:ro" oacm-ci:test python -m app.cli check | tee check.out
           grep -q "Result: OK" check.out
-          docker run --rm oacm-ci:test sh -c 'id -u; lego --version; supercronic -version 2>&1 | head -1; python -m app.cli --help >/dev/null'
+          docker run --rm oacm-ci:test sh -c 'id -u; lego --version; supercronic -version 2>&1 | head -1; supercronic -test /app/crontab; python -m app.cli --help >/dev/null'
           docker run --rm oacm-ci:test id -u | grep -qx 10001
+
+  image-arm64:
+    # The release builds linux/arm64 too: cross-build it here and prove the arch-specific binaries
+    # inside really are arm64 (a defaulted TARGETARCH once shipped amd64 lego in the arm64 image).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - run: docker buildx build --platform linux/arm64 --load -t oacm-ci:arm64 .
+      - run: |
+          docker run --rm --platform linux/arm64 oacm-ci:arm64 sh -c 'uname -m; lego --version; supercronic -version' | tee arm64.out
+          grep -q 'aarch64' arm64.out && grep -q 'linux/arm64' arm64.out
 
   shell:
     runs-on: ubuntu-latest

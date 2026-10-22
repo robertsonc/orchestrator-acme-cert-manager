@@ -4,5 +4,5 @@
 # --source cron marks the runs as scheduled in history and in scheduler.json,
 # which /healthz uses to detect a scheduler that stopped running.
 # Output goes to supercronic (docker compose logs) and is appended to renew.log.
-0 2  * * * cd /app && python -m app.cli renew-all --source cron 2>&1 | tee -a /data/logs/renew.log
-0 14 * * * cd /app && python -m app.cli renew-all --source cron 2>&1 | tee -a /data/logs/renew.log
+0 2  * * * cd /app && bash -o pipefail -c 'python -m app.cli renew-all --source cron 2>&1 | tee -a /data/logs/renew.log'
+0 14 * * * cd /app && bash -o pipefail -c 'python -m app.cli renew-all --source cron 2>&1 | tee -a /data/logs/renew.log'

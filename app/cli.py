@@ -188,12 +188,14 @@ def cmd_restore(args: argparse.Namespace) -> int:
 
 
 def _passphrase(args: argparse.Namespace) -> str:
+    env = getattr(args, "passphrase_env", None) or "BACKUP_PASSPHRASE"
     if getattr(args, "encrypt", False) or getattr(args, "passphrase_env", None):
-        env = getattr(args, "passphrase_env", None) or "BACKUP_PASSPHRASE"
         val = os.environ.get(env, "")
         if not val:
             raise SystemExit(f"{env} is not set (needed for an encrypted backup/restore)")
         return val
+    if getattr(args, "command", "") == "restore":
+        return os.environ.get(env, "")        # an encrypted archive needs it; a plain one ignores it
     return ""
 
 

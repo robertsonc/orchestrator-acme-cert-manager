@@ -27,6 +27,22 @@ _CMD_TIMEOUT = 180
 _POLL_INTERVAL = 10
 
 
+def _replace(sftp, tmp: str, path: str) -> None:
+    """Move ``tmp`` over ``path`` atomically where the server allows it (posix-rename@openssh.com), else remove+rename."""
+    posix = getattr(sftp, "posix_rename", None)
+    if posix is not None:
+        try:
+            posix(tmp, path)
+            return
+        except IOError:
+            pass      # extension unsupported by this server: fall back
+    try:
+        sftp.remove(path)
+    except IOError:
+        pass
+    sftp.rename(tmp, path)
+
+
 class SSHDriver(Driver):
     name = "ssh"
     label = "Generic SSH/SCP"
@@ -173,27 +189,38 @@ class SSHDriver(Driver):
         files = [(s["remote_cert_path"], cert_data, 0o644), (s["remote_key_path"], bundle.key.read_bytes(), 0o600)]
         if s.get("remote_chain_path"):
             files.append((s["remote_chain_path"], bundle.chain.read_bytes(), 0o644))
-        written = []
+        written: list[str] = []
+        staged: list[str] = []
         try:
+            transport = client.get_transport()
+            if transport is not None:
+                transport.set_keepalive(30)
             sftp = client.open_sftp()
+            sftp.get_channel().settimeout(sshcheck.command_timeout())   # a stalled peer must not hold the certificate lock
             try:
+                # Stage every file first (the key is created private before a byte is written), then
+                # swap them in: a failure while staging leaves the old set untouched.
                 for path, data, mode in files:
                     tmp = f"{path}.oacm-tmp"
                     with sftp.open(tmp, "wb") as fh:
+                        fh.chmod(mode)
                         fh.write(data)
                     sftp.chmod(tmp, mode)
-                    try:
-                        sftp.remove(path)
-                    except IOError:
-                        pass
-                    sftp.rename(tmp, path)
+                    staged.append(tmp)
+                for path, _data, _mode in files:
+                    _replace(sftp, f"{path}.oacm-tmp", path)
                     written.append(path)
             finally:
                 sftp.close()
         except (paramiko.SSHException, socket.timeout, OSError, IOError) as exc:
+            if written:
+                what = (f"{len(written)} of {len(files)} file(s) replaced ({', '.join(written)}); the target now holds a mixed "
+                        f"set, run Force deploy once it is reachable")
+            else:
+                what = "nothing on the target was replaced"
             return StepResult("deploy", ok=False,
-                              message=f"upload to {ep.user}@{ep.host} failed after {len(written)} file(s): {exc}",
-                              detail={"phase": "upload", "kind": "transport", "written": written})
+                              message=f"upload to {ep.user}@{ep.host} failed: {exc}; {what}",
+                              detail={"phase": "upload", "kind": "transport", "written": written, "staged": staged})
         finally:
             client.close()
         return StepResult("deploy", ok=True,
@@ -223,12 +250,15 @@ class SSHDriver(Driver):
                               detail={"phase": "activate", "command": cmd, "exit": rc, "stderr": err[:2000], "stdout": out[:2000]})
         return StepResult("activate", ok=True, message="activation command succeeded")
 
+    def _sni(self, target: Target) -> str | None:
+        return target.certificate.domain if target.certificate else None
+
     def verify(self, target: Target, serial: int, timeout: int) -> tuple[bool, int]:
         host, port = self.verify_endpoint(target)
         deadline = time.time() + timeout
         waited = 0
         while True:
-            info = certs.fetch_served(host, port)
+            info = certs.fetch_served(host, port, sni=self._sni(target))
             if info.get("present") and info.get("serial") and int(info["serial"], 16) == serial:
                 return True, waited
             if time.time() >= deadline:
@@ -238,7 +268,7 @@ class SSHDriver(Driver):
 
     def served_info(self, target: Target) -> dict[str, Any]:
         host, port = self.verify_endpoint(target)
-        return certs.fetch_served(host, port)
+        return certs.fetch_served(host, port, sni=self._sni(target))
 
 
 register(SSHDriver())

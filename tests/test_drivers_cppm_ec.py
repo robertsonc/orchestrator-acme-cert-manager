@@ -72,8 +72,8 @@ class FakeCPPM:
             return FakeResp(200, {"_embedded": {"items": self.nodes}})
         if method == "GET" and path.startswith("/server-cert/name/"):
             _, _, _, uuid, svc = path.split("/", 4)
-            if uuid == "this":
-                uuid = "u-pub"
+            if uuid in ("this", "publisher"):
+                return FakeResp(400, {"detail": "server_uuid must be a UUID"})   # documented only for /cluster/server
             slot = self.slots.get((uuid, svc))
             return FakeResp(200, slot) if slot else FakeResp(404, {"detail": "no such slot"})
         if method == "PUT" and path.startswith("/server-cert/name/"):
@@ -281,3 +281,102 @@ def test_edgeconnect_read_only_by_default_then_experimental_write(layout, monkey
                                                            "appliance/rest?nePk=3.NE&url=httpsCertificate/config"]
     a = drv.activate_step(t, bundle)
     assert a.ok and "nodejs" in str(fake.calls) and drv.snapshot_bundle(t).serial == bundle.serial
+
+
+def test_clearpass_lost_put_response_counts_as_changed_and_is_verified(cppm_target, monkeypatch):
+    """A PUT whose response is lost may have landed: verification decides, and the node is never 'nothing was changed'."""
+    c, fake, old, new = cppm_target
+    t = c.targets[0]
+    drv = drivers.get("clearpass")
+    t.settings["other_slot_policy"] = "ignore"
+    monkeypatch.setattr(cp, "activation_timeout", lambda: 1)
+    real = fake.request
+
+    def request(method, url, **kw):
+        resp = real(method, url, **kw)
+        if method == "PUT" and "/u-sub1/" in url:
+            raise requests.ConnectionError("Remote end closed connection without response")   # after the install happened
+        return resp
+    fake.request = request
+    bundle = drv_base.CertBundle.for_certificate(c)
+    assert drv.deploy(t, bundle).ok
+    res = drv.activate_step(t, bundle)
+    sub1 = next(r for r in res.detail["nodes"] if r["node"] == "sub1")
+    assert sub1["unknown"] is True and any(v.startswith("unknown (response lost") for v in sub1["services"].values())
+    assert "nothing was changed" not in res.message
+    assert sub1.get("verified") is False      # RADIUS was never pushed on that node, so the node does not verify
+
+
+def test_clearpass_api_error_mid_rollout_is_recorded_per_node_and_rolled_back(cppm_target, layout):
+    c, fake, old, new = cppm_target
+    t = c.targets[0]
+    drv = drivers.get("clearpass")
+    t.settings["other_slot_policy"] = "ignore"
+    # take a snapshot of the current (old) certificate so a rollback is possible
+    snap_dir = drv.snapshot_dir(t); snap_dir.mkdir(parents=True, exist_ok=True)
+    old_dir = layout["certs"] / "old-snap"; _ec_bundle(old_dir, issuer_cn="CN=Fake LE Intermediate X1")
+    for name in ("cppm.example.test.cer", "cppm.example.test.key", "ca.cer"):
+        (snap_dir / name).write_bytes((old_dir / name).read_bytes())
+    real = fake.request
+    state = {"puts": 0}
+
+    def request(method, url, **kw):
+        if method == "PUT":
+            state["puts"] += 1
+        if method == "GET" and "/server-cert/name/u-pub/" in url and state["puts"] >= 2:
+            return FakeResp(502, {"detail": "web service restarting"})
+        return real(method, url, **kw)
+    fake.request = request
+    bundle = drv_base.CertBundle.for_certificate(c)
+    assert drv.deploy(t, bundle).ok
+    res = drv.activate_step(t, bundle)
+    assert not res.ok and res.detail["nodes"], res.message
+    pub = next((r for r in res.detail["nodes"] if r["node"] == "pub"), None)
+    assert pub is not None and any("api error" in v for v in pub["services"].values()) and pub["ok"] is False
+    assert res.detail["rolled_back"] in (True, False) and "rollback" in res.detail      # sub1 was changed: a rollback ran
+
+
+def test_clearpass_callback_stops_after_the_last_put_and_honours_the_ttl(cppm_target):
+    c, fake, old, new = cppm_target
+    t = c.targets[0]
+    drv = drivers.get("clearpass")
+    t.settings["other_slot_policy"] = "ignore"
+    bundle = drv_base.CertBundle.for_certificate(c)
+    assert drv.deploy(t, bundle).ok
+    seen = {}
+    real = fake.request
+
+    def request(method, url, **kw):
+        resp = real(method, url, **kw)
+        if method == "PUT":
+            seen["url"] = kw["json"]["pkcs12_file_url"]
+        return resp
+    fake.request = request
+    res = drv.activate_step(t, bundle)
+    assert res.ok, res.message
+    import urllib.error
+    # the listener object is gone with the run; an explicit server shows the lifetime rules
+    with cp.CallbackServer("127.0.0.1", _free_port(), "127.0.0.1", b"x", "a.p12", {"127.0.0.1"}, 1) as cb:
+        assert urllib.request.urlopen(cb.url, timeout=5).read() == b"x"
+        cb.stop()
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            urllib.request.urlopen(cb.url, timeout=5)
+        assert ei.value.code == 404
+    with cp.CallbackServer("127.0.0.1", _free_port(), "127.0.0.1", b"x", "a.p12", {"127.0.0.1"}, 1) as cb:
+        cb._deadline = 0        # lifetime elapsed
+        with pytest.raises(urllib.error.HTTPError):
+            urllib.request.urlopen(cb.url, timeout=5)
+
+
+def test_clearpass_served_info_uses_real_node_uuids_and_lists_every_node(cppm_target):
+    c, fake, old, new = cppm_target
+    t = c.targets[0]
+    drv = drivers.get("clearpass")
+    info = drv.served_info(t)
+    assert info["present"] and info["serial"] == format(old.serial_number, "X")
+    assert [n["node"] for n in info["nodes"]] == ["sub1", "pub"] and all(n.get("serial") for n in info["nodes"])
+    assert "warning" not in info
+    from cryptography.hazmat.primitives import serialization
+    fake.slots[("u-sub1", info["service"])]["cert_file"] = new.public_bytes(serialization.Encoding.PEM).decode()
+    info = drv.served_info(t)
+    assert "different certificates" in info.get("warning", "")

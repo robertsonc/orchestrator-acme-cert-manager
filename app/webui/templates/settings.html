@@ -26,7 +26,7 @@
           <td><a class="primary" href="{{ url_for('server_detail', server_id=t.id) }}">{{ t.name or t.id }}</a>{% if t.name %}<div class="secondary mono">{{ t.id }}</div>{% endif %}</td>
           <td>{{ m.driver_pill(t.driver, driver_labels.get(t.driver, t.driver)) }}</td>
           <td class="mono small">{{ hosts.get(t.id, '') }}</td>
-          <td>{% if loop.first %}{{ m.env_pill('lab' if c.acme_ca == 'lab' else ('staging' if c.acme_ca != 'letsencrypt' else 'production')) }}{% endif %}</td>
+          <td>{% if loop.first %}{{ m.env_pill(envs[c.id]) }}{% endif %}</td>
           <td class="mono small">{% if loop.first %}{{ c.key_type }}{% endif %}</td>
           <td>{% set api = t.settings.get('api_key') %}{% set cf = c.dns_api_token or c.dns_env %}
               {% if cf and (api or t.driver != 'orchestrator') %}<span class="pill quiet" title="DNS credentials and target secrets stored in config">in config</span>

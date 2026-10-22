@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import socket
 import ssl
 from pathlib import Path
 from typing import Any
@@ -74,11 +75,23 @@ def leaf_info(path: Path) -> dict[str, Any]:
     return info
 
 
-def fetch_served(host: str, port: int = 443, timeout: int = SERVED_TIMEOUT) -> dict[str, Any]:
-    """The certificate a host presents on a port right now (no chain validation)."""
+def fetch_served(host: str, port: int = 443, timeout: int = SERVED_TIMEOUT, sni: str | None = None) -> dict[str, Any]:
+    """The certificate a host presents on a port right now (no chain validation).
+
+    ``sni`` is the name sent in the TLS handshake; it defaults to ``host`` but a
+    target reached by IP or by a different name must send the certificate's own
+    name, or a server with several virtual hosts answers with its default one.
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
     try:
-        pem = ssl.get_server_certificate((host, port), timeout=timeout)
-        info = parse_pem(pem.encode())
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=sni or host) as tls:
+                der = tls.getpeercert(binary_form=True)
+        if not der:
+            raise ValueError("no certificate presented")
+        info = parse_pem(ssl.DER_cert_to_PEM_cert(der).encode())
         info["error"] = None
         return info
     except (ssl.SSLError, OSError, ValueError) as exc:

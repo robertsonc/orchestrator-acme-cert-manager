@@ -91,7 +91,7 @@ def _csrf_valid() -> bool:
 @app.after_request
 def _persist_csrf_cookie(resp):
     new = getattr(request, "_new_csrf", None)
-    if new and not request.cookies.get(CSRF_COOKIE):
+    if new and request.cookies.get(CSRF_COOKIE) != new:      # absent OR not ours (another app's cookie on this host)
         resp.set_cookie(CSRF_COOKIE, new, httponly=True, samesite="Strict", max_age=30 * 86400, secure=_cookie_secure())
     return resp
 
@@ -247,7 +247,7 @@ _ALLOWED_KEY = set(KEY_CHOICES)
 _ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 _ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _HOST_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$")
-_SECRET_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*(API_KEY|_KEY|_TOKEN|_SECRET|_PASSWORD)$")
+_SECRET_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*(API_KEY|_KEY|_TOKEN|_SECRET|_PASSWORD)(_[A-Z0-9]+)*$")   # ORCH_API_KEY_LAB is fine
 _SECRET_ENV_DENY = {"CF_DNS_API_TOKEN", "NOTIFY_WEBHOOK_URL", "BACKUP_PASSPHRASE", "SESSION_COOKIE_SECURE"}
 _HOST_FIELDS = ("orchestrator_host", "host", "appliance_host", "verify_host", "callback_host")
 _CA_URL_RE = re.compile(r"^https?://[^\s/]+(/\S*)?$")
@@ -724,6 +724,8 @@ def _flat_from_target(cert: Certificate, target: Target) -> dict:
 
 def _flat_blank(driver: str = "orchestrator") -> dict:
     flat = _flat_cert(None)
+    if driver not in drivers.names():
+        driver = "orchestrator"          # a stale ?driver= bookmark is not a broken configuration
     drv = drivers.get(driver)
     for f in drv.schema():
         flat[f.name] = f.default
@@ -847,7 +849,7 @@ def _validate(flat: dict, is_new: bool, existing_cert: Certificate | None = None
         errors.append("ID may contain only letters, numbers, hyphens, and underscores.")
     elif is_new and not new_target_only and config.server_exists(sid):
         errors.append(f"A server with ID '{sid}' already exists.")
-    if is_new and flat.get("domain") and any(c.domain.lower() == flat["domain"].lower() and c.id != sid
+    if flat.get("domain") and any(c.domain.lower() == flat["domain"].lower() and c.id != sid
                                              for c in config.load_certificates()):
         errors.append(f"Another certificate already covers {flat['domain']}; add this system as a target of that "
                       f"certificate instead (Settings → + Target).")
@@ -956,7 +958,8 @@ def _render_settings(test_result=None, test_server=None, status=200):
     certs_list = config.load_certificates()
     labels = {d.name: d.label for d in drivers.all_drivers()}
     hosts = {t.id: drivers.get(t.driver).display_host(t) for c in certs_list for t in c.targets}
-    return render_template("settings.html", certificates=certs_list, driver_labels=labels, hosts=hosts,
+    envs = {c.id: config.ca_environment(c.acme_ca) for c in certs_list}
+    return render_template("settings.html", certificates=certs_list, driver_labels=labels, hosts=hosts, envs=envs,
                            ca_labels=dict(CA_CHOICES), system=_system(),
                            test_result=test_result, test_server=test_server, now=_now()), status
 
@@ -1020,6 +1023,8 @@ def settings_save():
         flat["id"] = existing_cert.id          # ids are create-only; never renamed on edit
         flat["target_id"] = existing_target.id
         flat["driver"] = existing_target.driver
+        if "target_name" not in request.form:    # the primary target's form has no name field: keep the stored one
+            flat["target_name"] = existing_target.name
     elif add_to_cert:
         try:
             existing_cert = config.get_certificate(add_to_cert)
@@ -1035,10 +1040,13 @@ def settings_save():
     cert, target = _build(flat, existing_cert, existing_target)
     if existing_cert is not None:
         # Keep the certificate's other targets; replace (or add) this one.
-        others = [t for t in existing_cert.targets if t.id != target.id]
-        cert.targets = [target] + others if existing_target is not None else others + [target]
+        if existing_target is not None:
+            cert.targets = [target if t.id == target.id else t for t in existing_cert.targets]   # in place: order is deploy order
+        else:
+            cert.targets = [t for t in existing_cert.targets if t.id != target.id] + [target]
         cert.attach()
     config.upsert_certificate(cert)
+    invalidate_served_cache()
     log.info("certificate %s / target %s (%s) saved via web UI by %s to %s",
              cert.id, target.id, target.driver, _current_user(), config.SERVERS_FILE)
     return redirect(url_for("settings"))
@@ -1048,6 +1056,7 @@ def settings_save():
 def settings_delete(server_id: str):
     """Delete a target; the certificate goes with its last target."""
     if config.delete_target(server_id):
+        invalidate_served_cache()
         log.info("target %s deleted via web UI by %s", server_id, _current_user())
     return redirect(url_for("settings"))
 

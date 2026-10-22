@@ -8,6 +8,7 @@ take, so their behaviour and tests are unchanged.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from .. import certs, config, deploy as deploy_mod, restart as restart_mod, sshcheck
@@ -156,6 +157,9 @@ class OrchestratorDriver(Driver):
 
     def served_info(self, target: Target) -> dict[str, Any]:
         return certs.fetch_served(self.display_host(target))
+
+    def snapshot_dir(self, target: Target) -> Path:
+        return restart_mod._rollback_dir(self.server(target))
 
     def snapshot(self, target: Target, bundle: CertBundle) -> None:
         restart_mod._promote_known_good(self.server(target))

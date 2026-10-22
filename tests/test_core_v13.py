@@ -444,29 +444,43 @@ def test_ssh_driver_schema_normalize_and_deploy_with_fake_sftp(layout, rsa_key, 
     _bundle_files(layout["certs"] / "orch.example.test")
     bundle = drv_base.CertBundle.for_certificate(c)
 
+    events = []
+
     class FakeFile:
         def __init__(self, store, name): self.store, self.name = store, name
         def __enter__(self): return self
         def __exit__(self, *a): pass
-        def write(self, data): self.store[self.name] = data
+        def chmod(self, mode): events.append(("fchmod", self.name, mode)); sftp.modes[self.name] = mode
+        def write(self, data): events.append(("write", self.name)); self.store[self.name] = data
+
+    class FakeChannel:
+        def settimeout(self, t): events.append(("timeout", t))
 
     class FakeSFTP:
         def __init__(self): self.files, self.modes, self.renamed = {}, {}, []
-        def open(self, name, mode): return FakeFile(self.files, name)
+        def get_channel(self): return FakeChannel()
+        def open(self, name, mode): events.append(("open", name)); return FakeFile(self.files, name)
         def chmod(self, name, mode): self.modes[name] = mode
         def remove(self, name): raise IOError("absent")
-        def rename(self, a, b): self.renamed.append((a, b)); self.files[b] = self.files.pop(a)
+        def posix_rename(self, a, b): self.renamed.append((a, b)); self.files[b] = self.files.pop(a)
+        def rename(self, a, b): raise AssertionError("posix_rename is available; plain rename must not be used")
         def close(self): pass
 
     sftp = FakeSFTP()
 
     class FakeClient:
+        def get_transport(self): return None
         def open_sftp(self): return sftp
         def close(self): pass
     monkeypatch.setattr(sshcheck, "connect", lambda ep, extra=None: FakeClient())
     res = drv.deploy(t, bundle)
     assert res.ok and set(sftp.files) == {"/etc/ssl/x.pem", "/etc/ssl/x.key", "/etc/ssl/chain.pem"}
     assert sftp.modes["/etc/ssl/x.key.oacm-tmp"] == 0o600
+    key_events = [e for e in events if len(e) > 1 and e[1] == "/etc/ssl/x.key.oacm-tmp"]
+    assert [e[0] for e in key_events] == ["open", "fchmod", "write"]        # private before the first byte lands
+    assert ("timeout", sshcheck.command_timeout()) in events
+    # every file is staged before any is swapped in
+    assert events.index(("open", "/etc/ssl/chain.pem.oacm-tmp")) < len(events) and sftp.renamed[0][1] == "/etc/ssl/x.pem"
     assert sftp.files["/etc/ssl/x.pem"].count(b"BEGIN CERTIFICATE") == 2       # fullchain
     assert all(a.endswith(".oacm-tmp") for a, _ in sftp.renamed)
     monkeypatch.setattr(sshcheck, "run", lambda client, cmd, timeout=0: (1, "", "Redirecting\nnginx: config broken"))

@@ -8,8 +8,9 @@ ARG SUPERCRONIC_VERSION=0.2.51
 # binaries, recorded when the pin was made. Bumping the version means recording them again.
 ARG SUPERCRONIC_SHA256_AMD64=cc232108374e8e2b537045f2d5eaa1229f619db314c3ba6a14d38b35dc0aa123
 ARG SUPERCRONIC_SHA256_ARM64=4ae22576a78223d8ccdf5f3b3660a5cbb5288416bf0ca96afc4a36d195932b94
-# linux/amd64 or linux/arm64 (set by buildx; defaults to amd64 for a plain `docker build`)
-ARG TARGETARCH=amd64
+# linux/amd64 or linux/arm64: set by BuildKit from --platform (never given a default here, or
+# the arm64 leg of a multi-arch build would silently fetch amd64 binaries)
+ARG TARGETARCH
 # The service user. docker-compose.yml overrides the uid/gid with OACM_UID/OACM_GID
 # from .env (setup.sh writes your own ids there) so the bind mounts need no chown.
 ARG APP_UID=10001
@@ -20,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Lego (ACME client), verified against the release's checksum file
-RUN set -eu; cd /tmp; \
+RUN set -eu; cd /tmp; : "${TARGETARCH:?set by BuildKit from --platform}"; \
     asset="lego_v${LEGO_VERSION}_linux_${TARGETARCH}.tar.gz"; \
     curl -fsSL "https://github.com/go-acme/lego/releases/download/v${LEGO_VERSION}/${asset}" -o "$asset"; \
     curl -fsSL "https://github.com/go-acme/lego/releases/download/v${LEGO_VERSION}/lego_${LEGO_VERSION}_checksums.txt" -o lego_checksums.txt; \

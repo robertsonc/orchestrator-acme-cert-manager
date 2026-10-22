@@ -61,22 +61,47 @@ def _leaf_meta(leaf: Path) -> tuple[str | None, str | None]:
         return None, None
 
 
+def _served_serial(info: dict) -> int | None:
+    """The serial a driver's served_info() reports, as an int (drivers report hex strings)."""
+    raw = info.get("serial") if info.get("present") else None
+    if raw in (None, ""):
+        return None
+    try:
+        return int(str(raw), 16)
+    except ValueError:
+        return None
+
+
 def _deploy_targets(cert: Certificate, targets: list[Target], steps: list[dict]) -> str:
-    """deploy -> activate for each target in order; stops at the first failure."""
+    """deploy -> activate for each target in turn.
+
+    A failure on one target is recorded and the next target is still attempted:
+    once the certificate is issued the targets are independent, and one broken
+    or monitor-only target must not let the others expire. The outcome is
+    "failed" when any target failed.
+    """
     bundle = CertBundle.for_certificate(cert)
+    outcome = "success"
     for t in targets:
         drv = drivers.get(t.driver)
+        reason = drv.deploy_disabled(t)
+        if reason:
+            steps.append({"step": "deploy", "ok": True, "skipped": True, "target": t.id,
+                          "message": f"skipped {t.id}: {reason}", "detail": {"phase": "prepare", "kind": "config"}})
+            log.info("renew(%s): skipped %s (%s)", cert.id, t.id, reason)
+            continue
         s_deploy = _timed(lambda _t, _d=drv: _d.deploy(_t, bundle), t, "deploy")
         s_deploy["target"] = t.id
         steps.append(s_deploy)
         if not s_deploy["ok"]:
-            return "failed"
+            outcome = "failed"
+            continue
         s_act = _timed(lambda _t, _d=drv: _d.activate_step(_t, bundle), t, drv.steps[-1])
         s_act["target"] = t.id
         steps.append(s_act)
         if not s_act["ok"]:
-            return "failed"
-    return "success"
+            outcome = "failed"
+    return outcome
 
 
 def pending_targets(cert: Certificate, targets: list[Target]) -> list[Target]:
@@ -96,6 +121,8 @@ def pending_targets(cert: Certificate, targets: list[Target]) -> list[Target]:
     out = []
     for t in targets:
         drv = drivers.get(t.driver)
+        if drv.deploy_disabled(t):
+            continue
         try:
             snap = drv.snapshot_bundle(t)
         except (config.ConfigError, OSError):
@@ -108,8 +135,8 @@ def pending_targets(cert: Certificate, targets: list[Target]) -> list[Target]:
             log.warning("renew(%s): could not read the served certificate on %s: %s: %s",
                         cert.id, t.id, exc.__class__.__name__, exc)
             served = dict(certs.ABSENT, error=str(exc))
-        if served.get("present") and served.get("serial") == bundle.serial:
-            log.info("renew(%s): %s already serves %s; no deploy needed", cert.id, t.id, bundle.serial)
+        if _served_serial(served) == bundle.serial:
+            log.info("renew(%s): %s already serves %s; no deploy needed", cert.id, t.id, bundle.serial_hex)
             continue
         if snap is None and not served.get("present"):
             log.warning("renew(%s): %s has never been activated from here and its served certificate is "

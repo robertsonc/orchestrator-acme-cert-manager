@@ -218,6 +218,13 @@ class EdgeConnectDriver(Driver):
                           detail={"phase": "authorize", "checks": checks})
 
     # ---- pipeline -----------------------------------------------------------
+    def deploy_disabled(self, target: Target) -> str | None:
+        if target.settings.get("experimental_passthrough_write"):
+            return None
+        return ("monitor-only: the EdgeConnect write path is not enabled on this target (the HTTPS Certificate template "
+                "schema is not public and direct appliance uploads are documented as overwritten by Orchestrator sync); "
+                "enable 'experimental passthrough write' after confirming it on a lab appliance")
+
     def deploy(self, target: Target, bundle: CertBundle) -> StepResult:
         s = target.settings
         if not s.get("experimental_passthrough_write"):

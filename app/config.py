@@ -299,8 +299,12 @@ def save_certificates(certs: list[Certificate]) -> None:
     payload = {"version": CONFIG_VERSION, "certificates": [c.as_dict() for c in certs]}
     text = json.dumps(payload, indent=2) + "\n"
     if SERVERS_FILE.exists():
+        current = SERVERS_FILE.read_bytes()
         bak = SERVERS_FILE.with_suffix(".json.bak")
-        _write_private(bak, SERVERS_FILE.read_bytes())
+        _write_private(bak, current)
+        v1_copy = SERVERS_FILE.with_suffix(".json.v1")
+        if file_version() == 1 and not v1_copy.exists():
+            _write_private(v1_copy, current)       # kept once: the pre-1.3 file a rollback needs, whatever .bak holds later
     _write_private(SERVERS_FILE, text.encode())
 
 
@@ -391,14 +395,18 @@ def delete_target(target_id: str) -> bool:
     """Remove one target; a certificate left without targets is removed too."""
     with _config_lock():
         certs = load_certificates()
+        emptied: set[str] = set()
         changed = False
         for c in certs:
             before = len(c.targets)
             c.targets = [t for t in c.targets if t.id != target_id]
-            changed = changed or len(c.targets) != before
+            if len(c.targets) != before:
+                changed = True
+                if not c.targets:
+                    emptied.add(c.id)
         if not changed:
             return False
-        save_certificates([c for c in certs if c.targets])
+        save_certificates([c for c in certs if c.id not in emptied])     # only the certificate this target emptied
         return True
 
 

@@ -179,7 +179,8 @@ def classify_connect_error(exc: Exception, ep: Endpoint) -> str:
     if isinstance(exc, paramiko.AuthenticationException):
         return (f"SSH authentication failed for {ep.user}@{name}: the public half of "
                 f"{ep.key_path} is not in that account's authorized_keys, or the account "
-                f"does not permit key authentication.")
+                f"does not permit key authentication. With an RSA key it can also mean the server accepts only "
+                f"SHA-1 (ssh-rsa) signatures, which this client no longer sends: enable rsa-sha2-256/512 there.")
     if isinstance(exc, paramiko.SSHException):
         msg = str(exc)
         if "not found in known_hosts" in msg or "Unknown server" in msg:

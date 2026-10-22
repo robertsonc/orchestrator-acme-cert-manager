@@ -414,9 +414,18 @@ mocks paramiko; a production WSGI server instead of `app.run()`.
 
 Merged and de-duplicated from all ten research results; one line each, then why.
 
+### Decided on 2026-10-22 (owner answers, round 1)
+
+| Question | Decision | Consequence |
+|---|---|---|
+| EST gateway shape (item 1) | **Go wire layer on vendored, patched `globalsign/est`; credentials, CLI, UI and audit in Python.** | Section 3 is the build plan; the pure-Python variant is dropped. |
+| ClearPass callback reachability (item 8) | **Every node can reach the container host on the callback port over plain HTTP.** | The driver as built; no HTTPS callback or staging web server. Confirm on the lab cluster before the first live deploy. |
+| ClearPass identity and slots (item 9) | **One certificate (cluster FQDN + every node FQDN as SANs) on every node's HTTPS(RSA) slot; RADIUS/RadSec opt-in; HTTPS(ECC) untouched under the warn/block policy.** | Default settings stay; no second EC issuance in phase 2. |
+| SHA-1-only SSH targets (item 11) | **None; every target runs OpenSSH 7.2 or newer.** | paramiko 5.0.1 stays; no SHA-1 re-enable path will be built. |
+
 ### Critical path (answered before Phase 2 starts)
 
-1. May the wire-facing EST component be a static Go binary (vendored, patched `globalsign/est`)
+1. *(decided: Go)* May the wire-facing EST component be a static Go binary (vendored, patched `globalsign/est`)
    with credentials, CLI and UI in Python? Decides the build; pure Python needs a
    TLS-terminating sidecar and cannot verify tls-unique.
 2. Device inventory: AOS-CX models and `show version`, Orchestrator build and ECOS versions,
@@ -437,13 +446,13 @@ Merged and de-duplicated from all ten research results; one line each, then why.
 7. Credential model: standing per-device credential with window and counter (proposed default)
    or strict single-use OTPs? AOS-CX keeps one fixed credential and falls back silently to
    self-signed on expiry.
-8. ClearPass: can every node open an inbound TCP connection to the container host on a fixed
+8. *(decided: yes, plain HTTP)* ClearPass: can every node open an inbound TCP connection to the container host on a fixed
    callback port over plain HTTP? The API only imports from a URL.
-9. ClearPass identity: one certificate (cluster FQDN + node FQDNs) on all nodes or one per node;
+9. *(decided: one certificate, HTTPS(RSA))* ClearPass identity: one certificate (cluster FQDN + node FQDNs) on all nodes or one per node;
    which slots? ECC slots need a second EC issuance.
 10. Can every target consume PKCS#8 keys, no CN and no OCSP URL? Lego v5 and Let's Encrypt
     changed all three; otherwise `issue.py` needs `--enable-cn` and a re-encode step.
-11. Does any SSH target run OpenSSH older than 7.2 or offer only SHA-1 algorithms? paramiko 5
+11. *(decided: none)* Does any SSH target run OpenSSH older than 7.2 or offer only SHA-1 algorithms? paramiko 5
     (in 1.3) cannot connect; the alternative is 3.5.1 with an unfixable LOW advisory. Confirm
     before the 1.3 release.
 

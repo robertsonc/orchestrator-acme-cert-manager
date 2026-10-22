@@ -15,3 +15,9 @@ services:
     # resolve, map the FQDN here (parallels the ClearPass extra_hosts fix):
     # extra_hosts:
     #   - "orchestrator.example.com:x.x.x.x"
+    # ClearPass targets: ClearPass fetches the PKCS#12 from this container, so
+    # publish the callback port (the target's callback_port) on an interface the
+    # cluster nodes can reach, and limit it to them in the host firewall:
+    # ports:
+    #   - "127.0.0.1:8090:8080"
+    #   - "8765:8765"

@@ -214,7 +214,7 @@ CA_CHOICES = [
     ("letsencrypt_test", "Let's Encrypt (staging)"),
     (config.LAB_CA_ID, "Lab CA (bundled step-ca)"),
 ]
-KEY_CHOICES = ["rsa2048", "rsa3072", "rsa4096"]
+KEY_CHOICES = ["rsa2048", "rsa3072", "rsa4096", "ec256", "ec384"]
 _ALLOWED_CA = {v for v, _ in CA_CHOICES}
 _ALLOWED_KEY = set(KEY_CHOICES)
 _ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")

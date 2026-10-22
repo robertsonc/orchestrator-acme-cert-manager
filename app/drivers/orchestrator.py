@@ -131,7 +131,11 @@ class OrchestratorDriver(Driver):
         return sshcheck.validate(self.server(target))
 
     def warnings(self, target: Target) -> list[str]:
-        return sshcheck.warnings(self.server(target))
+        out = sshcheck.warnings(self.server(target))
+        kt = (self.certificate_of(target).key_type or "rsa2048").lower()
+        if not kt.startswith("rsa"):
+            out.append(f"certificate key type {kt}: Orchestrator has been validated with RSA certificates only.")
+        return out
 
     def probe(self, target: Target) -> StepResult:
         return sshcheck.test_connection(self.server(target))

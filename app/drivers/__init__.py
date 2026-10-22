@@ -42,8 +42,4 @@ def _load_builtin() -> None:
     if _loaded:
         return
     _loaded = True
-    from . import orchestrator, ssh  # noqa: F401  (register on import)
-    try:
-        from . import clearpass  # noqa: F401
-    except ImportError:  # pragma: no cover - optional until its dependencies are vendored
-        pass
+    from . import clearpass, edgeconnect, orchestrator, ssh  # noqa: F401  (register on import)

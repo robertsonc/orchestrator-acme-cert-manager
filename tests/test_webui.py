@@ -1,8 +1,27 @@
 from __future__ import annotations
 
+import re
+
 from app import config
 from app.webui import auth, server as web
 from tests.conftest import make_server
+
+
+def _csrf(c, path="/login"):
+    """Fetch a page to receive the csrf cookie and read the matching form token."""
+    html = c.get(path).get_data(as_text=True)
+    m = re.search(r'name="_csrf" value="([0-9a-f]+)"', html)
+    assert m, f"no csrf token on {path}"
+    return m.group(1)
+
+
+def _post(c, url, data=None, path="/login"):
+    data = dict(data or {})
+    data.setdefault("_csrf", _csrf(c, path))
+    return c.post(url, data=data)
+
+
+_NO_SERVED = {"present": False, "error": "not checked", "serial": None, "environment": None, "self_signed": None}
 
 
 def test_environment_detection():
@@ -44,11 +63,11 @@ def test_form_validation_accepts_good_ssh(server):
 
 
 def _client(layout, monkeypatch):
-    monkeypatch.setattr(web, "_served_info", lambda s: {"present": False, "error": "not checked"})
+    monkeypatch.setattr(web, "_served_info", lambda *a: dict(_NO_SERVED))
     auth.create_admin("admin", "password123")
     web.app.config["TESTING"] = True
     c = web.app.test_client()
-    r = c.post("/login", data={"username": "admin", "password": "password123"})
+    r = _post(c, "/login", {"username": "admin", "password": "password123"})
     assert r.status_code == 302
     return c
 
@@ -71,7 +90,7 @@ def test_dashboard_shows_config_path_and_ssh_problems(layout, known_hosts, monke
 
 def test_settings_save_rejects_empty_key_path(layout, known_hosts, monkeypatch):
     c = _client(layout, monkeypatch)
-    r = c.post("/settings/save", data={
+    r = _post(c, "/settings/save", {
         "id": "new1", "orchestrator_host": "orch.example.test", "acme_email": "a@b.c",
         "acme_ca": "letsencrypt_test", "key_type": "rsa2048", "ssh_user": "admin",
         "ssh_key_path": "", "ssh_known_hosts": str(known_hosts), "ssh_port": "22",
@@ -83,7 +102,7 @@ def test_settings_save_rejects_empty_key_path(layout, known_hosts, monkeypatch):
 
 def test_settings_save_persists_to_config_dir(layout, rsa_key, known_hosts, monkeypatch):
     c = _client(layout, monkeypatch)
-    r = c.post("/settings/save", data={
+    r = _post(c, "/settings/save", {
         "id": "new2", "orchestrator_host": "orch.example.test", "acme_email": "a@b.c",
         "acme_ca": "letsencrypt_test", "key_type": "rsa2048", "ssh_user": "admin",
         "ssh_key_path": str(rsa_key[0]), "ssh_known_hosts": str(known_hosts), "ssh_port": "22",
@@ -104,10 +123,10 @@ def test_api_status_reports_paths(layout, monkeypatch):
 
 
 def test_login_next_cannot_be_offsite(layout, monkeypatch):
-    monkeypatch.setattr(web, "_served_info", lambda s: {"present": False, "error": "x"})
+    monkeypatch.setattr(web, "_served_info", lambda *a: dict(_NO_SERVED))
     auth.create_admin("admin", "password123")
     c = web.app.test_client()
-    r = c.post("/login", data={"username": "admin", "password": "password123", "next": "//evil.example"})
+    r = _post(c, "/login", {"username": "admin", "password": "password123", "next": "//evil.example"})
     assert r.headers["Location"].endswith("/")
 
 

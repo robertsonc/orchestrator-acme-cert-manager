@@ -2,47 +2,53 @@
 {% set nav = 'settings' %}
 {% block title %}Settings · Orchestrator ACME Cert Manager{% endblock %}
 {% block content %}
-  {% import "_macros.html" as m %}
+  {% import "_macros.html" as m with context %}
   {% if system.problems %}
     <div class="alert a-warn"><strong>System checks</strong>
       <ul>{% for p in system.problems %}<li><span class="mono small">[{{ p.code }}]</span> {{ p.message }}</li>{% endfor %}</ul></div>
   {% endif %}
   {% if test_result %}
-    <div class="alert {{ 'a-good' if test_result.ok else 'a-crit' }}"><strong>SSH test for {{ test_server.name }}</strong> {{ test_result.message }}</div>
+    <div class="alert {{ 'a-good' if test_result.ok else 'a-crit' }}"><strong>Probe for {{ test_server.name }}</strong> {{ test_result.message }}</div>
   {% endif %}
 
-  <div class="section-head"><h2>Servers</h2><a class="btn" href="{{ url_for('settings_new') }}">+ Add server</a></div>
+  <div class="section-head"><h2>Certificates &amp; targets</h2><a class="btn" href="{{ url_for('settings_new') }}">+ Add server</a></div>
   <div class="panel table-wrap">
-    {% if not servers %}
+    {% if not certificates %}
       <p class="empty">No servers configured yet. <a href="{{ url_for('settings_new') }}">Add one</a> to get started.</p>
     {% else %}
     <table class="grid">
-      <thead><tr><th>Server</th><th>Host</th><th>CA</th><th>Key</th><th>Secrets</th><th>API TLS</th><th>SSH</th><th class="right">Actions</th></tr></thead>
+      <thead><tr><th>Certificate</th><th>Target</th><th>Driver</th><th>Host</th><th>CA</th><th>Key</th><th>Secrets</th><th class="right">Actions</th></tr></thead>
       <tbody>
-      {% for s in servers %}
+      {% for c in certificates %}
+        {% for t in c.targets %}
         <tr>
-          <td><a class="primary" href="{{ url_for('server_detail', server_id=s.id) }}">{{ s.name }}</a><div class="secondary mono">{{ s.id }}</div></td>
-          <td class="mono small">{{ s.orchestrator_host }}</td>
-          <td>{{ m.env_pill('lab' if s.acme_ca == 'lab' else ('staging' if s.acme_ca != 'letsencrypt' else 'production')) }}</td>
-          <td class="mono small">{{ s.key_type }}</td>
-          <td>{% if s.dns_api_token and s.api_key %}<span class="pill quiet" title="Cloudflare token and API key stored in config">in config</span>
-              {% elif s.dns_api_token or s.api_key %}<span class="pill quiet" title="One secret stored, the other from the environment">partial</span>
-              {% else %}<span class="pill quiet" title="Both secrets read from environment variables">env</span>{% endif %}</td>
-          <td>{% if s.verify_ssl %}<span class="check good"><span class="g">●</span>verified</span>{% else %}<span class="check warn"><span class="g">▲</span>unverified</span>{% endif %}</td>
-          <td class="mono small">{{ s.ssh_user or '—' }}{% if s.ssh_port != 22 %} <span class="muted">:{{ s.ssh_port }}</span>{% endif %}</td>
+          <td>{% if loop.first %}<span class="primary">{{ c.name }}</span><div class="secondary mono">{{ c.id }} · {{ c.domain }}</div>{% endif %}</td>
+          <td><a class="primary" href="{{ url_for('server_detail', server_id=t.id) }}">{{ t.name or t.id }}</a>{% if t.name %}<div class="secondary mono">{{ t.id }}</div>{% endif %}</td>
+          <td>{{ m.driver_pill(t.driver, driver_labels.get(t.driver, t.driver)) }}</td>
+          <td class="mono small">{{ hosts.get(t.id, '') }}</td>
+          <td>{% if loop.first %}{{ m.env_pill('lab' if c.acme_ca == 'lab' else ('staging' if c.acme_ca != 'letsencrypt' else 'production')) }}{% endif %}</td>
+          <td class="mono small">{% if loop.first %}{{ c.key_type }}{% endif %}</td>
+          <td>{% set api = t.settings.get('api_key') %}{% set cf = c.dns_api_token or c.dns_env %}
+              {% if cf and (api or t.driver != 'orchestrator') %}<span class="pill quiet" title="DNS credentials and target secrets stored in config">in config</span>
+              {% elif cf or api %}<span class="pill quiet" title="One secret stored, the other from the environment">partial</span>
+              {% else %}<span class="pill quiet" title="Secrets read from environment variables">env</span>{% endif %}</td>
           <td><div class="actions">
-            <form method="post" action="{{ url_for('settings_test_ssh', server_id=s.id) }}"><button type="submit" class="btn secondary sm" title="Authenticate and check sudo. Restarts nothing.">Test SSH</button></form>
-            <a class="btn secondary sm" href="{{ url_for('settings_edit', server_id=s.id) }}">Edit</a>
-            <form method="post" action="{{ url_for('settings_delete', server_id=s.id) }}"
-                  data-confirm="Delete server '{{ s.name }}'? This only removes it from the config; issued certificates on disk are left alone.">
+            <form method="post" action="{{ url_for('settings_test_ssh', server_id=t.id) }}">{{ m.csrf() }}<button type="submit" class="btn secondary sm" title="Live, non-disruptive check. Changes nothing.">Probe</button></form>
+            <a class="btn secondary sm" href="{{ url_for('settings_edit', server_id=t.id) }}">Edit</a>
+            {% if loop.last %}<a class="btn secondary sm" href="{{ url_for('settings_target_new', cert_id=c.id) }}" title="Deploy this certificate to another target">+ Target</a>{% endif %}
+            <form method="post" action="{{ url_for('settings_delete', server_id=t.id) }}"
+                  data-confirm="Delete target '{{ t.name or t.id }}'?{% if c.targets|length == 1 %} It is the certificate's only target, so the certificate entry '{{ c.id }}' goes with it.{% endif %} Issued certificates on disk are left alone.">
+              {{ m.csrf() }}
               <button type="submit" class="btn danger sm">Delete</button></form>
           </div></td>
         </tr>
+        {% endfor %}
       {% endfor %}
       </tbody>
     </table>
     {% endif %}
   </div>
   <p class="help">Changes take effect on the next run — no rebuild or restart. Saved to <span class="mono">{{ system.servers_file }}</span>.
-    What a server needs from the host (SSH key, pinned host key, sudoers rule, environment secrets, lab CA) is prepared by <code>./setup.sh</code> and shown on the <a href="{{ url_for('system_page') }}">System</a> page.</p>
+    One certificate is issued once and deployed to each of its targets; add a target to reuse a certificate on another system.
+    What a target needs from the host (SSH key, pinned host key, sudoers rule, environment secrets, lab CA) is prepared by <code>./setup.sh</code> and shown on the <a href="{{ url_for('system_page') }}">System</a> page.</p>
 {% endblock %}

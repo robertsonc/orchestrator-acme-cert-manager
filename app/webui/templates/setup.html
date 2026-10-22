@@ -1,12 +1,14 @@
 {% extends "base.html" %}
 {% block title %}Setup · Orchestrator ACME Cert Manager{% endblock %}
 {% block content %}
+  {% import "_macros.html" as m with context %}
   <div class="auth-wrap">
     <div class="panel auth-card">
       <h1>Create the admin account</h1>
       <p class="small muted" style="margin:0 0 10px">One administrator protects the dashboard and settings. Choose a password of at least 8 characters.</p>
       {% if errors %}<div class="errors"><ul style="margin:0">{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul></div>{% endif %}
       <form method="post" action="{{ url_for('setup') }}" autocomplete="off">
+        {{ m.csrf() }}
         <div class="field"><label for="username">Username</label><input id="username" name="username" value="{{ username }}" autofocus></div>
         <div class="field"><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="new-password"></div>
         <div class="field"><label for="confirm">Confirm password</label><input id="confirm" name="confirm" type="password" autocomplete="new-password"></div>

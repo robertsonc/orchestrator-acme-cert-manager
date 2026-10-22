@@ -300,10 +300,45 @@ def save_certificates(certs: list[Certificate]) -> None:
     text = json.dumps(payload, indent=2) + "\n"
     if SERVERS_FILE.exists():
         bak = SERVERS_FILE.with_suffix(".json.bak")
-        bak.write_text(SERVERS_FILE.read_text())
-        _lock_down(bak)
-    SERVERS_FILE.write_text(text)
-    _lock_down(SERVERS_FILE)
+        _write_private(bak, SERVERS_FILE.read_bytes())
+    _write_private(SERVERS_FILE, text.encode())
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    """Mode-600 file written atomically; in place only when the target is a single-file bind mount (EBUSY)."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        with open(path, "wb") as fh:
+            fh.write(data)
+        _lock_down(path)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+class _config_lock:
+    """Cross-process lock around load-modify-save of servers.json."""
+
+    def __enter__(self):
+        import fcntl
+        SERVERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        self._fd = os.open(SERVERS_FILE.with_name(f".{SERVERS_FILE.name}.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        import fcntl
+        fcntl.flock(self._fd, fcntl.LOCK_UN)
+        os.close(self._fd)
+        return False
 
 
 def save_servers(servers: list[ServerConfig]) -> None:
@@ -313,20 +348,26 @@ def save_servers(servers: list[ServerConfig]) -> None:
 
 def upsert_certificate(cert: Certificate) -> None:
     """Insert a certificate or replace the one with the same id (preserving order)."""
-    certs = load_certificates()
-    for i, c in enumerate(certs):
-        if c.id == cert.id:
-            certs[i] = cert
-            break
-    else:
-        certs.append(cert)
-    for t in cert.targets:
-        t.certificate_id = cert.id
-    save_certificates(certs)
+    with _config_lock():
+        certs = load_certificates()
+        for i, c in enumerate(certs):
+            if c.id == cert.id:
+                certs[i] = cert
+                break
+        else:
+            certs.append(cert)
+        for t in cert.targets:
+            t.certificate_id = cert.id
+        save_certificates(certs)
 
 
 def upsert_target(cert_id: str, target: Target) -> None:
     """Insert or replace one target of an existing certificate."""
+    with _config_lock():
+        _upsert_target(cert_id, target)
+
+
+def _upsert_target(cert_id: str, target: Target) -> None:
     certs = load_certificates()
     cert = next((c for c in certs if c.id == cert_id), None)
     if cert is None:
@@ -348,16 +389,17 @@ def upsert_target(cert_id: str, target: Target) -> None:
 
 def delete_target(target_id: str) -> bool:
     """Remove one target; a certificate left without targets is removed too."""
-    certs = load_certificates()
-    changed = False
-    for c in certs:
-        before = len(c.targets)
-        c.targets = [t for t in c.targets if t.id != target_id]
-        changed = changed or len(c.targets) != before
-    if not changed:
-        return False
-    save_certificates([c for c in certs if c.targets])
-    return True
+    with _config_lock():
+        certs = load_certificates()
+        changed = False
+        for c in certs:
+            before = len(c.targets)
+            c.targets = [t for t in c.targets if t.id != target_id]
+            changed = changed or len(c.targets) != before
+        if not changed:
+            return False
+        save_certificates([c for c in certs if c.targets])
+        return True
 
 
 def upsert_server(server: ServerConfig) -> None:
@@ -366,27 +408,29 @@ def upsert_server(server: ServerConfig) -> None:
     The certificate's other targets (if any) are kept; only the Orchestrator
     target with this id and the certificate's own fields are replaced.
     """
-    certs = load_certificates()
-    new = server.to_certificate()
-    cert = next((c for c in certs if c.id == new.id), None)
-    if cert is None:
-        certs.append(new)
-    else:
-        others = [t for t in cert.targets if t.id != server.id]
-        new.targets = new.targets + others
-        new.attach()
-        certs[certs.index(cert)] = new
-    save_certificates(certs)
+    with _config_lock():
+        certs = load_certificates()
+        new = server.to_certificate()
+        cert = next((c for c in certs if c.id == new.id), None)
+        if cert is None:
+            certs.append(new)
+        else:
+            others = [t for t in cert.targets if t.id != server.id]
+            new.targets = new.targets + others
+            new.attach()
+            certs[certs.index(cert)] = new
+        save_certificates(certs)
 
 
 def delete_server(server_id: str) -> bool:
     """Remove a certificate (and all its targets) by id. Returns True if something was removed."""
-    certs = load_certificates()
-    remaining = [c for c in certs if c.id != server_id]
-    if len(remaining) == len(certs):
-        return False
-    save_certificates(remaining)
-    return True
+    with _config_lock():
+        certs = load_certificates()
+        remaining = [c for c in certs if c.id != server_id]
+        if len(remaining) == len(certs):
+            return False
+        save_certificates(remaining)
+        return True
 
 
 def api_key_for(server: ServerConfig) -> str:
@@ -408,16 +452,38 @@ def cf_token_for(cert) -> str:
     return cert.dns_api_token or os.environ.get(CF_TOKEN_ENV, "")
 
 
+def _domain_dir(domain: str) -> Path:
+    """CERTS_DIR/<domain>, refusing anything that would escape CERTS_DIR."""
+    name = (domain or "").strip()
+    if not name or "/" in name or name in (".", "..") or name.startswith("."):
+        raise ConfigError(f"invalid certificate domain {domain!r}")
+    d = (CERTS_DIR / name)
+    if d.resolve().parent != CERTS_DIR.resolve():
+        raise ConfigError(f"certificate domain {domain!r} resolves outside {CERTS_DIR}")
+    return d
+
+
+def duplicate_domains(certs: list[Certificate]) -> list[str]:
+    seen: dict[str, str] = {}
+    dupes = []
+    for c in certs:
+        key = c.domain.lower()
+        if key in seen:
+            dupes.append(f"{c.id} and {seen[key]} both issue for {c.domain}")
+        seen.setdefault(key, c.id)
+    return dupes
+
+
 def cert_dir_for(cert) -> Path:
     """Per-certificate directory (Lego state, flattened files, rollback snapshot)."""
-    d = CERTS_DIR / cert.domain
+    d = _domain_dir(cert.domain)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 def leaf_path_for(cert) -> Path:
     """The flattened leaf certificate for this certificate (may not exist yet)."""
-    return CERTS_DIR / cert.domain / f"{cert.domain}.cer"
+    return _domain_dir(cert.domain) / f"{cert.domain}.cer"
 
 
 def is_staging_ca(acme_ca: str) -> bool:

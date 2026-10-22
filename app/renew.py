@@ -17,7 +17,7 @@ from pathlib import Path
 
 from cryptography import x509
 
-from . import config, deploy, drivers, issue, locks, notify, restart, store  # noqa: F401 (deploy/restart patched by tests)
+from . import certs, config, deploy, drivers, issue, locks, notify, restart, store  # noqa: F401 (deploy/restart patched by tests)
 from .drivers.base import CertBundle
 from .models import Certificate, RenewalRecord, ServerConfig, StepResult, Target
 
@@ -28,10 +28,21 @@ def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
 
-def _timed(fn, arg) -> dict:
-    """Run a pipeline step and return its dict with elapsed_s added."""
+def _timed(fn, arg, step: str = "step") -> dict:
+    """Run a pipeline step and return its dict with elapsed_s added.
+
+    An exception out of a step becomes a failed step (traceback tail in the
+    detail) so the record and the alert are still produced.
+    """
+    import traceback
     t0 = time.monotonic()
-    res = fn(arg)
+    try:
+        res = fn(arg)
+    except Exception as exc:  # noqa: BLE001 - a step must never take the run down silently
+        log.exception("%s step raised", step)
+        res = StepResult(step, ok=False, message=f"{step} failed unexpectedly: {exc.__class__.__name__}: {exc}",
+                         detail={"phase": "exception", "kind": "internal",
+                                 "traceback": traceback.format_exc()[-2000:]})
     d = res.as_dict()
     d["elapsed_s"] = round(time.monotonic() - t0, 1)
     return d
@@ -55,17 +66,58 @@ def _deploy_targets(cert: Certificate, targets: list[Target], steps: list[dict])
     bundle = CertBundle.for_certificate(cert)
     for t in targets:
         drv = drivers.get(t.driver)
-        s_deploy = _timed(lambda _t: drv.deploy(_t, bundle), t)
+        s_deploy = _timed(lambda _t, _d=drv: _d.deploy(_t, bundle), t, "deploy")
         s_deploy["target"] = t.id
         steps.append(s_deploy)
         if not s_deploy["ok"]:
             return "failed"
-        s_act = _timed(lambda _t: drv.activate_step(_t, bundle), t)
+        s_act = _timed(lambda _t, _d=drv: _d.activate_step(_t, bundle), t, drv.steps[-1])
         s_act["target"] = t.id
         steps.append(s_act)
         if not s_act["ok"]:
             return "failed"
     return "success"
+
+
+def pending_targets(cert: Certificate, targets: list[Target]) -> list[Target]:
+    """Targets whose last verified activation is not the certificate on disk.
+
+    This is how a scheduled run finishes a renewal whose activation failed on
+    one target, or picks up a target added after the last issuance. Before a
+    target is touched its served certificate is read: one that already
+    presents the issued serial (deployed by hand, or by a run that died before
+    taking its snapshot) is left alone, and a target that was never activated
+    from here and cannot be read at all is not deployed to from a scheduled
+    run - that stays an explicit operator action.
+    """
+    bundle = CertBundle.for_certificate(cert)
+    if not bundle.present or not bundle.serial:
+        return []
+    out = []
+    for t in targets:
+        drv = drivers.get(t.driver)
+        try:
+            snap = drv.snapshot_bundle(t)
+        except (config.ConfigError, OSError):
+            snap = None
+        if snap is not None and snap.serial == bundle.serial:
+            continue
+        try:
+            served = drv.served_info(t)
+        except Exception as exc:    # a driver bug must not take the whole scheduled run down
+            log.warning("renew(%s): could not read the served certificate on %s: %s: %s",
+                        cert.id, t.id, exc.__class__.__name__, exc)
+            served = dict(certs.ABSENT, error=str(exc))
+        if served.get("present") and served.get("serial") == bundle.serial:
+            log.info("renew(%s): %s already serves %s; no deploy needed", cert.id, t.id, bundle.serial)
+            continue
+        if snap is None and not served.get("present"):
+            log.warning("renew(%s): %s has never been activated from here and its served certificate is "
+                        "unreadable (%s); not deploying from a scheduled run - use Force deploy", cert.id, t.id,
+                        served.get("error") or "absent")
+            continue
+        out.append(t)
+    return out
 
 
 def _finish(cert: Certificate, targets: list[Target], steps: list[dict], outcome: str, kind: str,
@@ -89,14 +141,14 @@ def renew_certificate(cert: Certificate, force: bool = False, actor: str = "", s
     (and we are not forcing): targets are only touched when the cert changed.
     Raises locks.RunLocked when another run holds this certificate.
     """
-    kind = "renew" if force else "scheduled"
+    kind = "renew" if force else ("scheduled" if source == "cron" else "check")
     targets = list(targets if targets is not None else cert.targets)
     with locks.run_lock(cert.id, kind, actor, source):
         steps: list[dict] = []
         outcome = "success"
         t_start = time.monotonic()
 
-        s_issue = _timed(lambda c: issue.issue_or_renew(c, force=force), cert)
+        s_issue = _timed(lambda c: issue.issue_or_renew(c, force=force), cert, "issue")
         steps.append(s_issue)
         not_after = s_issue["detail"].get("expiry")
         serial = s_issue["detail"].get("serial")
@@ -104,8 +156,15 @@ def renew_certificate(cert: Certificate, force: bool = False, actor: str = "", s
         if not s_issue["ok"]:
             outcome = "failed"
         elif not force and not s_issue["detail"].get("renewed", True):
-            outcome = "skipped"
-            log.info("renew(%s): skipped (cert still valid)", cert.id)
+            pending = pending_targets(cert, targets)
+            if pending:
+                log.info("renew(%s): certificate still valid but %s not yet activated: deploying",
+                         cert.id, ", ".join(t.id for t in pending))
+                steps[-1]["message"] += f" Pending activation on {', '.join(t.id for t in pending)}."
+                targets = pending
+            else:
+                outcome = "skipped"
+                log.info("renew(%s): skipped (cert still valid)", cert.id)
 
         if outcome == "success":
             outcome = _deploy_targets(cert, targets, steps)
@@ -175,6 +234,10 @@ def renew_all(force: bool = False, actor: str = "scheduler", source: str = "cron
         except locks.RunLocked as exc:
             log.warning("renew-all: %s", exc)
             outcomes[c.id] = "locked"
+            continue
+        except Exception as exc:  # noqa: BLE001 - one certificate must not stop the others
+            log.exception("renew-all: %s failed outside the pipeline", c.id)
+            outcomes[c.id] = f"error: {exc.__class__.__name__}"
             continue
         records.append(rec)
         outcomes[c.id] = rec.outcome

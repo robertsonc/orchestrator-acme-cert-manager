@@ -3,10 +3,9 @@ busy state, target rows and the driver-generic settings form."""
 from __future__ import annotations
 
 import datetime as dt
-import json
 
 from app import config, locks, store, sysinfo
-from app.models import Certificate, RenewalRecord, Target
+from app.models import RenewalRecord
 from app.webui import auth, server as web
 from tests.conftest import make_server
 from tests.test_core_v13 import _bundle_files

@@ -102,7 +102,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"__ERROR__\t{exc}")
     sys.exit(0)
 def row(sid, host, ssh, has_api, dns, acme):
-    print("\t".join([
+    print("\x1f".join([
         str(sid), str(host), str(ssh.get("port") or 22),
         str(ssh.get("key_path") or ""), str(ssh.get("known_hosts") or "/data/ssh/known_hosts"),
         "1" if has_api else "0", "1" if (dns.get("api_token") or dns.get("env")) else "0",
@@ -227,9 +227,9 @@ else
   m="$(mode_of "$envf")"
   [[ "$m" == "600" ]] && pass ".env present (mode 600)" || warn ".env mode ${m} — it holds secrets" "chmod 600 .env"
   if grep -q $'\r' "$envf"; then fail ".env contains CRLF line endings (values would carry a trailing CR)" "sed -i 's/\\r\$//' .env"; else pass "no CRLF in .env"; fi
-  if grep -qE "^[A-Z_]+=\"" "$envf" || grep -qE "^[A-Z_]+='" "$envf"; then
-    warn "quoted values in .env — Compose passes the quotes through" "remove the quotes around values in .env"
-  fi
+  if sed 's/\$\$//g' "$envf" | grep -qE "^[A-Z_][A-Z0-9_]*=[^'#]*[$]"; then
+    warn "a value in .env contains an unquoted \$ — Compose v2 interpolates it as a variable reference" "single-quote the value (KEY='pa\$sword') or write \$\$ for a literal \$"
+  else pass "no unquoted \$ in .env values"; fi
   sf="$(env_get SERVERS_FILE "$envf")"
   if [[ -z "$sf" ]]; then
     note "SERVERS_FILE not in .env — docker-compose.yml sets /config/servers.json explicitly since 1.1.0 (fine)"
@@ -247,7 +247,7 @@ else
       fail "config/servers.json is not valid JSON: ${servers_rows#*	}" "fix the JSON (compare with config/servers.example.json)"
       servers_rows=""
     else
-      while IFS=$'\t' read -r _ _ _ _ _ hasapi hascf _; do
+      while IFS=$'\x1f' read -r _ _ _ _ _ hasapi hascf _; do
         [[ "$hasapi" == "1" ]] && inline_api=1; [[ "$hascf" == "1" ]] && inline_cf=1
       done <<< "$servers_rows"
     fi
@@ -259,6 +259,19 @@ else
     fail "no Orchestrator API key: ORCH_API_KEY is unset/placeholder and no server has an inline key" "set ORCH_API_KEY in .env, or enter it per server in Settings"
   else pass "Orchestrator API key available ($( [[ $inline_api -eq 1 ]] && echo inline || echo .env ))"; fi
   ouid="$(env_get OACM_UID "$envf")"; ogid="$(env_get OACM_GID "$envf")"
+  if [[ -n "$ouid" ]]; then
+    # Files written by a pre-1.3 (root) container keep root ownership on the host; the unprivileged
+    # container cannot rewrite them.
+    foreign=""
+    for d in config data/certs data/logs data/ssh; do
+      [[ -d "$d" ]] || continue
+      f="$(find "$d" -not -user "$ouid" -print -quit 2>/dev/null || true)"
+      [[ -n "$f" ]] && foreign="${foreign} ${f}"
+    done
+    if [[ -n "$foreign" ]]; then
+      fail "files not owned by uid ${ouid} under config/ data/certs data/logs data/ssh (first:${foreign}) — written by the pre-1.3 root container; the unprivileged container cannot update them" "sudo chown -R ${ouid}:${ogid:-$ouid} config data/certs data/logs && sudo chown ${ouid}:${ogid:-$ouid} data/ssh data/ssh/*"
+    else pass "config/ and data/ files are owned by uid ${ouid}"; fi
+  fi
   if [[ -z "$ouid" || -z "$ogid" ]]; then
     fail "OACM_UID/OACM_GID not set in .env — since 1.3 the container runs unprivileged (uid 10001 by default) and cannot write config/ or data/ owned by you" "./setup.sh writes OACM_UID=$(id -u) OACM_GID=$(id -g) to .env (or add them by hand), then docker compose down && docker compose up -d"
   elif [[ "$ouid" != "$(id -u)" ]]; then
@@ -350,7 +363,7 @@ check_kh() {  # check_kh <host path> <host> <port> <label>
   else fail "${label}: no known_hosts entry for ${name} in ${kh}" "./setup.sh --host ${host} --ssh-port ${port} (confirm the fingerprint), or ssh-keyscan -p ${port} ${host} >> ${kh} after verifying it"; fi
 }
 if [[ -n "${servers_rows:-}" ]]; then
-  while IFS=$'\t' read -r sid shost sport skey skh _ _ sca; do
+  while IFS=$'\x1f' read -r sid shost sport skey skh _ _ sca; do
     [[ -z "$sid" ]] && continue
     kp="$(host_path "${skey:-/data/ssh/orch_restart}")"; khp="$(host_path "$skh")"
     [[ -z "$skey" ]] && warn "${sid}: ssh.key_path is empty in servers.json" "set it to /data/ssh/orch_restart in Settings"
@@ -395,7 +408,7 @@ if [[ $with_ca -eq 1 ]]; then
     else pass "offline root directory is not on this host"; fi
     retired="$(ls data/pki/certs/retired/*.crt 2>/dev/null | wc -l)"
     [[ "$retired" -gt 0 ]] && note "root rollover in progress: ${retired} retired root(s) still trusted — Force renew every lab-CA server, then delete data/pki/certs/retired/*"
-    [[ -f data/pki/.init-in-progress ]] && warn "a previous init was interrupted (.init-in-progress)" "./setup.sh --with-ca resumes it"
+    [[ -f data/pki/config/.init-in-progress ]] && warn "a previous init was interrupted (.init-in-progress)" "./setup.sh --with-ca resumes it"
   else
     note "not initialised yet (no ${meta})"
     if [[ -z "$LAB_CA_DOMAIN" ]]; then

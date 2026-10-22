@@ -17,7 +17,7 @@ import requests
 
 from app import backup, certs, config, deploy, drivers, locks, preflight, renew, restart, sshcheck, store
 from app.drivers import base as drv_base
-from app.models import Certificate, RenewalRecord, StepResult, Target
+from app.models import Certificate, StepResult, Target
 from tests.conftest import make_server
 
 
@@ -38,13 +38,14 @@ def _leaf(path: Path, cn="orch.example.test", issuer_cn=None, days=90, age_days=
             .not_valid_after(now + dt.timedelta(days=days)).sign(key, hashes.SHA256()))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    path.with_suffix(".key").write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                                           serialization.NoEncryption()))
     return certs.parse_pem(path.read_bytes())
 
 
 def _bundle_files(d: Path, domain="orch.example.test", issuer_cn="CN=Fake LE Intermediate X1", days=90, age_days=0):
     d.mkdir(parents=True, exist_ok=True)
-    info = _leaf(d / f"{domain}.cer", cn=domain, issuer_cn=issuer_cn, days=days, age_days=age_days)
-    (d / f"{domain}.key").write_text("-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n")
+    info = _leaf(d / f"{domain}.cer", cn=domain, issuer_cn=issuer_cn, days=days, age_days=age_days)   # also writes {domain}.key
     (d / "ca.cer").write_text("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n")
     return info
 
@@ -181,7 +182,8 @@ def test_two_concurrent_renews_one_runs_one_refuses(layout, monkeypatch):
 
 # --------------------------------------------------------------------------- renewal window (#9)
 
-@pytest.mark.parametrize("lifetime,age,due", [(90, 10, False), (90, 61, True), (45, 20, False), (45, 31, True), (6, 3, False), (6, 4, True)])
+@pytest.mark.parametrize("lifetime,age,due", [(90, 10, False), (90, 61, True), (64, 40, False), (64, 43, True),
+                                               (45, 20, False), (45, 31, True), (6, 2, False), (6, 3, True)])
 def test_due_for_renewal_follows_lifetime_fraction(tmp_path, monkeypatch, lifetime, age, due):
     monkeypatch.delenv("RENEW_WINDOW_DAYS", raising=False)
     info = _leaf(tmp_path / "leaf.pem", days=lifetime, age_days=age)
@@ -207,6 +209,7 @@ def test_scheduled_issue_skips_lego_when_not_due_and_disables_ari_across_environ
     _bundle_files(d, issuer_cn="CN=Fake LE Intermediate X1", days=90, age_days=10)   # staging, 80 days left
     (d / "certificates" / "orch.example.test.crt").write_text((d / "orch.example.test.cer").read_text())
     (d / "certificates" / "orch.example.test.key").write_text("k")
+    (d / "certificates" / "orch.example.test.json").write_text('{"domain": "orch.example.test"}')
     calls = []
     monkeypatch.setattr(issue.subprocess, "run", lambda cmd, **k: calls.append(cmd) or (_ for _ in ()).throw(AssertionError("lego must not run")))
     monkeypatch.delenv("RENEW_WINDOW_DAYS", raising=False)
@@ -302,7 +305,7 @@ def test_activation_failure_rolls_back_same_environment_but_refuses_across(layou
     bundle = drv_base.CertBundle.for_certificate(c)
     fake_driver.snapshot(t, bundle)                     # a verified staging snapshot exists
     # new production cert whose activation fails: same-env rollback refused by default
-    prod = _bundle_files(d, domain="rb.example.test", issuer_cn="CN=R3,O=Let's Encrypt,C=US")
+    _bundle_files(d, domain="rb.example.test", issuer_cn="CN=R3,O=Let's Encrypt,C=US")
     bundle = drv_base.CertBundle.for_certificate(c)
     fake_driver.serve = None
     res = fake_driver.activate_step(t, bundle)
@@ -508,7 +511,8 @@ def test_backup_and_restore_roundtrip_with_encryption(layout, tmp_path, monkeypa
 
 
 def test_restore_refuses_traversal(tmp_path, layout):
-    import io, tarfile
+    import io
+    import tarfile
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for name in ("backup.json", "../evil"):
@@ -524,3 +528,87 @@ def test_cli_reports_lock_with_exit_code_3(layout, monkeypatch, capsys):
     with locks.run_lock("orch-test", "renew", actor="alice"):
         rc = cli.main(["renew", "orch-test", "--force"])
     assert rc == cli.EXIT_LOCKED and "already running" in capsys.readouterr().err
+
+
+def test_ari_cert_id_and_window_precedence(tmp_path, monkeypatch):
+    """RFC 9773 CertID = b64url(AKI) '.' b64url(DER serial); an open ARI window wins over the lifetime rule."""
+    from app import ari
+    import datetime as dt
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = dt.datetime.now(dt.timezone.utc)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "a.test")])
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(0x8A_BC_DE).not_valid_before(now).not_valid_after(now + dt.timedelta(days=90))
+            .add_extension(x509.AuthorityKeyIdentifier(b"\x01\x02\x03", None, None), critical=False)
+            .sign(key, hashes.SHA256()))
+    pem = cert.public_bytes(serialization.Encoding.PEM)
+    assert ari.cert_id(pem) == "AQID.AIq83g"          # serial 0x8ABCDE needs a leading 0x00 in DER
+    info = certs.parse_pem(pem)
+    assert certs.due_for_renewal(info)[0] is False      # 90 days left
+    window = {"start": now - dt.timedelta(hours=1), "end": now + dt.timedelta(hours=40)}
+    due, why = certs.due_for_renewal(info, window)
+    assert due and "ARI window open" in why
+    later = {"start": now + dt.timedelta(days=1), "end": now + dt.timedelta(days=2)}
+    assert certs.due_for_renewal(info, later)[0] is False
+    monkeypatch.setenv("RENEW_WINDOW_DAYS", "100")      # the explicit override beats ARI
+    assert certs.due_for_renewal(info, later)[0] is True
+
+    class R:
+        def __init__(self, status, body, headers=None): self.status_code, self._b, self.headers = status, body, headers or {}
+        def json(self): return self._b
+    calls = []
+
+    def fake_get(url, timeout=None, verify=None):
+        calls.append(url)
+        if url.endswith("/directory"):
+            return R(200, {"renewalInfo": "https://ca.test/acme/renewal-info"})
+        return R(200, {"suggestedWindow": {"start": "2026-10-01T00:00:00Z", "end": "2026-10-02T00:00:00Z"}}, {"Retry-After": "21600"})
+    monkeypatch.setattr(ari.requests, "get", fake_get)
+    ari.reset_cache()
+    win = ari.renewal_info("https://ca.test/directory", pem)
+    assert win["start"].year == 2026 and win["retry_after"] == "21600" and calls[-1].endswith("/AQID.AIq83g")
+    assert ari.renewal_info("https://ca.test/directory", pem) and calls.count("https://ca.test/directory") == 1   # directory cached
+    monkeypatch.setattr(ari.requests, "get", lambda url, timeout=None, verify=None: R(200, {}))
+    ari.reset_cache()
+    assert ari.renewal_info("https://other.test/directory", pem) is None     # no renewalInfo advertised
+
+
+def test_issue_retries_once_without_ari_when_the_ca_rejects_replaces(layout, monkeypatch):
+    from app import issue
+    d = layout["certs"] / "orch.example.test"
+    (d / "certificates").mkdir(parents=True)
+    _bundle_files(d, issuer_cn="CN=R3,O=Let's Encrypt,C=US", days=90, age_days=10)
+    (d / "certificates" / "orch.example.test.crt").write_text((d / "orch.example.test.cer").read_text())
+    (d / "certificates" / "orch.example.test.key").write_text("k")
+    (d / "certificates" / "orch.example.test.json").write_text('{"domain": "orch.example.test"}')
+    calls = []
+
+    class P:
+        def __init__(self, rc, err=""): self.returncode, self.stdout, self.stderr = rc, "", err
+    outcomes = [P(1, '403 urn:ietf:params:acme:error:unauthorized :: requester account did not request the certificate being replaced by this order'), P(0)]
+    monkeypatch.setattr(issue.subprocess, "run", lambda cmd, **k: calls.append(list(cmd)) or outcomes.pop(0))
+    res = issue.issue_or_renew(make_server(acme_ca="letsencrypt"), force=True)
+    assert res.ok and res.detail["ari_retry"] is True
+    assert "--ari-disable" not in calls[0] and "--ari-disable" in calls[1]
+    # an unrelated failure is not retried
+    calls.clear(); outcomes[:] = [P(1, "dns: cloudflare: 403 forbidden")]
+    res = issue.issue_or_renew(make_server(acme_ca="letsencrypt"), force=True)
+    assert not res.ok and len(calls) == 1 and res.detail["ari_retry"] is False
+
+
+def test_lego_environment_is_an_allow_list(monkeypatch):
+    from app import issue
+    monkeypatch.setenv("ORCH_API_KEY", "secret-orch")
+    monkeypatch.setenv("CPPM_CLIENT_SECRET", "secret-cppm")
+    monkeypatch.setenv("LEGO_DEBUG_ACME_HTTP_CLIENT", "1")
+    monkeypatch.setenv("CLOUDFLARE_PROPAGATION_TIMEOUT", "300")
+    env = issue.lego_environment(make_server(acme_ca="letsencrypt"), "tok")
+    assert "ORCH_API_KEY" not in env and "CPPM_CLIENT_SECRET" not in env
+    assert env["LEGO_DEBUG_ACME_HTTP_CLIENT"] == "1" and env["CLOUDFLARE_PROPAGATION_TIMEOUT"] == "300" and env["PATH"]
+    other = Certificate(id="c", name="c", domain="c.test", dns_provider="route53", dns_env={"AWS_ACCESS_KEY_ID": "id"})
+    env = issue.lego_environment(other, "")
+    assert "CLOUDFLARE_PROPAGATION_TIMEOUT" not in env and env["AWS_ACCESS_KEY_ID"] == "id" and "CF_DNS_API_TOKEN" not in env

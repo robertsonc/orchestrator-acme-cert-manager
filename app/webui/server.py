@@ -18,6 +18,7 @@ import re
 import secrets
 import threading
 import time
+from urllib.parse import urlsplit
 
 from flask import Flask, abort, jsonify, make_response, redirect, render_template, request, url_for
 
@@ -43,12 +44,26 @@ def _current_user() -> str | None:
     return auth.read_token(request.cookies.get(auth.COOKIE_NAME, ""))
 
 
+def _cookie_secure() -> bool:
+    """Secure flag when the UI sits behind TLS (SESSION_COOKIE_SECURE=true) or the request is HTTPS."""
+    return os.environ.get("SESSION_COOKIE_SECURE", "").lower() in ("1", "true", "yes") or request.is_secure
+
+
 def _set_session(resp, username: str):
     resp.set_cookie(
         auth.COOKIE_NAME, auth.make_token(username),
-        max_age=auth.SESSION_TTL, httponly=True, samesite="Strict",
+        max_age=auth.SESSION_TTL, httponly=True, samesite="Strict", secure=_cookie_secure(),
     )
     return resp
+
+
+def _safe_next(raw: str) -> str:
+    """Only a same-site absolute path is an acceptable post-login destination."""
+    nxt = (raw or "").replace("\\", "/").strip()
+    parts = urlsplit(nxt)
+    if not nxt.startswith("/") or nxt.startswith("//") or parts.scheme or parts.netloc:
+        return url_for("index")
+    return nxt
 
 
 def _csrf_cookie_value() -> str:
@@ -76,7 +91,7 @@ def _csrf_valid() -> bool:
 def _persist_csrf_cookie(resp):
     new = getattr(request, "_new_csrf", None)
     if new and not request.cookies.get(CSRF_COOKIE):
-        resp.set_cookie(CSRF_COOKIE, new, httponly=True, samesite="Strict", max_age=30 * 86400)
+        resp.set_cookie(CSRF_COOKIE, new, httponly=True, samesite="Strict", max_age=30 * 86400, secure=_cookie_secure())
     return resp
 
 
@@ -166,6 +181,8 @@ def setup():
         errors = []
         if not u:
             errors.append("A username is required.")
+        elif not auth.valid_username(u):
+            errors.append("Username may contain only letters, digits, '.', '_', '@' and '-' (1-64 characters).")
         if len(p) < auth.MIN_PASSWORD_LEN:
             errors.append(f"Password must be at least {auth.MIN_PASSWORD_LEN} characters.")
         if p != p2:
@@ -192,21 +209,30 @@ def login():
                                    f"{max(1, wait // 60)} minute(s).", next=request.form.get("next", ""), now=_now()), 429
         if auth.verify(u, p):
             _login_succeeded(u)
-            nxt = request.form.get("next", "") or url_for("index")
-            if not nxt.startswith("/") or nxt.startswith("//"):
-                nxt = url_for("index")
-            return _set_session(make_response(redirect(nxt)), u)
+            return _set_session(make_response(redirect(_safe_next(request.form.get("next", "")))), u)
         _login_failed(u)
         return render_template("login.html", error="Incorrect username or password.",
                                next=request.form.get("next", ""), now=_now()), 401
     return render_template("login.html", error=None, next=request.args.get("next", ""), now=_now())
 
 
-@app.route("/logout", methods=["GET", "POST"])
+@app.route("/logout", methods=["POST"])
 def logout():
+    """Revokes every session token (single admin: logging out means everywhere), then clears the cookie."""
+    if _current_user():
+        auth.revoke_all()
     resp = make_response(redirect(url_for("login")))
     resp.delete_cookie(auth.COOKIE_NAME)
     return resp
+
+
+@app.errorhandler(config.ConfigError)
+def _config_error(exc):
+    """A hand-edited servers.json that does not load must not turn every page into a bare 500."""
+    log.error("configuration error: %s", exc)
+    return render_template("error.html", status=500, title="Configuration cannot be loaded",
+                           message=f"{exc}. Fix {config.SERVERS_FILE} on the host (config/servers.json; the previous "
+                                   f"version is in servers.json.bak), then reload.", now=_now()), 500
 
 
 CA_CHOICES = [
@@ -219,6 +245,11 @@ _ALLOWED_CA = {v for v, _ in CA_CHOICES}
 _ALLOWED_KEY = set(KEY_CHOICES)
 _ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 _ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_HOST_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$")
+_SECRET_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*(API_KEY|_KEY|_TOKEN|_SECRET|_PASSWORD)$")
+_SECRET_ENV_DENY = {"CF_DNS_API_TOKEN", "NOTIFY_WEBHOOK_URL", "BACKUP_PASSPHRASE", "SESSION_COOKIE_SECURE"}
+_HOST_FIELDS = ("orchestrator_host", "host", "appliance_host", "verify_host", "callback_host")
+_CA_URL_RE = re.compile(r"^https?://[^\s/]+(/\S*)?$")
 
 _PENDING: set[str] = set()          # certificate ids with a thread started but the lock not yet taken
 _PENDING_LOCK = threading.Lock()
@@ -265,8 +296,10 @@ def _cert_info(cert) -> dict:
     return certs.leaf_info(config.leaf_path_for(cert))
 
 
-def _served_info(drv, target) -> dict:
-    key = f"{target.driver}:{target.id}:{drv.display_host(target)}"
+def _served_info(drv, target, issued_serial: str | None = None) -> dict:
+    # The issued serial is part of the key, so a scheduled run that changed the served
+    # certificate is seen on the next page load instead of after the cache expires.
+    key = f"{target.driver}:{target.id}:{drv.display_host(target)}:{issued_serial or ''}"
     now = time.monotonic()
     with _SERVED_LOCK:
         hit = _SERVED_CACHE.get(key)
@@ -418,7 +451,7 @@ def _row_for(cert, target=None, with_served: bool = True) -> dict:
             target = cert.targets[0]
     drv = drivers.get(target.driver)
     issued = _cert_info(cert)
-    served = _served_info(drv, target) if with_served else {**certs.ABSENT, "error": "not checked"}
+    served = _served_info(drv, target, issued.get("serial")) if with_served else {**certs.ABSENT, "error": "not checked"}
     host = drv.display_host(target)
     settings = target.settings
     holder = locks.holder(cert.id)
@@ -710,7 +743,7 @@ def _flat_from_request(f) -> dict:
         "id": f.get("id", "").strip(),
         "name": f.get("name", "").strip(),
         "domain": f.get("domain", "").strip(),
-        "acme_ca": f.get("acme_ca", "letsencrypt").strip(),
+        "acme_ca": (f.get("acme_ca_url", "") or "").strip() or f.get("acme_ca", "letsencrypt").strip(),
         "acme_email": f.get("acme_email", "").strip(),
         "key_type": f.get("key_type", "rsa2048").strip(),
         "dns_provider": (f.get("dns_provider", "cloudflare") or "cloudflare").strip().lower(),
@@ -813,6 +846,10 @@ def _validate(flat: dict, is_new: bool, existing_cert: Certificate | None = None
         errors.append("ID may contain only letters, numbers, hyphens, and underscores.")
     elif is_new and not new_target_only and config.server_exists(sid):
         errors.append(f"A server with ID '{sid}' already exists.")
+    if is_new and flat.get("domain") and any(c.domain.lower() == flat["domain"].lower() and c.id != sid
+                                             for c in config.load_certificates()):
+        errors.append(f"Another certificate already covers {flat['domain']}; add this system as a target of that "
+                      f"certificate instead (Settings → + Target).")
     tid = flat.get("target_id") or sid
     if not _ID_RE.match(tid or ""):
         errors.append("Target ID may contain only letters, numbers, hyphens, and underscores.")
@@ -832,8 +869,21 @@ def _validate(flat: dict, is_new: bool, existing_cert: Certificate | None = None
         errors.append("Certificate domain is required.")
     if not flat["acme_email"]:
         errors.append("ACME email is required — Let's Encrypt needs it for registration.")
-    if flat["acme_ca"] not in _ALLOWED_CA:
-        errors.append("Invalid certificate authority selection.")
+    for name in _HOST_FIELDS:
+        val = flat.get(name)
+        if val and not _HOST_RE.match(str(val)):
+            errors.append(f"{name.replace('_', ' ')} must be a hostname or IP address (no scheme, port or path): {val!r}.")
+    if flat["domain"] and not _HOST_RE.match(flat["domain"]):
+        errors.append(f"Certificate domain must be a hostname: {flat['domain']!r}.")
+    if flat["acme_email"] and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", flat["acme_email"]):
+        errors.append("ACME email does not look like an email address.")
+    for name, val in flat.items():
+        if name.endswith("_env") and name != "dns_env" and val:
+            if not _SECRET_ENV_RE.match(str(val)) or str(val) in _SECRET_ENV_DENY:
+                errors.append(f"{name.replace('_', ' ')} must name a dedicated secret variable (ending in _API_KEY, _KEY, "
+                              f"_TOKEN, _SECRET or _PASSWORD), not {val!r}.")
+    if flat["acme_ca"] not in _ALLOWED_CA and not _CA_URL_RE.match(flat["acme_ca"]):
+        errors.append("Invalid certificate authority selection (pick a preset or give an https:// ACME directory URL).")
     elif config.is_lab_ca(flat["acme_ca"]) and not config.lab_ca_available():
         errors.append("The bundled lab CA is not configured on this host: run ./setup.sh --with-ca "
                       "--lab-domain <zone>, then select it.")
@@ -919,10 +969,13 @@ def settings():
 def settings_test_ssh(server_id: str):
     """The driver's live check from the settings list. Restarts nothing."""
     try:
-        config.get_target(server_id)
+        cert, target = config.get_target(server_id)
     except config.ConfigError:
         return redirect(url_for("settings"))
-    return server_test_ssh(server_id)
+    drv = drivers.get(target.driver)
+    res = drv.probe(target)
+    log.info("probe %s (%s) via settings by %s: %s", target.id, drv.name, _current_user(), "ok" if res.ok else res.message)
+    return _render_settings(test_result=res.as_dict(), test_server={"name": target.name or target.id, "id": target.id})[0]
 
 
 @app.route("/settings/new")
@@ -999,6 +1052,7 @@ def settings_delete(server_id: str):
 
 
 def main() -> None:
+    os.umask(0o077)            # every file this process creates starts owner-only
     logging.basicConfig(level="INFO", format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     log.info("web UI starting; configuration file: %s", config.SERVERS_FILE)
     app.run(host="0.0.0.0", port=8080)

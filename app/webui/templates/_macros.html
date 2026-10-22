@@ -72,7 +72,8 @@
     <button type="submit" class="btn {{ size }}" {% if r.renewing %}disabled{% endif %}
             title="Issue from the ACME CA, then deploy and activate{% if r.siblings %} on every target of this certificate{% endif %}.">Force renew</button>
   </form>
-  <form method="post" action="{{ url_for('force_deploy', server_id=r.id) }}">
+  <form method="post" action="{{ url_for('force_deploy', server_id=r.id) }}"
+        data-confirm="Force deploy re-pushes the certificate on disk to {{ r.host }} and activates it{% if r.driver == 'orchestrator' %} (restarts the Orchestrator web service via SSH){% elif r.driver == 'clearpass' %} (ClearPass restarts the affected service on each node){% endif %}. No CA contact. Continue?">
     {{ csrf() }}
     <input type="hidden" name="return" value="{{ origin }}">
     <button type="submit" class="btn secondary {{ size }}" {% if r.renewing or not r.cert.present %}disabled{% endif %}

@@ -9,6 +9,9 @@ services:
     # mounts below stay writable without a chown; the image default (10001)
     # applies when they are absent and preflight then names the exact fix.
     user: "${OACM_UID:-10001}:${OACM_GID:-10001}"
+    # A renewal can run for minutes (DNS propagation wait, activation polling); let a
+    # `docker compose down` finish the job in flight instead of killing it after 10 s.
+    stop_grace_period: 10m
     environment:
       # The server list, admin credential, session secret and renewal history
       # all live in /config, which is bind-mounted below so UI changes survive

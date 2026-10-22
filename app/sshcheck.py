@@ -240,12 +240,35 @@ def open_client(server: ServerConfig) -> paramiko.SSHClient:
 
 
 def run(client: paramiko.SSHClient, cmd: str, timeout: int = _CMD_TIMEOUT) -> tuple[int, str, str]:
-    """Run one command; returns (exit_status, stdout, stderr)."""
+    """Run one command; returns (exit_status, stdout, stderr).
+
+    The wait for the exit status is bounded by ``timeout`` (Paramiko's
+    recv_exit_status() alone waits forever) and output is drained while
+    waiting, so a chatty or hung command can neither block on a full pipe nor
+    stall the pipeline past the deadline.
+    """
+    import time as _time
     _, stdout, stderr = client.exec_command(cmd, timeout=timeout)
-    rc = stdout.channel.recv_exit_status()
-    return (rc,
-            stdout.read().decode(errors="replace").strip(),
-            stderr.read().decode(errors="replace").strip())
+    chan = stdout.channel
+    out, err = bytearray(), bytearray()
+    deadline = _time.monotonic() + timeout
+    while True:
+        while chan.recv_ready():
+            out += chan.recv(65536)
+        while chan.recv_stderr_ready():
+            err += chan.recv_stderr(65536)
+        if chan.exit_status_ready():
+            break
+        if _time.monotonic() >= deadline:
+            chan.close()
+            raise socket.timeout(f"command did not finish within {timeout}s: {cmd!r}")
+        chan.status_event.wait(0.5)
+    while chan.recv_ready():
+        out += chan.recv(65536)
+    while chan.recv_stderr_ready():
+        err += chan.recv_stderr(65536)
+    rc = chan.recv_exit_status()
+    return rc, out.decode(errors="replace").strip(), err.decode(errors="replace").strip()
 
 
 def authorization_probe(command: str) -> str | None:
@@ -274,17 +297,17 @@ def probe_commands(client: paramiko.SSHClient, user: str, commands: list[tuple[s
             continue
         probe = authorization_probe(cmd)
         if probe is None:
-            checks.append({"command": cmd, "ok": True, "note": "not using sudo; authorization not probed"})
+            checks.append({"label": label, "command": cmd, "ok": True, "note": "not using sudo; authorization not probed"})
             continue
         try:
             rc, out, err = run(client, probe)
         except (paramiko.SSHException, socket.timeout, OSError) as exc:
             ok = False
-            checks.append({"command": cmd, "ok": False, "error": f"probe failed: {exc}"})
+            checks.append({"label": label, "command": cmd, "ok": False, "error": f"probe failed: {exc}"})
             continue
         passed = rc == 0
         ok = ok and passed
-        entry = {"command": cmd, "ok": passed, "probe": probe, "exit": rc,
+        entry = {"label": label, "command": cmd, "ok": passed, "probe": probe, "exit": rc,
                  "stdout": out[:500], "stderr": err[:500]}
         if not passed:
             if "password" in (err + out).lower():

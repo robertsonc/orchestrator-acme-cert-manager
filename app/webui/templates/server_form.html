@@ -55,9 +55,12 @@
       <div class="grid2">
         <div class="field">
           <label for="acme_ca">CA {{ m.info('Let\'s Encrypt needs nothing on the host. The lab CA must be initialised on the Docker host first; its identity is pinned there and written to .env.', './setup.sh --with-ca --lab-domain <zone>') }}</label>
+          {% set preset = form.acme_ca in (ca_choices|map(attribute=0)|list) %}
           <select id="acme_ca" name="acme_ca" {% if new_target_only %}disabled{% endif %}>
             {% for value, label in ca_choices %}<option value="{{ value }}" {% if form.acme_ca == value %}selected{% endif %}>{{ label }}{% if value == 'lab' and not lab_ca.available %} — not initialised on this host{% endif %}</option>{% endfor %}
+            {% if not preset and form.acme_ca %}<option value="{{ form.acme_ca }}" selected>Custom directory: {{ form.acme_ca }}</option>{% endif %}
           </select>
+          <input id="acme_ca_url" name="acme_ca_url" value="" placeholder="or an https:// ACME directory URL (ZeroSSL, Sectigo, an internal CA)" {% if new_target_only %}disabled{% endif %} style="margin-top:6px">
           {% if new_target_only %}<input type="hidden" name="acme_ca" value="{{ form.acme_ca }}">{% endif %}
           <p class="hint">Staging has high rate limits but issues browser-untrusted certs. Test there, then switch to production. <strong>Lab CA</strong> issues from the bundled step-ca (DNS-01 via Cloudflare, names under the lab domain only); clients must trust its root.</p>
           <p class="lab-state">

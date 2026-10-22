@@ -70,18 +70,53 @@ def _read() -> list[dict]:
     if not HISTORY_FILE.exists():
         return []
     try:
-        return json.loads(HISTORY_FILE.read_text())
+        data = json.loads(HISTORY_FILE.read_text())
     except (json.JSONDecodeError, OSError):
         return []
+    return data if isinstance(data, list) else []
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text)
+    try:
+        os.replace(tmp, path)
+    except OSError:            # a single-file bind mount cannot be replaced; write in place
+        path.write_text(text)
+        tmp.unlink(missing_ok=True)
 
 
 def add_record(record: RenewalRecord) -> None:
+    """Append one record; the scheduler process and the web UI share the file, so take a cross-process lock."""
+    import fcntl
+    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = HISTORY_FILE.with_name(f".{HISTORY_FILE.name}.lock")
     with _LOCK:
-        items = _read()
-        items.append(record.as_dict())
-        items = items[-_MAX:]
-        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        HISTORY_FILE.write_text(json.dumps(items, indent=2))
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            if HISTORY_FILE.exists() and HISTORY_FILE.stat().st_size:
+                try:
+                    data = json.loads(HISTORY_FILE.read_text())
+                    items = data if isinstance(data, list) else []
+                    if not isinstance(data, list):
+                        raise ValueError("history is not a list")
+                except (json.JSONDecodeError, ValueError, OSError):
+                    # Never overwrite an audit trail we could not read: set it aside instead.
+                    aside = HISTORY_FILE.with_name(f"{HISTORY_FILE.name}.corrupt-{datetime.datetime.now():%Y%m%d%H%M%S}")
+                    try:
+                        os.replace(HISTORY_FILE, aside)
+                    except OSError:
+                        pass
+                    items = []
+            else:
+                items = []
+            items.append(record.as_dict())
+            items = items[-_MAX:]
+            _write_atomic(HISTORY_FILE, json.dumps(items, indent=2))
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
 
 def all_records() -> list[dict]:

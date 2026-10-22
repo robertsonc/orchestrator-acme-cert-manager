@@ -68,8 +68,14 @@
     timer = setTimeout(refresh, interval());
   }
 
+  function focusInside() {
+    var a = document.activeElement;
+    return a && a !== document.body && live.contains(a);
+  }
+
   function refresh() {
-    if (document.hidden || inflight) { schedule(); return; }
+    // Never yank the keyboard focus out from under someone who is on a button or reading a block.
+    if (document.hidden || inflight || focusInside()) { schedule(); return; }
     inflight = true;
     var url = live.getAttribute('data-live');
     fetch(url, { credentials: 'same-origin', headers: { 'X-Requested-With': 'live' } })

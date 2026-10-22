@@ -5,7 +5,6 @@ import datetime as dt
 
 from app import config, store, sysinfo
 from app.models import RenewalRecord
-from app.webui import server as web
 from tests.conftest import make_server
 from tests.test_config_persistence import _lab_pki
 from tests.test_webui import _client, _post

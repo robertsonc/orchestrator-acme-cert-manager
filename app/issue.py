@@ -36,7 +36,7 @@ from pathlib import Path
 
 from cryptography import x509
 
-from . import certs, config
+from . import ari, certs, config
 from .models import StepResult
 
 log = logging.getLogger(__name__)
@@ -90,16 +90,25 @@ def issue_or_renew(cert, force: bool = False) -> StepResult:
                      f"{config.LAB_CA_ROOT})."),
         )
 
-    acme_url = _acme_url(cert)
+    try:
+        acme_url = _acme_url(cert)
+    except ValueError as exc:
+        return StepResult(step=STEP, ok=False, message=str(exc))
     cert_dir = config.cert_dir_for(cert)                   # lego state + flattened files live here
     lego_cert = cert_dir / "certificates" / f"{cert.domain}.crt"
+    lego_meta = cert_dir / "certificates" / f"{cert.domain}.json"
 
-    first_issue = not lego_cert.exists()
+    # Lego itself decides obtain-vs-renew on the .json resource, not the .crt.
+    first_issue = not (lego_cert.exists() and lego_meta.exists())
     pre_mtime = lego_cert.stat().st_mtime if lego_cert.exists() else None
     on_disk = certs.leaf_info(cert_dir / f"{cert.domain}.cer") if not first_issue else dict(certs.ABSENT)
 
     if not force and not first_issue:
-        due, why = certs.due_for_renewal(on_disk)
+        info = None
+        if on_disk.get("present") and on_disk.get("environment") == config.ca_environment(cert.acme_ca):
+            # Same CA environment: ask the CA when it wants this certificate renewed.
+            info = ari.renewal_info(acme_url, (cert_dir / f"{cert.domain}.cer").read_bytes(), verify=_ca_verify(cert))
+        due, why = certs.due_for_renewal(on_disk, info)
         if not due:
             # Nothing to do: keep the flattened files current and report without contacting the CA.
             leaf, key, chain = _flatten(cert_dir, cert.domain)
@@ -151,6 +160,20 @@ def issue_or_renew(cert, force: bool = False) -> StepResult:
             detail={},
         )
 
+    ari_retry = False
+    if proc.returncode != 0 and "--ari-disable" not in cmd and _is_ari_rejection(proc.stderr + proc.stdout):
+        # The CA refused the ARI "replaces" link (certificate from another account or CA, or
+        # already replaced). Lego only retries on "already replaced"; do the rest here, once.
+        log.warning("lego %s for %s: the CA rejected the ARI 'replaces' link; retrying once without ARI",
+                    action, cert.domain)
+        ari_retry = True
+        cmd.append("--ari-disable")
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=LEGO_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return StepResult(step=STEP, ok=False,
+                              message=f"lego {action} timed out after {LEGO_TIMEOUT}s on the retry without ARI", detail={})
+
     if proc.returncode != 0:
         err = (proc.stderr.strip() or proc.stdout.strip())
         log.error("lego failed (%s): %s", proc.returncode, err)
@@ -159,7 +182,8 @@ def issue_or_renew(cert, force: bool = False) -> StepResult:
             step=STEP,
             ok=False,
             message=f"lego {action} failed (exit {proc.returncode}): {last}",
-            detail={"stderr": proc.stderr.strip()[-2000:], "stdout": proc.stdout.strip()[-2000:]},
+            detail={"stderr": proc.stderr.strip()[-2000:], "stdout": proc.stdout.strip()[-2000:],
+                    "ari_retry": ari_retry},
         )
 
     if not lego_cert.exists():
@@ -191,22 +215,61 @@ def issue_or_renew(cert, force: bool = False) -> StepResult:
             "cert": str(leaf),
             "key": str(key),
             "chain": str(chain),
+            "ari_retry": ari_retry,
         },
     )
 
 
+_ARI_MARKERS = ("replaces", "ari", "renewal-info", "renewalinfo", "requester account did not request",
+                "alreadyreplaced", "already replaced", "being replaced")
+
+
+def _is_ari_rejection(output: str) -> bool:
+    low = (output or "").lower()
+    return any(m in low for m in _ARI_MARKERS) and ("replace" in low or "ari" in low)
+
+
+def _ca_verify(cert):
+    """Trust for talking to the ACME directory: the lab root for the lab CA, system roots otherwise."""
+    return str(config.LAB_CA_ROOT) if config.is_lab_ca(cert.acme_ca) else True
+
+
 def _acme_url(cert) -> str:
+    """The ACME directory for acme.ca: a preset id, the lab CA, or an explicit URL. Never a silent default."""
     ca = (cert.acme_ca or "letsencrypt").strip()
     if config.is_lab_ca(ca):
         return config.lab_ca_acme_url()
-    return ca if ca.startswith("http") else _ACME_URLS.get(ca, _ACME_URLS["letsencrypt"])
+    if ca.startswith("http://") or ca.startswith("https://"):
+        return ca
+    if ca in _ACME_URLS:
+        return _ACME_URLS[ca]
+    raise ValueError(f"acme.ca {ca!r} is not 'letsencrypt', 'letsencrypt_test', 'lab' or an ACME directory URL; "
+                     f"refusing to guess a CA for {cert.id!r}")
+
+
+_ENV_PASS = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR",
+             "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy")
+_CLOUDFLARE_PREFIXES = ("CF_", "CLOUDFLARE_")
+# Credentials Lego would prefer over CF_DNS_API_TOKEN; the per-certificate token must win.
+_CLOUDFLARE_COMPETING = {"CLOUDFLARE_DNS_API_TOKEN", "CLOUDFLARE_ZONE_API_TOKEN", "CLOUDFLARE_EMAIL", "CLOUDFLARE_API_KEY",
+                         "CF_API_EMAIL", "CF_API_KEY", "CF_ZONE_API_TOKEN"}
 
 
 def lego_environment(cert, cf_token: str) -> dict[str, str]:
-    """Environment for the Lego subprocess: DNS credentials plus, for the bundled
-    lab CA, the root certificate Lego must trust when talking to the directory."""
-    env = os.environ.copy()
-    if (cert.dns_provider or "cloudflare").strip().lower() == "cloudflare":
+    """Environment for the Lego subprocess, built from an allow-list.
+
+    Lego's `exec` provider runs an arbitrary program with Lego's whole
+    environment, so the container's own secrets (ORCH_API_KEY, CPPM_CLIENT_SECRET,
+    NOTIFY_WEBHOOK_URL, ...) are never passed through. What is: the basics
+    (PATH, proxies, locale), every LEGO_* variable an operator set, the
+    Cloudflare variables for a Cloudflare certificate, the certificate's own
+    dns.env, and the lab root for the bundled CA.
+    """
+    provider = (cert.dns_provider or "cloudflare").strip().lower()
+    env = {k: v for k, v in os.environ.items()
+           if k in _ENV_PASS or k.startswith("LEGO_")
+           or (provider == "cloudflare" and k.startswith(_CLOUDFLARE_PREFIXES) and k not in _CLOUDFLARE_COMPETING)}
+    if provider == "cloudflare":
         env[CF_TOKEN_ENV] = cf_token
     for k, v in (getattr(cert, "dns_env", None) or {}).items():
         if k and v:

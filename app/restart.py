@@ -13,8 +13,6 @@ Key facts learned in the lab:
 from __future__ import annotations
 
 import logging
-import os
-import shutil
 import socket
 import ssl
 import time
@@ -160,16 +158,10 @@ def _rollback_files(server: ServerConfig):
 def _promote_known_good(server: ServerConfig) -> None:
     """Copy the just-verified cert into rollback/ as the new last-known-good."""
     src = config.cert_dir_for(server)
-    d = _rollback_dir(server)
-    d.mkdir(parents=True, exist_ok=True)
     try:
-        shutil.copyfile(src / f"{server.domain}.cer", d / f"{server.domain}.cer")
-        shutil.copyfile(src / f"{server.domain}.key", d / f"{server.domain}.key")
-        shutil.copyfile(src / "ca.cer", d / "ca.cer")
-        os.chmod(d / f"{server.domain}.key", 0o600)
-        drv.write_snapshot_meta(d, drv.CertBundle.from_paths(
-            d / f"{server.domain}.cer", d / f"{server.domain}.key", d / "ca.cer"))
-    except OSError as exc:
+        drv.promote_snapshot(_rollback_dir(server), drv.CertBundle.from_paths(
+            src / f"{server.domain}.cer", src / f"{server.domain}.key", src / "ca.cer"))
+    except (OSError, ValueError) as exc:
         log.warning("could not save known-good cert for %s: %s", server.id, exc)
 
 
@@ -183,6 +175,13 @@ def _attempt_rollback(server: ServerConfig, failed_serial: int) -> StepResult:
 
     snap = drv.CertBundle.from_paths(cert, key, ca)
     failed = drv.CertBundle.for_certificate(server)
+    if snap.serial and snap.serial == failed_serial:
+        return StepResult(STEP, ok=False,
+                          message=("activation did not verify; the certificate on disk is already the last-known-good "
+                                   "one, so there is nothing to roll back to. Check the reload command and that "
+                                   "orchestrator_host is the appliance you expect."),
+                          detail={"rolled_back": False, "reason": "snapshot equals the failed certificate",
+                                  "failed_serial": format(failed_serial, "x")})
     refusal = drv.cross_environment_refusal(server.to_target(), snap, failed)
     if refusal:
         log.error("restart(%s): %s", server.id, refusal)

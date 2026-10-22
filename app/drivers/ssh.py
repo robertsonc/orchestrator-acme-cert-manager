@@ -137,9 +137,9 @@ class SSHDriver(Driver):
             dirs = sorted({posixpath.dirname(s[k]) for k in ("remote_cert_path", "remote_key_path", "remote_chain_path") if s.get(k)})
             for d in dirs:
                 try:
-                    rc, out, err = sshcheck.run(client, f"test -d {shlex.quote(d)} && test -w {shlex.quote(d)}")
+                    rc, _out, err = sshcheck.run(client, f"test -d {shlex.quote(d)} && test -w {shlex.quote(d)}")
                 except (paramiko.SSHException, socket.timeout, OSError) as exc:
-                    rc, out, err = 1, "", str(exc)
+                    rc, err = 1, str(exc)
                 passed = rc == 0
                 ok = ok and passed
                 checks.append({"command": f"writable {d}", "ok": passed, "exit": rc, "stderr": err[:300],

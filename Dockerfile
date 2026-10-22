@@ -1,8 +1,10 @@
 # syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
-ARG LEGO_VERSION=5.3.1
+ARG LEGO_VERSION=5.5.2
 ARG SUPERCRONIC_VERSION=0.2.33
+# linux/amd64 or linux/arm64 (set by buildx; defaults to amd64 for a plain `docker build`)
+ARG TARGETARCH=amd64
 # The service user. docker-compose.yml overrides the uid/gid with OACM_UID/OACM_GID
 # from .env (setup.sh writes your own ids there) so the bind mounts need no chown.
 ARG APP_UID=10001
@@ -12,14 +14,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates openssh-client openssl tini \
     && rm -rf /var/lib/apt/lists/*
 
-# Lego (ACME client)
-RUN curl -fsSL "https://github.com/go-acme/lego/releases/download/v${LEGO_VERSION}/lego_v${LEGO_VERSION}_linux_amd64.tar.gz" \
-        -o /tmp/lego.tar.gz \
-    && tar -xzf /tmp/lego.tar.gz -C /usr/local/bin lego \
-    && rm /tmp/lego.tar.gz
+# Lego (ACME client), verified against the release's checksum file
+RUN set -eu; cd /tmp; \
+    asset="lego_v${LEGO_VERSION}_linux_${TARGETARCH}.tar.gz"; \
+    curl -fsSL "https://github.com/go-acme/lego/releases/download/v${LEGO_VERSION}/${asset}" -o "$asset"; \
+    curl -fsSL "https://github.com/go-acme/lego/releases/download/v${LEGO_VERSION}/lego_${LEGO_VERSION}_checksums.txt" -o lego_checksums.txt; \
+    grep " ${asset}\$" lego_checksums.txt | sha256sum -c -; \
+    tar -xzf "$asset" -C /usr/local/bin lego; \
+    rm -f "$asset" lego_checksums.txt
 
 # supercronic (container-friendly cron)
-RUN curl -fsSL "https://github.com/aptible/supercronic/releases/download/v${SUPERCRONIC_VERSION}/supercronic-linux-amd64" \
+RUN curl -fsSL "https://github.com/aptible/supercronic/releases/download/v${SUPERCRONIC_VERSION}/supercronic-linux-${TARGETARCH}" \
         -o /usr/local/bin/supercronic \
     && chmod +x /usr/local/bin/supercronic
 

@@ -47,6 +47,12 @@ All notable changes to this project are documented here. The format follows
 - **DNS provider passthrough**: `dns.env` variables (stored and redacted like
   other inline secrets) are passed to Lego for any provider; the form has a
   provider field and a variables editor. (#12)
+- **ARI** (RFC 9773): scheduled runs ask the CA for the certificate's
+  suggested renewal window first and renew once it opens (this is how
+  Let's Encrypt requests early renewal after an incident, and in-window
+  renewals are exempt from rate limits); the lifetime rule is the fallback.
+  A `replaces` link the CA rejects (certificate from another account) is
+  retried once without ARI.
 - `python -m app.cli probe <target>` (alias `ssh-test`), `--source` /
   `--actor` on `renew`, `redeploy`, `renew-all`.
 
@@ -71,6 +77,13 @@ All notable changes to this project are documented here. The format follows
 - The settings list groups targets under their certificate; "Delete" removes
   a target, and the certificate with its last target.
 - Logout is a POST.
+- Lego 5.5.2 (from 5.3.1; no CLI changes), verified against the release's
+  checksum file; the Dockerfile downloads the asset for the build
+  architecture (amd64 / arm64).
+- Lego runs with an allow-listed environment (basics, `LEGO_*`, the
+  certificate's DNS variables, Cloudflare's for Cloudflare certificates):
+  the container's own API keys never reach a DNS provider script.
+- Certificates with a lifetime of 10 days or less renew at half the lifetime.
 
 ### Fixed
 - A scheduled renewal and a Force renew/deploy from the UI could run on the

@@ -25,16 +25,37 @@ jobs:
           step version
       - run: pip install -r requirements.txt -r requirements-dev.txt
       - run: python -m compileall -q app
+      - run: ruff check app tests
       - run: python -m pytest -q
         env:
           REQUIRE_STEP_CLI: "1"   # the native lab CA tests must run, not skip
+
+  image:
+    # Builds the cert manager image the way `docker compose up --build` does and
+    # starts it once as the unprivileged user against a throwaway layout, so a
+    # Dockerfile or entrypoint regression fails here, not on an operator's host.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t oacm-ci:test .
+      - name: Unprivileged container runs preflight and the CLI
+        run: |
+          set -euo pipefail
+          mkdir -p ci-config ci-data/certs ci-data/logs ci-data/ssh ci-data/pki/certs
+          cp config/servers.example.json ci-config/servers.json
+          docker run --rm -u "$(id -u):$(id -g)" -e STRICT_STARTUP=false -e IN_CONTAINER=true \
+            -v "$PWD/ci-config:/config" -v "$PWD/ci-data/certs:/data/certs" -v "$PWD/ci-data/logs:/data/logs" \
+            -v "$PWD/ci-data/ssh:/data/ssh:ro" oacm-ci:test python -m app.cli check | tee check.out
+          grep -q "Result: OK" check.out
+          docker run --rm oacm-ci:test sh -c 'id -u; lego --version; supercronic -version 2>&1 | head -1; python -m app.cli --help >/dev/null'
+          docker run --rm oacm-ci:test id -u | grep -qx 10001
 
   shell:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-      - run: bash -n setup.sh upgrade-check.sh app/entrypoint.sh pki/lab-ca-init.sh && shellcheck -S warning setup.sh upgrade-check.sh pki/lab-ca-init.sh
+      - run: bash -n setup.sh upgrade-check.sh pki/lab-ca-init.sh && dash -n app/entrypoint.sh && shellcheck -S warning setup.sh upgrade-check.sh pki/lab-ca-init.sh && shellcheck -S warning -s sh app/entrypoint.sh
 
   lab-ca-smoke:
     # Starts the real step-ca container the way setup.sh does: init on a

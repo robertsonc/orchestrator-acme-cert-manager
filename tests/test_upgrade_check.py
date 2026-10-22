@@ -169,7 +169,7 @@ def test_legacy_config_in_running_container_blocks_until_copied_out(tmp_path):
 
 @pytest.mark.skipif(SSH_KEYGEN is None, reason="ssh-keygen not available")
 def test_env_problems_are_found(tmp_path):
-    env = "SERVERS_FILE=/data/servers.json\r\nCF_DNS_API_TOKEN=your-cloudflare-api-token\r\nORCH_API_KEY=\"quoted\"\r\n"
+    env = "SERVERS_FILE=/data/servers.json\r\nCF_DNS_API_TOKEN=your-cloudflare-api-token\r\nORCH_API_KEY=pa$sword\r\n"
     work = _repo(tmp_path, servers=SERVERS, env=env)
     _good_ssh(work)
     r = _run(work)
@@ -177,7 +177,7 @@ def test_env_problems_are_found(tmp_path):
     assert "CRLF" in r.stdout
     assert "SERVERS_FILE=/data/servers.json" in r.stdout
     assert "no Cloudflare DNS token" in r.stdout
-    assert "quoted values" in r.stdout
+    assert "unquoted $" in r.stdout
 
 
 @pytest.mark.skipif(SSH_KEYGEN is None, reason="ssh-keygen not available")

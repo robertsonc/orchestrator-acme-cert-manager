@@ -170,11 +170,6 @@ def test_clearpass_failure_on_second_node_rolls_back_first(cppm_target, layout):
     t.settings["other_slot_policy"] = "ignore"
     drv = drivers.get("clearpass")
     # take a snapshot of the old (current) certificate as last-known-good
-    d = layout["certs"] / "cppm.example.test"
-    from cryptography.hazmat.primitives import serialization
-    old_pem = old.public_bytes(serialization.Encoding.PEM)
-    new_pem = (d / "cppm.example.test.cer").read_bytes()
-    new_key = (d / "cppm.example.test.key").read_bytes()
     # the on-disk key belongs to `new`; regenerate a consistent old bundle for the snapshot
     snap_dir = drv.snapshot_dir(t); snap_dir.mkdir(parents=True, exist_ok=True)
     old_bundle_dir = layout["certs"] / "old-tmp"; old_cert = _ec_bundle(old_bundle_dir, issuer_cn="CN=Fake LE Intermediate X1")
@@ -260,7 +255,6 @@ def test_edgeconnect_read_only_by_default_then_experimental_write(layout, monkey
     _bundle_files(d, domain="ec-app.example.test", issuer_cn="CN=R3,O=Let's Encrypt,C=US")
     from app import certs as _certs
     new = _certs.leaf_info(d / "ec-app.example.test.cer")
-    old_pem = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
     drv = drivers.get("edgeconnect")
     with pytest.raises(config.ConfigError, match="nePk"):
         drv.normalize({"orchestrator_host": "orch", "ne_pk": "three"})

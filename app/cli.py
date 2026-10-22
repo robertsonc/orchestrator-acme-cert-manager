@@ -198,6 +198,7 @@ def _passphrase(args: argparse.Namespace) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    os.umask(0o077)            # every file this process (and Lego) creates starts owner-only
     _setup_logging()
     p = argparse.ArgumentParser(prog="orchestrator-acme-cert-manager")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -239,7 +240,7 @@ def main(argv: list[str] | None = None) -> int:
     rd.set_defaults(func=_redeploy_one)
 
     ra = sub.add_parser("renew-all", help="full pipeline for all certificates (what the scheduler runs)")
-    ra.add_argument("--force", action="store_true", default=os.environ.get("FORCE_RENEW") == "true")
+    ra.add_argument("--force", action="store_true")
     who(ra)
     ra.set_defaults(func=cmd_renew_all)
 

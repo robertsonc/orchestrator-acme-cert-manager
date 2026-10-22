@@ -218,6 +218,10 @@ def check_servers() -> tuple[list[Finding], dict[str, list[str]]]:
     if not certificates:
         out.append(Finding("info", "no-servers", "no servers configured yet (add one in the web UI)"))
         return out, problems
+    for d in config.duplicate_domains(certificates):
+        out.append(Finding("warn", "duplicate-domain", f"{d}: two certificates share one directory under "
+                           f"{config.CERTS_DIR} and overwrite each other; keep one certificate and add the other "
+                           f"system as a target of it."))
     for c in certificates:
         issued = certs.leaf_info(config.leaf_path_for(c))
         if config.is_lab_ca(c.acme_ca) and not config.lab_ca_available():

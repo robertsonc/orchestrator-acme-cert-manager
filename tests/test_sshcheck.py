@@ -116,7 +116,37 @@ class _FakeClient:
         self.commands.append(cmd)
         rc, out, err = self.responses.pop(0)
 
+        class _Ev:
+            def wait(self_inner, t=None):
+                return True
+
         class _Ch:
+            status_event = _Ev()
+
+            def __init__(self_inner):
+                self_inner._o = out.encode()
+                self_inner._e = err.encode()
+
+            def recv_ready(self_inner):
+                return bool(self_inner._o)
+
+            def recv_stderr_ready(self_inner):
+                return bool(self_inner._e)
+
+            def recv(self_inner, n):
+                d, self_inner._o = self_inner._o[:n], self_inner._o[n:]
+                return d
+
+            def recv_stderr(self_inner, n):
+                d, self_inner._e = self_inner._e[:n], self_inner._e[n:]
+                return d
+
+            def exit_status_ready(self_inner):
+                return True
+
+            def close(self_inner):
+                pass
+
             def recv_exit_status(self_inner):
                 return rc
 

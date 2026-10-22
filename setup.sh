@@ -222,8 +222,11 @@ install_docker() {
     local pm="dnf"; have dnf || pm="yum"
     local repo_os="centos"; [[ "$id" == "fedora" ]] && repo_os="fedora"; [[ "$id" == "rhel" ]] && repo_os="rhel"
     sudo_cmd "$pm" -y install "${pm}-plugins-core" >/dev/null 2>&1 || true
-    if have dnf; then sudo_cmd dnf config-manager --add-repo "https://download.docker.com/linux/${repo_os}/docker-ce.repo"
-    else sudo_cmd yum-config-manager --add-repo "https://download.docker.com/linux/${repo_os}/docker-ce.repo"; fi
+    local repo_url="https://download.docker.com/linux/${repo_os}/docker-ce.repo"
+    if have dnf5 || { have dnf && dnf --version 2>/dev/null | head -1 | grep -qE "^dnf5|^5\."; }; then
+      sudo_cmd dnf config-manager addrepo --overwrite --from-repofile="$repo_url"   # dnf5 syntax (Fedora 41+, RHEL 10)
+    elif have dnf; then sudo_cmd dnf config-manager --add-repo "$repo_url"
+    else sudo_cmd yum-config-manager --add-repo "$repo_url"; fi
     sudo_cmd "$pm" -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   else
     die "unsupported distribution '${id:-unknown}' for automatic Docker install. Install Docker Engine + the Compose plugin per https://docs.docker.com/engine/install/ and re-run with --skip-docker."
@@ -682,6 +685,9 @@ final_test() {
 # ---- main --------------------------------------------------------------------
 cd "$here"
 echo "${c_bold}orchestrator-acme-cert-manager — host setup${c_off}"
+if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "${ALLOW_ROOT:-0}" != "1" ]]; then
+  die "run ./setup.sh as your own user (${SUDO_USER}), not with sudo: it would create root-owned secrets and directories the unprivileged container cannot use, and record uid 0 as the service user. The script calls sudo itself only for the Docker install and sudoers steps. (ALLOW_ROOT=1 overrides.)"
+fi
 if [[ -n "$backup_file" ]]; then do_backup "$backup_file"; exit 0; fi
 if [[ -n "$restore_file" ]]; then do_restore "$restore_file"; exit 0; fi
 ensure_docker
@@ -698,7 +704,15 @@ fi
 [[ -n "$ORCH_DOMAIN" ]] || ORCH_DOMAIN="$ORCH_HOST"
 
 ensure_env
-if [[ $with_ca -eq 1 ]]; then ensure_lab_ca; fi
+if [[ $with_ca -eq 1 ]]; then
+  ensure_lab_ca
+  # A rebuilt ./data/pki is invisible to a running cert manager (its bind mount follows the
+  # old directory inode), so recreate the container when one is up.
+  if [[ $rotate_root -eq 1 ]] && docker_daemon_quiet && [[ -n "$($dcmd ps -q -f name='^orchestrator-acme-cert-manager$' 2>/dev/null)" ]]; then
+    step "Recreating the cert manager so it sees the new lab CA root"
+    $dcmd compose up -d --force-recreate orchestrator-acme-cert-manager && ok "cert manager recreated" || warn "could not recreate the cert manager; run: docker compose up -d --force-recreate orchestrator-acme-cert-manager"
+  fi
+fi
 remote_ok=1
 if [[ -z "$ORCH_HOST" ]]; then
   warn "no Orchestrator host given — skipping config generation and remote steps (re-run with --host)"

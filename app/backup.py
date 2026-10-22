@@ -33,6 +33,8 @@ from pathlib import Path
 from . import __version__, config
 
 MAGIC = b"OACMB1"
+TOOL = "orchestrator-acme-cert-manager"
+FORMAT = 1
 MANIFEST = "backup.json"
 _SECRET_MODES = {"config/servers.json": 0o600, "config/admin.json": 0o600, "config/session.secret": 0o600}
 
@@ -97,7 +99,7 @@ def create(path: str | os.PathLike, include_root: bool = False, passphrase: str 
                     except OSError as exc:
                         skipped.append({"part": arc, "reason": str(exc)})
         manifest = {
-            "format": 1, "app_version": __version__,
+            "tool": TOOL, "format": FORMAT, "app_version": __version__,
             "created": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
             "uid": os.getuid(), "included": included, "skipped": skipped, "include_root": include_root,
             "servers_file": str(config.SERVERS_FILE),
@@ -137,7 +139,6 @@ def restore(path: str | os.PathLike, force: bool = False, passphrase: str = "") 
         names = [m.name for m in members]
         if MANIFEST not in names:
             raise BackupError(f"{src} has no {MANIFEST}; not a backup made by this tool")
-        manifest = json.loads(tar.extractfile(MANIFEST).read())
         # Safety: only plain files/dirs, relative paths under the two roots, no traversal.
         for m in members:
             if m.name == MANIFEST:
@@ -147,6 +148,15 @@ def restore(path: str | os.PathLike, force: bool = False, passphrase: str = "") 
                 raise BackupError(f"refusing archive member outside config/ or data/: {m.name}")
             if not (m.isfile() or m.isdir()):
                 raise BackupError(f"refusing non-regular archive member: {m.name}")
+        manifest = json.loads(tar.extractfile(MANIFEST).read())
+        if not isinstance(manifest, dict) or manifest.get("tool") != TOOL:
+            raise BackupError(f"{src}: manifest was not written by {TOOL}")
+        try:
+            fmt = int(manifest.get("format", 1))
+        except (TypeError, ValueError):
+            raise BackupError(f"{src}: manifest has no readable format number") from None
+        if fmt > FORMAT:
+            raise BackupError(f"{src}: backup format {fmt} is newer than this version understands ({FORMAT})")
         current = Path(config.SERVERS_FILE)
         archived = next((m for m in members if m.name == "config/servers.json"), None)
         if archived is not None and current.exists() and not force:

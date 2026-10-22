@@ -93,20 +93,33 @@ def renew_window_days() -> int | None:
     if not raw:
         return None
     try:
-        return max(0, int(raw))
+        days = int(raw)
     except ValueError:
         return None
+    return days if days > 0 else None          # 0 or negative: the lifetime rule
 
 
-RENEW_FRACTION = 1 / 3   # renew once a third of the lifetime (or less) remains
+RENEW_FRACTION = 1 / 3          # renew once a third of the lifetime (or less) remains ...
+RENEW_FRACTION_SHORT = 1 / 2    # ... or half of it for lifetimes of 10 days or less (LE / Lego / Certbot rule)
+SHORT_LIFETIME_DAYS = 10
 
 
-def due_for_renewal(info: dict[str, Any]) -> tuple[bool, str]:
+def renew_fraction(lifetime_days: float) -> float:
+    return RENEW_FRACTION_SHORT if lifetime_days <= SHORT_LIFETIME_DAYS else RENEW_FRACTION
+
+
+def due_for_renewal(info: dict[str, Any], ari: dict[str, Any] | None = None) -> tuple[bool, str]:
     """Whether the issued certificate should be renewed now, and why.
 
-    Default: renew when a third of the certificate's own lifetime remains (30
-    days for a 90-day certificate, 15 for 45, 2 for 6). RENEW_WINDOW_DAYS, when
-    set, is an absolute days-before-expiry override.
+    Order of precedence:
+      1. RENEW_WINDOW_DAYS, when set: an absolute days-before-expiry window.
+      2. The CA's ARI suggested window (RFC 9773), when ``ari`` is given: due
+         once the window has opened. This is how the CA asks for early renewal
+         after a revocation or incident, and renewals inside it are exempt
+         from rate limits.
+      3. The lifetime rule: renew when a third of the certificate's own
+         lifetime remains (30 days for 90, 15 for 45), or half of it for
+         lifetimes of 10 days or less (about 3.3 days for a 6.7-day one).
     """
     if not info.get("present"):
         return True, "no certificate on disk"
@@ -117,11 +130,19 @@ def due_for_renewal(info: dict[str, Any]) -> tuple[bool, str]:
     if override is not None:
         due = days_left <= override
         return due, (f"{days_left} days left, window {override} days (RENEW_WINDOW_DAYS)")
+    if ari and ari.get("start") and ari.get("end"):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        start, end = ari["start"], ari["end"]
+        if now >= start:
+            return True, (f"ARI window open since {start.isoformat(timespec='minutes')} "
+                          f"(until {end.isoformat(timespec='minutes')})")
+        return False, f"{days_left} days left; ARI window opens {start.isoformat(timespec='minutes')}"
     lifetime = info.get("lifetime_days") or 90
-    window_s = lifetime * 86400 * RENEW_FRACTION
+    fraction = renew_fraction(lifetime)
+    window_s = lifetime * 86400 * fraction
     remaining_s = info.get("seconds_left")
     if remaining_s is None:
         remaining_s = days_left * 86400
     due = remaining_s <= window_s
-    window = max(1, int(lifetime * RENEW_FRACTION + 0.999))
+    window = max(1, int(lifetime * fraction + 0.999))
     return due, f"{days_left} days left of {lifetime}, renews at {window}"

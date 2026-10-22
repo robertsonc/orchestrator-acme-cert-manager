@@ -20,11 +20,13 @@ if ! python -m app.cli check; then
 fi
 python -m app.cli list || true
 
-# Optional one-shot forced renewal on boot (testing)
+# Optional one-shot forced renewal on boot (testing). Only this run is forced:
+# the scheduled runs never read FORCE_RENEW.
 if [ "${FORCE_RENEW}" = "true" ]; then
-  echo "[entrypoint] FORCE_RENEW=true — running renew-all once"
+  echo "[entrypoint] FORCE_RENEW=true — running renew-all --force once"
   python -m app.cli renew-all --force --source cron || true
 fi
+unset FORCE_RENEW
 
 python -m app.webui.server &
 web=$!
@@ -36,9 +38,11 @@ echo "[entrypoint] supercronic started (pid $cron)"
 
 stop_all() {
   trap - TERM INT
-  kill "$web" "$cron" 2>/dev/null || true
-  wait "$web" 2>/dev/null || true
+  # supercronic first: it waits for a running renew-all job (compose stop_grace_period covers it).
+  kill "$cron" 2>/dev/null || true
   wait "$cron" 2>/dev/null || true
+  kill "$web" 2>/dev/null || true
+  wait "$web" 2>/dev/null || true
 }
 trap 'stop_all; exit 0' TERM INT
 

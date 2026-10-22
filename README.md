@@ -605,6 +605,18 @@ Certificate fields:
 | `dns.api_token`     | Inline Cloudflare token. Blank → fall back to `CF_DNS_API_TOKEN`.                                         |
 | `dns.env`           | Provider variables passed to Lego's environment (`{"AWS_ACCESS_KEY_ID": "…"}`); stored like other inline secrets, never echoed. |
 
+DNS providers other than Cloudflare take their variables from `dns.env` (the form's *Provider variables* box; one `KEY=value` per line). The names are Lego's, documented per provider at <https://go-acme.github.io/lego/dns/>; the four most common:
+
+| Provider | `dns.provider` | Required variables | Useful tuning |
+|---|---|---|---|
+| Cloudflare | `cloudflare` | `CF_DNS_API_TOKEN` (the token field, or `.env`) | `CLOUDFLARE_PROPAGATION_TIMEOUT`, `CLOUDFLARE_TTL` |
+| Amazon Route 53 | `route53` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (plus `AWS_REGION`; `AWS_HOSTED_ZONE_ID` to skip zone lookup) | `AWS_PROPAGATION_TIMEOUT`, `AWS_TTL`, `AWS_ASSUME_ROLE_ARN` |
+| Azure DNS | `azuredns` | `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_RESOURCE_GROUP` | `AZURE_ZONE_NAME`, `AZURE_ENVIRONMENT`, `AZURE_PROPAGATION_TIMEOUT` |
+| Infoblox | `infoblox` | `INFOBLOX_HOST`, `INFOBLOX_USERNAME`, `INFOBLOX_PASSWORD` | `INFOBLOX_DNS_VIEW`, `INFOBLOX_WAPI_VERSION`, `INFOBLOX_SSL_VERIFY`, `INFOBLOX_CA_CERTIFICATE` |
+| RFC 2136 dynamic update | `dnsupdate` (`rfc2136` is an alias) | `DNSUPDATE_NAMESERVER`, `DNSUPDATE_TSIG_KEY`, `DNSUPDATE_TSIG_SECRET`, `DNSUPDATE_TSIG_ALGORITHM` | `DNSUPDATE_TTL`, `DNSUPDATE_PROPAGATION_TIMEOUT` |
+
+Lego's `VAR_FILE=/path` convention works for any of them (the plain variable wins when both are set). Lego's `exec` provider runs an arbitrary program, so this tool passes Lego an allow-listed environment (never the container's own API keys); `manual` cannot run unattended. Issuance always uses a fixed `--dns.propagation.wait` (`DNS_PROPAGATION_WAIT`, default `60s`), so the provider's own `*_PROPAGATION_TIMEOUT` is not consulted; raise the wait for slow zones (Route 53 and Azure often need more than 60 s).
+
 Target fields: `id` (global slug), `driver` (`orchestrator`, `ssh`, `clearpass`, `edgeconnect`), `name`, and `settings` as the driver's form shows them (the **System** page lists the drivers; the form shows each field's meaning and, for anything configured on the host, the command that sets it up). Orchestrator settings are the ones above: `orchestrator_host`, `verify_ssl`, `ca_bundle`, `ca_bundle_mode` (`exclusive` / `additive`), `api_key_env`, `api_key`, `allow_cross_env_rollback`, and the `ssh` block (`user`, `key_path`, `known_hosts`, `port`, `restart_command`, `nginx_reload_command`, all validated on save and before every activation).
 
 > Secrets (`dns.api_token`, `dns.env`, `api_key`, `client_secret`) are optional. Set them in the web UI or here; either way the file is written `chmod 600`. **`config/servers.json` is gitignored** and must never be committed.

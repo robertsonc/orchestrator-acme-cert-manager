@@ -138,7 +138,8 @@ def _call(server: ServerConfig, phase: str, url: str, payload: dict, headers: di
     for attempt in range(1, attempts + 1):
         t0 = time.monotonic()
         try:
-            resp = requests.post(url, json=payload, headers=headers, verify=verify, timeout=_TIMEOUT)
+            resp = requests.post(url, json=payload, headers=headers, verify=verify, timeout=_TIMEOUT,
+                                 allow_redirects=False)      # never forward the key or token to another host
         except requests.exceptions.SSLError as exc:
             elapsed = int((time.monotonic() - t0) * 1000)
             last = _failure(server, phase, endpoint, "tls", None, attempt, attempts, elapsed,
@@ -153,6 +154,11 @@ def _call(server: ServerConfig, phase: str, url: str, payload: dict, headers: di
         else:
             elapsed = int((time.monotonic() - t0) * 1000)
             status = resp.status_code
+            if 300 <= status < 400:
+                last = _failure(server, phase, endpoint, "redirect", status, attempt, attempts, elapsed,
+                                excerpt=redact(f"Location: {resp.headers.get('Location', '')}"))
+                retryable = False
+                break
             if resp.ok:
                 log.info("deploy(%s): %s HTTP %s in %dms (attempt %d/%d)",
                          server.id, phase, status, elapsed, attempt, attempts)
@@ -183,6 +189,15 @@ def _failure(server: ServerConfig, phase: str, endpoint: str, kind: str, status:
              attempt: int, attempts: int, elapsed_ms: int, excerpt: str,
              request_id: str | None = None) -> StepResult:
     status_txt = f"HTTP {status}" if status is not None else "no HTTP response"
+    if kind == "redirect":
+        headline = "Certificate validation failed" if phase == "validation" else "Certificate install failed"
+        message = (f"{headline} on {server.id}: {status_txt} ({kind}) on {endpoint} — the Orchestrator answered with a "
+                   f"redirect, which this tool never follows (it would send the private key and API key elsewhere). "
+                   f"Check orchestrator_host; not retried.")
+        return StepResult(STEP, ok=False, message=message, detail={
+            "phase": phase, "kind": kind, "endpoint": endpoint, "status": status, "attempt": attempt,
+            "attempts": attempts, "elapsed_ms": elapsed_ms, "response_excerpt": excerpt,
+            "next_action": "fix orchestrator_host", "server_id": server.id, "host": server.orchestrator_host})
     if kind == "tls":
         headline = "Certificate validation failed" if phase == "validation" else "Certificate install failed"
         explain = ("TLS verification of the Orchestrator API failed: the appliance certificate does not chain "
@@ -220,6 +235,10 @@ def _failure(server: ServerConfig, phase: str, endpoint: str, kind: str, status:
         elif kind == "rejected":
             explain = "the Orchestrator rejected the install request"
             nxt = "check the response excerpt and the API key's role"
+        elif kind == "transient":
+            explain = ("the Orchestrator reverse proxy answered with a gateway error during install — the GMS backend "
+                       "may still have applied the upload")
+            nxt = "do not re-issue; run Force deploy to re-validate and re-install, then verify the served serial"
         else:
             explain = "the Orchestrator returned a server error during install"
             nxt = "run Force deploy once the appliance is healthy; no certificate was activated"

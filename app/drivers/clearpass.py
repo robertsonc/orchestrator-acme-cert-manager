@@ -24,7 +24,6 @@ accepted on your release. Each is reported in the step diagnostics.
 """
 from __future__ import annotations
 
-import base64
 import http.server
 import ipaddress
 import logging
@@ -476,13 +475,21 @@ class ClearPassDriver(Driver):
             svc = self.services(target)
             slot = self.slots(sess, base, {"uuid": "this", "name": "this"}, svc[0] if svc else "HTTPS(RSA)")
             if slot is None:
-                info = dict(certs.ABSENT); info["error"] = "slot not present"; return info
+                info = dict(certs.ABSENT)
+                info["error"] = "slot not present"
+                return info
             pem = slot.get("cert_file") or ""
             if "BEGIN CERTIFICATE" in pem:
-                info = certs.parse_pem(pem.encode()); info["error"] = None; return info
-            info = dict(certs.ABSENT); info["error"] = "no cert_file in the API response"; return info
+                info = certs.parse_pem(pem.encode())
+                info["error"] = None
+                return info
+            info = dict(certs.ABSENT)
+            info["error"] = "no cert_file in the API response"
+            return info
         except (ClearPassError, ValueError) as exc:
-            info = dict(certs.ABSENT); info["error"] = str(exc)[:200]; return info
+            info = dict(certs.ABSENT)
+            info["error"] = str(exc)[:200]
+            return info
 
     def activate_step(self, target: Target, bundle: CertBundle) -> StepResult:
         prep = self._prepared.pop(target.id, None)
@@ -566,7 +573,7 @@ def _resolve(host: str) -> set[str]:
     except ValueError:
         pass
     try:
-        for fam, _, _, _, sockaddr in socket.getaddrinfo(host, None):
+        for _fam, _, _, _, sockaddr in socket.getaddrinfo(host, None):
             out.add(sockaddr[0])
     except OSError:
         pass
@@ -670,16 +677,24 @@ class CallbackServer:
 
             def do_HEAD(self):
                 if not self._allowed() or self.path != outer.path:
-                    self.send_response(404); self.end_headers(); return
-                self.send_response(200); self.send_header("Content-Type", "application/x-pkcs12")
-                self.send_header("Content-Length", str(len(outer.data))); self.end_headers()
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-pkcs12")
+                self.send_header("Content-Length", str(len(outer.data)))
+                self.end_headers()
 
             def do_GET(self):
                 if not self._allowed() or self.path != outer.path:
-                    self.send_response(404); self.end_headers(); return
+                    self.send_response(404)
+                    self.end_headers()
+                    return
                 outer.fetches += 1
-                self.send_response(200); self.send_header("Content-Type", "application/x-pkcs12")
-                self.send_header("Content-Length", str(len(outer.data))); self.end_headers()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-pkcs12")
+                self.send_header("Content-Length", str(len(outer.data)))
+                self.end_headers()
                 self.wfile.write(outer.data)
 
         http.server.ThreadingHTTPServer.allow_reuse_address = True

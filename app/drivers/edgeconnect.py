@@ -89,7 +89,9 @@ class EdgeConnectDriver(Driver):
         return n
 
     def flat(self, target: Target) -> dict:
-        d = dict(target.settings); d["api_key"] = ""; return d
+        d = dict(target.settings)
+        d["api_key"] = ""
+        return d
 
     def display_host(self, target: Target) -> str:
         return f"{target.settings.get('ne_pk', '?')} via {target.settings.get('orchestrator_host', '')}"
@@ -159,14 +161,17 @@ class EdgeConnectDriver(Driver):
             if isinstance(pem, str) and pem.startswith("data:"):
                 pem = base64.b64decode(pem.split(",", 1)[1]).decode(errors="replace")
         if isinstance(pem, str) and "BEGIN CERTIFICATE" in pem:
-            info = certs.parse_pem(pem.encode()); info["error"] = None; info["raw"] = None
+            info = certs.parse_pem(pem.encode())
+            info["error"] = None
+            info["raw"] = None
             return info
         info = dict(certs.ABSENT)
         info["error"] = "Orchestrator returned no PEM certificate for the appliance (response shape unknown on this version)"
         info["raw"] = redact(str(data))[:300]
         if isinstance(data, dict) and data.get("serial"):
             info["serial"] = str(data["serial"]).upper().replace(":", "")
-            info["present"] = True; info["error"] = None
+            info["present"] = True
+            info["error"] = None
         return info
 
     # ---- checks -------------------------------------------------------------
@@ -272,7 +277,9 @@ class EdgeConnectDriver(Driver):
             info.pop("raw", None)
             return info
         except EdgeConnectError as exc:
-            info = dict(certs.ABSENT); info["error"] = str(exc)[:200]; return info
+            info = dict(certs.ABSENT)
+            info["error"] = str(exc)[:200]
+            return info
 
 
 class EdgeConnectError(Exception):

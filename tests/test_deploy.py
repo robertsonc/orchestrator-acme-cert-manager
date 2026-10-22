@@ -28,7 +28,7 @@ def _run(layout, monkeypatch, script):
     """script: list of responses/exceptions consumed by successive requests.post calls."""
     calls = []
 
-    def fake_post(url, json=None, headers=None, verify=None, timeout=None):
+    def fake_post(url, json=None, headers=None, verify=None, timeout=None, **kw):
         calls.append(url)
         item = script.pop(0)
         if isinstance(item, Exception):
@@ -183,7 +183,7 @@ def test_verified_calls_use_combined_trust_whatever_ca_is_configured(layout, mon
     root = _lab_root(layout, monkeypatch, cfg)
     seen = []
 
-    def fake_post(url, json=None, headers=None, verify=None, timeout=None):
+    def fake_post(url, json=None, headers=None, verify=None, timeout=None, **kw):
         seen.append(verify)
         return _Resp(200) if url.endswith("/validation") else _Resp(204)
 

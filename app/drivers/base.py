@@ -185,14 +185,9 @@ class Driver:
     def snapshot(self, target: Target, bundle: CertBundle) -> None:
         """Copy the just-verified bundle into the rollback directory with its metadata."""
         d = self.snapshot_dir(target)
-        d.mkdir(parents=True, exist_ok=True)
         try:
-            shutil.copyfile(bundle.cert, d / bundle.cert.name)
-            shutil.copyfile(bundle.key, d / bundle.key.name)
-            shutil.copyfile(bundle.chain, d / bundle.chain.name)
-            os.chmod(d / bundle.key.name, 0o600)
-            write_snapshot_meta(d, bundle)
-        except OSError as exc:
+            promote_snapshot(d, bundle)
+        except (OSError, ValueError) as exc:
             log.warning("could not save known-good cert for %s: %s", target.id, exc)
 
     def snapshot_bundle(self, target: Target) -> Optional[CertBundle]:
@@ -209,6 +204,12 @@ class Driver:
             return StepResult(step, ok=False,
                               message="activation failed and no previous certificate exists to roll back to",
                               detail={"rolled_back": False, "reason": "no known-good snapshot",
+                                      "failed_serial": failed.serial_hex})
+        if snap.serial and snap.serial == failed.serial:
+            return StepResult(step, ok=False,
+                              message=("activation did not verify; the certificate is already the last-known-good one, "
+                                       "so there is nothing to roll back to"),
+                              detail={"rolled_back": False, "reason": "snapshot equals the failed certificate",
                                       "failed_serial": failed.serial_hex})
         refusal = cross_environment_refusal(target, snap, failed)
         if refusal:
@@ -261,6 +262,37 @@ def activation_timeout() -> int:
 
 def rollback_timeout() -> int:
     return int(os.environ.get("ROLLBACK_POLL_TIMEOUT", "120"))
+
+
+def promote_snapshot(d: Path, bundle: CertBundle) -> None:
+    """Copy cert/key/chain + metadata into ``d`` so a reader never sees a half-written set.
+
+    The three files are staged under a temporary directory next to ``d`` and
+    renamed into place one by one only after all copies succeeded and the key
+    matches the certificate; an earlier snapshot stays intact until then.
+    """
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+    leaf = x509.load_pem_x509_certificate(bundle.cert.read_bytes())
+    key = serialization.load_pem_private_key(bundle.key.read_bytes(), password=None)
+    if leaf.public_key().public_numbers() != key.public_key().public_numbers():
+        raise ValueError("refusing to snapshot: the private key does not match the certificate")
+    d.parent.mkdir(parents=True, exist_ok=True)
+    stage = d.parent / f".{d.name}.tmp-{os.getpid()}"
+    if stage.exists():
+        shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir(mode=0o700)
+    try:
+        for src in (bundle.cert, bundle.key, bundle.chain):
+            fd = os.open(stage / src.name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if src == bundle.key else 0o644)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(src.read_bytes())
+        write_snapshot_meta(stage, bundle)
+        d.mkdir(parents=True, exist_ok=True)
+        for name in (bundle.cert.name, bundle.chain.name, SNAPSHOT_META, bundle.key.name):
+            os.replace(stage / name, d / name)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
 
 
 def write_snapshot_meta(d: Path, bundle: CertBundle) -> None:

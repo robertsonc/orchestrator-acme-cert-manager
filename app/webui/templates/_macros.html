@@ -1,3 +1,5 @@
+{% macro csrf() -%}<input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token() }}">{%- endmacro %}
+
 {% macro status(state, label) -%}
   {%- set glyph = {'ok': '●', 'warning': '▲', 'critical': '✕', 'unknown': '?', 'none': '○', 'working': ''}[state] -%}
   <span class="status {{ state }}"><span class="g" aria-hidden="true">{{ glyph }}</span>{{ label }}</span>
@@ -10,6 +12,10 @@
   {%- else %}<span class="pill quiet">—</span>{% endif -%}
 {%- endmacro %}
 
+{% macro driver_pill(name, label) -%}
+  <span class="pill driver" title="deploy target driver: {{ name }}">{{ label or name }}</span>
+{%- endmacro %}
+
 {% macro serial(s) -%}
   {%- if s %}<span class="mono" title="{{ s }}">{{ s[:6] }}…{{ s[-6:] }}</span>{% else %}<span class="muted">—</span>{% endif -%}
 {%- endmacro %}
@@ -17,6 +23,11 @@
 {% macro outcome(h) -%}
   {%- if h.rolled_back %}<span class="pill bad">rolled back</span>
   {%- else %}<span class="dot {{ h.outcome }}"></span>{{ h.outcome }}{% endif -%}
+{%- endmacro %}
+
+{# who started a run: "scheduler · cron", "alice · web", "root · cli" #}
+{% macro who(h) -%}
+  {%- if h.actor or h.source %}<span class="muted small" title="started by {{ h.actor or '?' }} via {{ h.source or '?' }}">{{ h.actor or '?' }}{% if h.source %} · {{ h.source }}{% endif %}</span>{% else %}<span class="muted small">—</span>{% endif -%}
 {%- endmacro %}
 
 {% macro diag(d, key) -%}
@@ -34,7 +45,8 @@
     {% if d.response_excerpt %}<dt>Response</dt><dd class="mono">{{ d.response_excerpt }}</dd>{% endif %}
     {% if d.stderr %}<dt>stderr</dt><dd class="mono">{{ d.stderr }}</dd>{% endif %}
     {% if d.problems %}<dt>Problems</dt><dd>{% for p in d.problems %}{{ p }}<br>{% endfor %}</dd>{% endif %}
-    {% if d.restored_serial %}<dt>Restored</dt><dd class="mono">{{ d.restored_serial }}</dd>{% endif %}
+    {% if d.restored_serial %}<dt>Restored</dt><dd class="mono">{{ d.restored_serial }}{% if d.cross_environment %} <span class="pill bad">cross-environment</span>{% endif %}</dd>{% endif %}
+    {% if d.snapshot_environment and d.reason %}<dt>Snapshot</dt><dd>{{ d.snapshot_environment }} certificate{% if d.snapshot_serial %} · <span class="mono">{{ d.snapshot_serial }}</span>{% endif %} — {{ d.reason }}</dd>{% endif %}
     {% if d.next_action %}<dt>Next</dt><dd>{{ d.next_action }}</dd>{% endif %}
   </dl>
 </details>
@@ -54,14 +66,17 @@
 
 {% macro action_buttons(r, origin, size='') -%}
   <form method="post" action="{{ url_for('renew', server_id=r.id) }}"
-        data-confirm="Force renew contacts the ACME CA and issues a new certificate for {{ r.domain }}. This counts against Let's Encrypt rate limits. Continue?">
+        data-confirm="Force renew contacts the ACME CA and issues a new certificate for {{ r.domain }}{% if r.siblings %}, then deploys it to every target that shares it ({{ (r.siblings + [r.id])|join(', ') }}){% endif %}. This counts against Let's Encrypt rate limits. Continue?">
+    {{ csrf() }}
     <input type="hidden" name="return" value="{{ origin }}">
     <button type="submit" class="btn {{ size }}" {% if r.renewing %}disabled{% endif %}
-            title="Issue from the ACME CA, then deploy and activate.">Force renew</button>
+            title="Issue from the ACME CA, then deploy and activate{% if r.siblings %} on every target of this certificate{% endif %}.">Force renew</button>
   </form>
-  <form method="post" action="{{ url_for('force_deploy', server_id=r.id) }}">
+  <form method="post" action="{{ url_for('force_deploy', server_id=r.id) }}"
+        data-confirm="Force deploy re-pushes the certificate on disk to {{ r.host }} and activates it{% if r.driver == 'orchestrator' %} (restarts the Orchestrator web service via SSH){% elif r.driver == 'clearpass' %} (ClearPass restarts the affected service on each node){% endif %}. No CA contact. Continue?">
+    {{ csrf() }}
     <input type="hidden" name="return" value="{{ origin }}">
     <button type="submit" class="btn secondary {{ size }}" {% if r.renewing or not r.cert.present %}disabled{% endif %}
-            title="Re-push the certificate already on disk and activate. No CA contact.">Force deploy</button>
+            title="Re-push the certificate already on disk to this target and activate. No CA contact.">Force deploy</button>
   </form>
 {%- endmacro %}

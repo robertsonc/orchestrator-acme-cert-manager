@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import base64
+import logging
+from urllib.parse import urlsplit
+
+import pytest
 import requests
 
 from app import deploy, renew, issue
@@ -15,31 +20,50 @@ class _Resp:
         self.headers = headers or {}
 
 
-def _files(layout):
+_CERT_PEM = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
+_CHAIN_PEM = "-----BEGIN CERTIFICATE-----\nCHAIN\n-----END CERTIFICATE-----\n"
+_KEY_PEM = ("-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQSECRETKEYMATERIAL\n"
+            "-----END PRIVATE KEY-----\n")
+_TOKEN = "tok-SECRET-0123456789abcdef"      # distinctive, so a leak into a log line or a message is unmistakable
+
+
+def _files(layout, cert_text=_CERT_PEM, key_text=_CERT_PEM, ca_text=_CERT_PEM):
     d = layout["certs"] / "orch.example.test"
     d.mkdir(parents=True, exist_ok=True)
     cert, key, ca = d / "orch.example.test.cer", d / "orch.example.test.key", d / "ca.cer"
-    for f in (cert, key, ca):
-        f.write_text("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n")
+    for f, text in ((cert, cert_text), (key, key_text), (ca, ca_text)):
+        f.write_text(text)
     return cert, key, ca
 
 
-def _run(layout, monkeypatch, script):
-    """script: list of responses/exceptions consumed by successive requests.post calls."""
-    calls = []
+def _run(layout, monkeypatch, script, server=None, seen=None, sleeps=None, files=None):
+    """script: list of responses/exceptions consumed by successive requests.post calls.
 
-    def fake_post(url, json=None, headers=None, verify=None, timeout=None):
+    A callable entry is invoked as item(url, call) with the recorded keyword arguments,
+    so a scripted response can echo the request. `seen` collects one dict per call
+    (url plus every keyword argument requests.post received); `sleeps` collects the
+    retry back-off delays that would have been slept.
+    """
+    calls = []
+    sleeps = [] if sleeps is None else sleeps
+
+    def fake_post(url, json=None, headers=None, verify=None, timeout=None, **kw):
+        call = {"url": url, "json": json, "headers": headers, "verify": verify, "timeout": timeout, **kw}
         calls.append(url)
+        if seen is not None:
+            seen.append(call)
         item = script.pop(0)
+        if callable(item):
+            item = item(url, call)
         if isinstance(item, Exception):
             raise item
         return item
 
     monkeypatch.setattr(deploy.requests, "post", fake_post)
-    monkeypatch.setattr(deploy.time, "sleep", lambda s: None)
+    monkeypatch.setattr(deploy.time, "sleep", sleeps.append)
     monkeypatch.setattr(deploy, "VALIDATION_ATTEMPTS", 3)
-    cert, key, ca = _files(layout)
-    res = deploy.deploy_paths(make_server(), cert, key, ca)
+    cert, key, ca = files or _files(layout)
+    res = deploy.deploy_paths(server or make_server(), cert, key, ca)
     return res, calls
 
 
@@ -104,6 +128,170 @@ def test_redact_strips_key_material_and_secrets():
     assert "hunter2" not in out and "MIIE" not in out and "QUJDREVG" not in out
     assert "<redacted>" in out and "<pem-redacted>" in out
     assert len(deploy.redact("x" * 5000)) <= deploy._EXCERPT_LEN + 1
+
+
+# --------------------------------------------------------------------------- request shape and secrecy
+
+
+def _decode_data_uri(uri):
+    head, _, b64 = uri.partition(",")
+    assert head.startswith("data:") and head.endswith(";base64"), uri
+    return head[len("data:"):-len(";base64")], base64.b64decode(b64, validate=True)
+
+
+@pytest.mark.parametrize("verify_ssl", [False, True])
+def test_requests_carry_token_json_payload_and_transport_guards(layout, monkeypatch, verify_ssl):
+    """Both POSTs: X-Auth-Token + JSON, no redirects, the configured verify, a timeout, the PEM files as data URIs."""
+    pinned = layout["data"] / "pinned-ca.pem"
+    pinned.write_text("-----BEGIN CERTIFICATE-----\nPINNED\n-----END CERTIFICATE-----\n")
+    server = make_server(api_key=_TOKEN, verify_ssl=verify_ssl, ca_bundle=str(pinned) if verify_ssl else "")
+    files = _files(layout, cert_text=_CERT_PEM, key_text=_KEY_PEM, ca_text=_CHAIN_PEM)
+    seen = []
+    res, calls = _run(layout, monkeypatch, [_Resp(200, "{}"), _Resp(204)], server=server, seen=seen, files=files)
+    assert res.ok
+    assert calls == [f"{server.base_url}/validation", server.base_url]
+    assert calls[0] == "https://orch.example.test/gms/rest/gms/httpsCertificate/validation"
+    cert, key, ca = files
+    assert len({cert.read_bytes(), key.read_bytes(), ca.read_bytes()}) == 3      # so the field mapping below means something
+    for call in seen:
+        assert call["headers"] == {"Content-Type": "application/json", "X-Auth-Token": _TOKEN}
+        assert call["allow_redirects"] is False
+        if verify_ssl:
+            assert call["verify"] == str(pinned)
+        else:
+            assert call["verify"] is False
+        assert call["timeout"] == deploy._TIMEOUT and call["timeout"] > 0
+        assert "data" not in call and "files" not in call                          # the body goes through json=
+        payload = call["json"]
+        assert set(payload) == {"certificateData", "keyData", "intermediateCertFileContent"}
+        assert _decode_data_uri(payload["certificateData"]) == ("application/x-x509-ca-cert", cert.read_bytes())
+        assert _decode_data_uri(payload["keyData"]) == ("application/octet-stream", key.read_bytes())
+        assert _decode_data_uri(payload["intermediateCertFileContent"]) == ("application/x-x509-ca-cert", ca.read_bytes())
+    assert seen[0]["json"] == seen[1]["json"]
+
+
+def test_private_key_and_api_key_never_reach_logs_or_excerpts(layout, monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    server = make_server(api_key=_TOKEN)
+    files = _files(layout, key_text=_KEY_PEM)
+    key_b64 = base64.b64encode(_KEY_PEM.encode()).decode()
+
+    def echo_request(url, call):        # a misbehaving appliance that reflects the upload in its error body
+        return _Resp(400, '{"error":"rejected","request":{"keyData":"%s"}}' % call["json"]["keyData"])
+
+    rejected, _ = _run(layout, monkeypatch, [echo_request], server=server, files=files)
+    accepted, _ = _run(layout, monkeypatch, [_Resp(200, '{"issuer":"R3"}'), _Resp(204)], server=server, files=files)
+    assert not rejected.ok and rejected.detail["kind"] == "rejected"
+    assert accepted.ok
+    # the deploy logger really was captured, so the negative checks below are meaningful
+    assert "verify_ssl is off" in caplog.text
+    assert "Certificate validation failed" in caplog.text
+    assert "uploaded (validation 200, install 204)" in caplog.text
+    for haystack in (caplog.text, rejected.message, str(rejected.detail), accepted.message, str(accepted.detail)):
+        assert "SECRETKEYMATERIAL" not in haystack
+        assert "PRIVATE KEY" not in haystack
+        assert key_b64 not in haystack
+        assert _TOKEN not in haystack
+    assert "<redacted>" in rejected.detail["response_excerpt"]
+
+
+# --------------------------------------------------------------------------- redirects
+
+
+@pytest.mark.parametrize("status,location", [
+    (301, "https://sso.example.test/login?next=%2Fgms%2Frest"),
+    (302, "http://orch-old.example.test/gms/rest/gms/httpsCertificate/validation"),
+    (307, "https://sso.example.test/"),
+    (308, None),
+])
+def test_redirect_on_validation_is_reported_not_followed_and_not_retried(layout, monkeypatch, status, location):
+    sleeps = []
+    server = make_server(api_key=_TOKEN)
+    headers = {"Location": location} if location else {}
+    res, calls = _run(layout, monkeypatch, [_Resp(status, "", headers=headers)], server=server, sleeps=sleeps)
+    assert not res.ok
+    assert len(calls) == 1 and calls[0].endswith("/validation")        # no retry, no install
+    assert sleeps == []
+    d = res.detail
+    assert d["phase"] == "validation" and d["kind"] == "redirect" and d["status"] == status
+    assert d["attempt"] == 1 and d["attempts"] == 3
+    assert d["endpoint"] == "/httpsCertificate/validation" and d["next_action"] == "fix orchestrator_host"
+    assert "Certificate validation failed" in res.message and f"HTTP {status} (redirect)" in res.message
+    assert "never follows" in res.message and "not retried" in res.message
+    if location:
+        assert urlsplit(location).hostname in d["response_excerpt"]
+    assert _TOKEN not in res.message and _TOKEN not in str(d)
+
+
+def test_redirect_on_install_is_reported_and_not_retried(layout, monkeypatch):
+    sleeps = []
+    server = make_server(api_key=_TOKEN)
+    moved = _Resp(302, "", headers={"Location": "https://elsewhere.example.test/gms/rest/gms/httpsCertificate"})
+    res, calls = _run(layout, monkeypatch, [_Resp(200, "{}"), moved], server=server, sleeps=sleeps)
+    assert not res.ok and len(calls) == 2 and sleeps == []
+    d = res.detail
+    assert d["phase"] == "install" and d["kind"] == "redirect" and d["status"] == 302
+    assert d["attempt"] == 1 and d["attempts"] == 1 and d["endpoint"] == "/httpsCertificate"
+    assert "Certificate install failed" in res.message and "HTTP 302 (redirect)" in res.message
+    assert "never follows" in res.message and "not retried" in res.message
+    assert "elsewhere.example.test" in d["response_excerpt"]
+    assert _TOKEN not in res.message and _TOKEN not in str(d)
+
+
+# --------------------------------------------------------------------------- install-phase failures
+
+
+@pytest.mark.parametrize("status", sorted(deploy.TRANSIENT_STATUSES))
+def test_install_gateway_error_is_transient_not_retried_and_flags_possible_apply(layout, monkeypatch, status):
+    sleeps = []
+    gateway = _Resp(status, "<html>Gateway</html>", headers={"X-Request-Id": "req-42"})
+    res, calls = _run(layout, monkeypatch, [_Resp(200, "{}"), gateway], sleeps=sleeps)
+    assert not res.ok and len(calls) == 2 and sleeps == []
+    d = res.detail
+    assert d["phase"] == "install" and d["kind"] == "transient" and d["status"] == status
+    assert d["attempt"] == 1 and d["attempts"] == 1 and d["request_id"] == "req-42"
+    assert "Certificate install failed" in res.message and f"HTTP {status} (transient)" in res.message
+    assert "may still have applied the upload" in res.message
+    assert "do not re-issue" in d["next_action"] and "Force deploy" in d["next_action"]
+
+
+@pytest.mark.parametrize("exc", [requests.ConnectionError("reset by peer"), requests.ReadTimeout("t/o"),
+                                 requests.ConnectTimeout("slow")], ids=["connection", "read-timeout", "connect-timeout"])
+def test_install_transport_exception_is_not_retried_and_flags_unknown_state(layout, monkeypatch, exc):
+    sleeps = []
+    res, calls = _run(layout, monkeypatch, [_Resp(200, "{}"), exc], sleeps=sleeps)
+    assert not res.ok and len(calls) == 2 and sleeps == []
+    d = res.detail
+    assert d["phase"] == "install" and d["kind"] == "transport" and d["status"] is None
+    assert d["attempt"] == 1 and d["attempts"] == 1
+    assert "no HTTP response (transport)" in res.message and "may or may not have applied" in res.message
+    assert "do not re-issue" in d["next_action"] and "Force deploy" in d["next_action"]
+
+
+# --------------------------------------------------------------------------- authentication failures
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_validation_401_403_is_not_retried_and_never_installs(layout, monkeypatch, status):
+    sleeps = []
+    server = make_server(api_key=_TOKEN)
+    denied = _Resp(status, '{"error":"invalid or expired token"}')
+    res, calls = _run(layout, monkeypatch, [denied], server=server, sleeps=sleeps)
+    assert not res.ok
+    assert len(calls) == 1 and calls[0].endswith("/validation") and sleeps == []
+    d = res.detail
+    assert d["phase"] == "validation" and d["status"] == status and d["attempt"] == 1
+    assert d["kind"] != "transient"
+    assert "Certificate validation failed" in res.message and f"HTTP {status}" in res.message
+    assert "invalid or expired token" in d["response_excerpt"]
+    assert _TOKEN not in res.message and _TOKEN not in str(d)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_validation_401_403_maps_to_auth_kind_with_api_key_guidance(layout, monkeypatch, status):
+    res, _ = _run(layout, monkeypatch, [_Resp(status, '{"error":"invalid token"}')])
+    assert res.detail["kind"] == "auth"
+    assert "API key" in res.message
 
 
 def test_force_deploy_never_contacts_the_ca(layout, monkeypatch):
@@ -183,7 +371,7 @@ def test_verified_calls_use_combined_trust_whatever_ca_is_configured(layout, mon
     root = _lab_root(layout, monkeypatch, cfg)
     seen = []
 
-    def fake_post(url, json=None, headers=None, verify=None, timeout=None):
+    def fake_post(url, json=None, headers=None, verify=None, timeout=None, **kw):
         seen.append(verify)
         return _Resp(200) if url.endswith("/validation") else _Resp(204)
 

@@ -29,6 +29,21 @@
     }
   });
 
+  // ---- driver selector on the target form --------------------------------
+  var driverSel = document.getElementById('driver');
+  if (driverSel) {
+    var sync = function () {
+      var chosen = driverSel.value;
+      document.querySelectorAll('.driver-section').forEach(function (sec) {
+        var on = sec.getAttribute('data-driver') === chosen;
+        if (on) sec.removeAttribute('hidden'); else sec.setAttribute('hidden', '');
+        sec.querySelectorAll('input, select, textarea').forEach(function (el) { el.disabled = !on; });
+      });
+    };
+    driverSel.addEventListener('change', sync);
+    sync();
+  }
+
   // ---- live refresh ------------------------------------------------------
   var BUSY_MS = 8000, IDLE_MS = 45000;
   var live = document.querySelector('[data-live]');
@@ -53,8 +68,14 @@
     timer = setTimeout(refresh, interval());
   }
 
+  function focusInside() {
+    var a = document.activeElement;
+    return a && a !== document.body && live.contains(a);
+  }
+
   function refresh() {
-    if (document.hidden || inflight) { schedule(); return; }
+    // Never yank the keyboard focus out from under someone who is on a button or reading a block.
+    if (document.hidden || inflight || focusInside()) { schedule(); return; }
     inflight = true;
     var url = live.getAttribute('data-live');
     fetch(url, { credentials: 'same-origin', headers: { 'X-Requested-With': 'live' } })

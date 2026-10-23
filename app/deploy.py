@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import time
+from urllib.parse import urlsplit
 from pathlib import Path
 
 import requests
@@ -47,6 +48,20 @@ _DATA_URI_RE = re.compile(r"data:[\w/+.-]+;base64,[A-Za-z0-9+/=]+")
 _LONG_B64_RE = re.compile(r"[A-Za-z0-9+/=]{48,}")
 _SECRET_FIELD_RE = re.compile(r'("(?:password|passPhrase|keyData|certificateData|'
                               r'intermediateCertFileContent|token|apiKey)"\s*:\s*)"[^"]*"', re.I)
+
+
+def _location_summary(location: str) -> str:
+    """scheme://host[:port]/path of a redirect target: no userinfo, query or fragment (they may echo the token)."""
+    if not location:
+        return "<none>"
+    try:
+        u = urlsplit(location)
+    except ValueError:
+        return "<unparseable>"
+    host = u.hostname or ""
+    if u.port:
+        host = f"{host}:{u.port}"
+    return f"{u.scheme}://{host}{u.path}" if u.scheme or host else (u.path or "<none>")
 
 
 def redact(text: str, limit: int = _EXCERPT_LEN) -> str:
@@ -138,7 +153,13 @@ def _call(server: ServerConfig, phase: str, url: str, payload: dict, headers: di
     for attempt in range(1, attempts + 1):
         t0 = time.monotonic()
         try:
-            resp = requests.post(url, json=payload, headers=headers, verify=verify, timeout=_TIMEOUT)
+            resp = requests.post(url, json=payload, headers=headers, verify=verify, timeout=_TIMEOUT,
+                                 allow_redirects=False)      # never forward the key or token to another host
+        except requests.exceptions.SSLError as exc:
+            elapsed = int((time.monotonic() - t0) * 1000)
+            last = _failure(server, phase, endpoint, "tls", None, attempt, attempts, elapsed,
+                            excerpt=redact(str(exc)))
+            retryable = False        # a trust problem does not fix itself between attempts
         except requests.RequestException as exc:
             elapsed = int((time.monotonic() - t0) * 1000)
             kind = "transport"
@@ -148,6 +169,11 @@ def _call(server: ServerConfig, phase: str, url: str, payload: dict, headers: di
         else:
             elapsed = int((time.monotonic() - t0) * 1000)
             status = resp.status_code
+            if 300 <= status < 400:
+                last = _failure(server, phase, endpoint, "redirect", status, attempt, attempts, elapsed,
+                                excerpt=f"Location: {_location_summary(resp.headers.get('Location', ''))}")
+                retryable = False
+                break
             if resp.ok:
                 log.info("deploy(%s): %s HTTP %s in %dms (attempt %d/%d)",
                          server.id, phase, status, elapsed, attempt, attempts)
@@ -155,7 +181,14 @@ def _call(server: ServerConfig, phase: str, url: str, payload: dict, headers: di
                                   detail={"phase": phase, "status": status, "attempts": attempt,
                                           "elapsed_ms": elapsed,
                                           "response_excerpt": redact(resp.text)})
-            kind = "transient" if status in TRANSIENT_STATUSES else ("rejected" if status < 500 else "http")
+            if status in TRANSIENT_STATUSES:
+                kind = "transient"
+            elif status in (401, 403):
+                kind = "auth"
+            elif status < 500:
+                kind = "rejected"
+            else:
+                kind = "http"
             last = _failure(server, phase, endpoint, kind, status, attempt, attempts, elapsed,
                             excerpt=redact(resp.text), request_id=resp.headers.get("X-Request-Id"))
             retryable = kind == "transient" and attempts > 1
@@ -178,12 +211,37 @@ def _failure(server: ServerConfig, phase: str, endpoint: str, kind: str, status:
              attempt: int, attempts: int, elapsed_ms: int, excerpt: str,
              request_id: str | None = None) -> StepResult:
     status_txt = f"HTTP {status}" if status is not None else "no HTTP response"
+    if kind == "redirect":
+        headline = "Certificate validation failed" if phase == "validation" else "Certificate install failed"
+        message = (f"{headline} on {server.id}: {status_txt} ({kind}) on {endpoint} — the Orchestrator answered with a "
+                   f"redirect to {excerpt.removeprefix('Location: ')}, which this tool never follows (it would send the "
+                   f"private key and API key elsewhere). Check orchestrator_host; not retried.")
+        return StepResult(STEP, ok=False, message=message, detail={
+            "phase": phase, "kind": kind, "endpoint": endpoint, "status": status, "attempt": attempt,
+            "attempts": attempts, "elapsed_ms": elapsed_ms, "response_excerpt": excerpt,
+            "next_action": "fix orchestrator_host", "server_id": server.id, "host": server.orchestrator_host})
+    if kind == "tls":
+        headline = "Certificate validation failed" if phase == "validation" else "Certificate install failed"
+        explain = ("TLS verification of the Orchestrator API failed: the appliance certificate does not chain "
+                   "to a trusted root (a staging or self-signed certificate is still being served)")
+        nxt = ("turn off verify_ssl for this target until the production certificate is live, or set "
+               "ca_bundle to the CA that issued the appliance certificate; not retried")
+        message = (f"{headline} on {server.id}: {status_txt} ({kind}) on {endpoint}, "
+                   f"attempt {attempt} of {attempts} — {explain}. Next: {nxt}.")
+        return StepResult(STEP, ok=False, message=message, detail={
+            "phase": phase, "kind": kind, "endpoint": endpoint, "status": status, "attempt": attempt,
+            "attempts": attempts, "elapsed_ms": elapsed_ms, "response_excerpt": excerpt,
+            "next_action": nxt, "server_id": server.id, "host": server.orchestrator_host})
     if phase == "validation":
         if kind == "transient":
             explain = ("transient gateway error from the Orchestrator reverse proxy — the GMS "
                        "backend is probably restarting or overloaded")
             nxt = ("retry with Force deploy (reuses the issued certificate; no CA contact)"
                    if attempt >= attempts else "retrying after backoff")
+        elif kind == "auth":
+            explain = "the Orchestrator refused the API key"
+            nxt = ("check the API key (X-Auth-Token): it must exist, be unexpired, allow this source address and "
+                   "hold READ_WRITE for certificate management; not retried")
         elif kind == "rejected":
             explain = "the Orchestrator rejected the certificate/key/chain payload"
             nxt = "check the response excerpt; verify the key matches the certificate and the chain is complete"
@@ -200,9 +258,16 @@ def _failure(server: ServerConfig, phase: str, endpoint: str, kind: str, status:
             explain = ("the install request did not complete — the appliance may or may not have "
                        "applied it")
             nxt = "do not re-issue; run Force deploy to re-validate and re-install, then verify the served serial"
+        elif kind == "auth":
+            explain = "the Orchestrator refused the API key during install"
+            nxt = "check the API key (X-Auth-Token): validity, expiry, source-address allow list and READ_WRITE role; no certificate was activated"
         elif kind == "rejected":
             explain = "the Orchestrator rejected the install request"
             nxt = "check the response excerpt and the API key's role"
+        elif kind == "transient":
+            explain = ("the Orchestrator reverse proxy answered with a gateway error during install — the GMS backend "
+                       "may still have applied the upload")
+            nxt = "do not re-issue; run Force deploy to re-validate and re-install, then verify the served serial"
         else:
             explain = "the Orchestrator returned a server error during install"
             nxt = "run Force deploy once the appliance is healthy; no certificate was activated"

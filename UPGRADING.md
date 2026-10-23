@@ -11,14 +11,15 @@ Two tools do the work:
 
 ## 1. Find out what you are running
 
-| Marker | 1.0.x (Aug 2026) | 1.1.x | 1.2.x (current) |
-|---|---|---|---|
-| `grep __version__ app/__init__.py` in the checkout | `1.0.0` | `1.1.0` | `1.2.0` |
-| `docker inspect -f '{{.Config.Image}}' orchestrator-acme-cert-manager` | `…:latest` | `…:1.1.0` | `…:1.2.0` |
-| `python -m app.cli check` inside the container | command does not exist | works | works |
-| Web UI | card dashboard, Settings | Fleet / Server pages, dark theme | plus **System** page |
-| `setup.sh` | 21 lines, copies examples only | full host workflow, `--with-ca` | plus `data/pki/certs` ownership, `upgrade-check.sh` |
-| Where the server list lives | `/data/servers.json` unless `SERVERS_FILE` was set | `/config/servers.json`, enforced by preflight | same |
+| Marker | 1.0.x (Aug 2026) | 1.1.x | 1.2.x | 1.3.x (current) |
+|---|---|---|---|---|
+| `grep __version__ app/__init__.py` in the checkout | `1.0.0` | `1.1.0` | `1.2.0` | `1.3.0` |
+| `docker inspect -f '{{.Config.Image}}' orchestrator-acme-cert-manager` | `…:latest` | `…:1.1.0` | `…:1.2.0` | `…:1.3.0` |
+| `python -m app.cli check` inside the container | command does not exist | works | works | works; reports `config-v1` until the first save |
+| Web UI | card dashboard, Settings | Fleet / Server pages, dark theme | plus **System** page | rows are *targets*; CSRF tokens; drivers |
+| `setup.sh` | 21 lines, copies examples only | full host workflow, `--with-ca` | plus `data/pki/certs` ownership, `upgrade-check.sh` | plus `OACM_UID/GID`, `--backup`, `--restore` |
+| Where the server list lives | `/data/servers.json` unless `SERVERS_FILE` was set | `/config/servers.json`, enforced by preflight | same | same; `version: 2` shape after the first save |
+| Container user | root | root | root | unprivileged (`OACM_UID`/`OACM_GID` from `.env`) |
 
 The version of the **checkout** and the version of the **running image** can differ. The running image is what matters for the data-migration steps; the checkout is what you are upgrading to.
 
@@ -89,11 +90,12 @@ Nothing on the appliance is restarted.
 
 ### 3.3 Recreate the container
 
-`docker compose up -d --build` alone is not enough when `.env`, the environment block or the volumes changed; the container has to be recreated:
+`docker compose up -d` alone is not enough when `.env`, the environment block or the volumes changed; the container has to be recreated:
 
 ```bash
 docker compose down
-docker compose up -d --build
+docker compose pull            # the released image for the tag pinned in docker-compose.yml (or: up -d --build to build here)
+docker compose up -d
 docker compose logs --tail 60
 ```
 
@@ -123,7 +125,7 @@ The upgrade is a code change plus a container recreate; data on disk is forward-
 ```bash
 git checkout <previous commit or tag>
 tar -xzf ../oacm-backup-<stamp>.tgz          # only if you need the old .env/config back
-docker compose down && docker compose up -d --build
+docker compose down && docker compose up -d   # the previous checkout pins its own image tag
 ```
 
 Certificates, the renewal history and the admin account are unchanged by either direction. If you roll back to 1.0.x, `config/servers.json` on the host is still read because `.env` now sets `SERVERS_FILE=/config/servers.json`.
@@ -205,6 +207,20 @@ Set the CA back to **Let's Encrypt (production)** and **Force renew**. This spen
 - No data changes. `data/pki/certs` is created by `setup.sh` so that it is owned by you; if Docker already created it (a 1.1 `docker compose up` does), `upgrade-check.sh` reports it and the `chown` to run before any lab CA work.
 - New: the **System** page, `/api/status` with the full snapshot, `/ca/root.pem`, `upgrade-check.sh`, this document.
 
+### From 1.2.x (to 1.3)
+
+- **The container no longer runs as root.** It runs as `OACM_UID:OACM_GID` from `.env` (image default `10001:10001`). Step 3.2 (`./setup.sh …`) writes your own uid/gid there, so `config/` and `data/` stay writable without a `chown`. If you skip `setup.sh`, add the two keys by hand; otherwise the container starts, preflight reports `perm-config-dir` with the exact `chown`, and the web UI cannot save. `upgrade-check.sh` blocks until the keys exist. A `docker compose down && up -d` is required (the `user:` line is a container property).
+- **Configuration shape.** `config/servers.json` is read as before and rewritten as `{"version": 2, "certificates": [...]}` the first time anything is saved from the UI or the CLI. Each old entry becomes one certificate with one Orchestrator *target* carrying the same id, so `/server/<id>`, history and the CLI arguments are unchanged. The System page shows `config-v1` until then. A 1.2 checkout still reads a v1 file, so a rollback before the first save needs nothing; after it, restore `config/servers.json.v1` (written once, when the v1 file is first rewritten; `servers.json.bak` is only the previous save and becomes a v2 file on the second save) or the backup from step 2.2.
+- **Renewal window.** Scheduled runs now renew when a third of the certificate's own lifetime remains instead of at a fixed 30 days. For 90-day certificates that is the same day; for shorter certificates it is proportionally earlier. Set `RENEW_WINDOW_DAYS` in `.env` to keep an absolute window.
+- **Rollback policy.** A failed production activation no longer restores a staging or lab certificate silently: the run fails with the reason and the appliance keeps what it serves. Tick *Allow rollback across CA environments* on a target to get the old behaviour; the message then says a cross-environment rollback happened.
+- **Locks.** A scheduled run and a Force renew/deploy cannot overlap on one certificate. If the upgrade is done while a run is in flight, wait for it: the lock lives in `config/locks/` and is released with the process.
+- **CSRF.** Every button in the UI carries a token tied to a `csrf` cookie. Scripts that POSTed to `/renew/<id>` or `/deploy/<id>` with only the session cookie get 403; use the CLI inside the container instead (`python -m app.cli renew <id> --force`, `redeploy <id>`).
+- **Health check.** `/healthz` reports 503 when no scheduled pass finished within twice the cron interval (24 h with the shipped crontab). On the first start after the upgrade it stays healthy until two intervals have passed. The entrypoint now exits when either the web UI or supercronic dies, so `docker compose ps` shows a restart instead of a half-dead container.
+- **Published image.** The compose service now references `ghcr.io/robertsonc/orchestrator-acme-cert-manager:<version>`; `docker compose up -d` pulls it and only builds when that tag is not published (`up -d --build` always builds from the checkout). The image you built as `orchestrator-acme-cert-manager:1.2.0` is no longer referenced: `docker image rm orchestrator-acme-cert-manager:1.2.0` once 1.3 runs.
+- **Secret variable names.** The Settings form now requires `api_key_env`, `client_secret_env` and similar fields to name a variable that ends in `_API_KEY`, `_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD`, optionally followed by a suffix (`ORCH_API_KEY_LAB` is fine, `ORCHKEY` is not). Existing entries keep working until edited.
+- **SSH to old servers.** The SSH library (paramiko 5) no longer negotiates SHA-1 algorithms. Orchestrator (OpenSSH 7.4 and newer) and any host that offers `rsa-sha2-*`, ECDSA or Ed25519 host keys and a SHA-2 key exchange are unaffected; a server that offers only `ssh-rsa` (SHA-1) host-key signatures, `diffie-hellman-*-sha1` or DSS keys fails Test SSH with a message that says so. Fix it on the server; this tool does not re-enable SHA-1.
+- **New in the UI and CLI.** Deploy targets with drivers (Orchestrator, generic SSH/SCP, ClearPass, EdgeConnect-via-Orchestrator), `python -m app.cli probe <target>`, `backup` / `restore`, actor/source on every run. Nothing needs configuring for an existing Orchestrator entry.
+
 ---
 
 ## 6. Post-upgrade checklist
@@ -216,3 +232,16 @@ Set the CA back to **Let's Encrypt (production)** and **Force renew**. This spen
 - [ ] A Force deploy on one server completed with **Activation: live** (if a window was available).
 - [ ] The backup from step 2.2 is somewhere other than this host.
 - [ ] Lab CA, if enabled: `data/pki-root` is off the host, the root is installed on the clients that need it, and the System page shows the CA as healthy.
+
+---
+
+## 7. Backup and restore (1.3+)
+
+```bash
+./setup.sh --backup ../oacm-$(date +%Y%m%d).tgz                 # .env, config/, data/ (logs excluded; offline root excluded)
+./setup.sh --backup ../oacm-full.tgz --include-root             # also data/pki-root (keep this one offline)
+```
+
+On the new host: clone the repository, `./setup.sh --restore ../oacm-….tgz` (stops if the container is running or the current `config/servers.json` is newer, unless `--force-restore`), then `./setup.sh --host …` to re-check the host key and sudo rule, then `docker compose up -d`. Inside the container, `python -m app.cli backup /config/backup.tgz` and `python -m app.cli restore /config/backup.tgz` do the same for what the container can see (config, certificates, SSH material; the lab CA online state is only visible from the host), optionally encrypted with `--encrypt` and `BACKUP_PASSPHRASE`.
+
+---

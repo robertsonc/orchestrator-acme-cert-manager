@@ -48,6 +48,10 @@ LAB_CA_PORT="${LAB_CA_PORT:-}"        # empty = unspecified: taken from an exist
 LAB_CA_IMAGE="${LAB_CA_IMAGE:-smallstep/step-ca:0.30.2}"
 with_ca=0
 rotate_root=0
+backup_file=""
+restore_file=""
+include_root=0
+force_restore=0
 non_interactive=0
 trust_host_key=0
 skip_docker=0
@@ -84,6 +88,14 @@ Bundled lab CA (optional):
                          On a re-run, values you do not pass are taken from the initialised CA; values
                          you do pass must match it (a CA cannot be renamed in place).
 
+Backup / restore (host side; sees everything, including the lab CA online state):
+  --backup FILE          Write .env, config/ and data/ (logs excluded; data/pki-root only with
+                         --include-root) to FILE as a tar.gz with permissions preserved, then exit.
+  --include-root         With --backup: also include the lab CA OFFLINE root (data/pki-root).
+  --restore FILE         Restore an archive made by --backup into this checkout (stop the stack first).
+                         Refuses to overwrite a newer config/servers.json unless --force-restore.
+  --force-restore        With --restore: overwrite even if the current config is newer.
+
 Behaviour:
   --non-interactive      Never prompt. Docker install is auto-approved; anything needing a human
                          (host-key confirmation without --trust-host-key, password-based key install)
@@ -94,7 +106,9 @@ Behaviour:
                          (shows the exact content, asks for confirmation, validates with visudo).
   --skip-docker          Do not install Docker.
   --skip-remote          Do not connect to the Orchestrator (prints the manual steps instead).
-  --start                Run 'docker compose up -d --build' at the end.
+  --start                Run 'docker compose up -d' at the end (pulls the published image;
+                         builds from this checkout only if the tag is not published).
+  --build                With --start: always build the image from this checkout.
   -h, --help             This text.
 
 Environment equivalents: ORCH_HOST ORCH_DOMAIN ORCH_SSH_USER ORCH_SSH_PORT ORCH_SERVER_ID
@@ -115,6 +129,10 @@ while [[ $# -gt 0 ]]; do
     --key-type) KEY_TYPE="$2"; shift 2 ;;
     --with-ca) with_ca=1; shift ;;
     --rotate-root) with_ca=1; rotate_root=1; shift ;;
+    --backup) backup_file="$2"; shift 2 ;;
+    --include-root) include_root=1; shift ;;
+    --restore) restore_file="$2"; shift 2 ;;
+    --force-restore) force_restore=1; shift ;;
     --lab-domain) LAB_CA_DOMAIN="$2"; shift 2 ;;
     --ca-host) LAB_CA_HOST="$2"; shift 2 ;;
     --ca-name) LAB_CA_NAME="$2"; shift 2 ;;
@@ -125,6 +143,7 @@ while [[ $# -gt 0 ]]; do
     --skip-docker) skip_docker=1; shift ;;
     --skip-remote) skip_remote=1; shift ;;
     --start) start_stack=1; shift ;;
+    --build) build_image=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -206,8 +225,11 @@ install_docker() {
     local pm="dnf"; have dnf || pm="yum"
     local repo_os="centos"; [[ "$id" == "fedora" ]] && repo_os="fedora"; [[ "$id" == "rhel" ]] && repo_os="rhel"
     sudo_cmd "$pm" -y install "${pm}-plugins-core" >/dev/null 2>&1 || true
-    if have dnf; then sudo_cmd dnf config-manager --add-repo "https://download.docker.com/linux/${repo_os}/docker-ce.repo"
-    else sudo_cmd yum-config-manager --add-repo "https://download.docker.com/linux/${repo_os}/docker-ce.repo"; fi
+    local repo_url="https://download.docker.com/linux/${repo_os}/docker-ce.repo"
+    if have dnf5 || { have dnf && dnf --version 2>/dev/null | head -1 | grep -qE "^dnf5|^5\."; }; then
+      sudo_cmd dnf config-manager addrepo --overwrite --from-repofile="$repo_url"   # dnf5 syntax (Fedora 41+, RHEL 10)
+    elif have dnf; then sudo_cmd dnf config-manager --add-repo "$repo_url"
+    else sudo_cmd yum-config-manager --add-repo "$repo_url"; fi
     sudo_cmd "$pm" -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   else
     die "unsupported distribution '${id:-unknown}' for automatic Docker install. Install Docker Engine + the Compose plugin per https://docs.docker.com/engine/install/ and re-run with --skip-docker."
@@ -243,7 +265,7 @@ ensure_daemon() {
   err "could not reach the docker daemon."
   echo "  Check: systemctl status docker  (or: journalctl -u docker --no-pager | tail -20)"
   echo "  If Docker came from snap: sudo snap start docker.  Docker Desktop: start it from the app."
-  echo "  Then re-run ./setup.sh, or 'docker compose up -d --build' once 'docker info' works."
+  echo "  Then re-run ./setup.sh, or 'docker compose up -d' once 'docker info' works."
   return 1
 }
 
@@ -321,6 +343,71 @@ ensure_env() {
   elif ! grep -q '^SERVERS_FILE=/config/servers.json$' "${here}/.env"; then
     warn ".env sets SERVERS_FILE to something other than /config/servers.json — only /config is persistently mounted by docker-compose.yml"
   fi
+  # The cert manager container runs unprivileged as OACM_UID:OACM_GID (1.3+). Using your
+  # own ids keeps the bind mounts writable without any chown.
+  local uid gid; uid="$(id -u)"; gid="$(id -g)"
+  if ! grep -q '^OACM_UID=' "${here}/.env"; then
+    set_env_kv OACM_UID "$uid"; set_env_kv OACM_GID "$gid"
+    ok "set OACM_UID=${uid} OACM_GID=${gid} in .env (the container runs as you; config/ and data/ need no chown)"
+  else
+    local cur; cur="$(grep '^OACM_UID=' "${here}/.env" | tail -1 | cut -d= -f2-)"
+    if [[ "$cur" != "$uid" ]]; then
+      warn "OACM_UID=${cur} in .env but you are uid ${uid}; config/ and data/ must be owned by uid ${cur} (or change OACM_UID and chown)"
+    else ok "OACM_UID/OACM_GID match your ids"; fi
+  fi
+}
+
+# ---- backup / restore (host side) --------------------------------------------
+do_backup() {
+  step "Backup"
+  local out="$1" excl=(--exclude='data/logs' --exclude='config/trust' --exclude='config/locks')
+  [[ $include_root -eq 1 ]] || excl+=(--exclude='data/pki-root')
+  [[ -e "$out" ]] && die "refusing to overwrite existing ${out}"
+  local parts=() p
+  for p in .env config data docker-compose.override.yml; do [[ -e "${here}/${p}" ]] && parts+=("$p"); done
+  [[ ${#parts[@]} -gt 0 ]] || die "nothing to back up in ${here}"
+  ( umask 077; tar -C "$here" "${excl[@]}" -czf "$out" "${parts[@]}" )
+  chmod 600 "$out"
+  ok "wrote ${out} ($(du -h "$out" | cut -f1)): ${parts[*]}$( [[ $include_root -eq 1 ]] && echo ' + data/pki-root' || echo ' (offline root excluded)')"
+  [[ -d "${here}/data/pki-root" && $include_root -eq 0 ]] && warn "data/pki-root is still on this host and was NOT included; move it offline or re-run with --include-root"
+  echo "  Restore on another host: git clone … && ./setup.sh --restore ${out} && ./setup.sh --host … && docker compose up -d"
+}
+
+do_restore() {
+  step "Restore"
+  local in="$1"
+  [[ -f "$in" ]] || die "archive ${in} not found"
+  tar -tzf "$in" >/dev/null 2>&1 || die "${in} is not a readable tar.gz (an encrypted archive from 'cli backup --encrypt' must be restored with 'cli restore')"
+  if docker_daemon_quiet && [[ -n "$($dcmd ps -q -f name='^orchestrator-acme-cert-manager$' 2>/dev/null)" ]]; then
+    die "the cert manager container is running; stop it first: docker compose down"
+  fi
+  if tar -tzf "$in" | grep -qx 'config/servers.json' && [[ -f "${cfg}/servers.json" && $force_restore -eq 0 ]]; then
+    local cur arc
+    cur="$(stat -c %Y "${cfg}/servers.json")"
+    arc="$(tar --full-time -tvzf "$in" config/servers.json | awk '{print $4" "$5}')"
+    if ! arc="$(date -d "$arc" +%s 2>/dev/null)"; then
+      warn "could not read the archived servers.json timestamp (${arc:-empty}); not comparing"; arc=$cur
+    fi
+    if (( cur > arc + 1 )) && ! tar -xzOf "$in" config/servers.json | cmp -s - "${cfg}/servers.json"; then
+      die "config/servers.json on this host is newer than the archived copy; re-run with --force-restore to overwrite it"
+    fi
+  fi
+  local stamp; stamp="$(date +%Y%m%d%H%M%S)"
+  local p
+  for p in config data .env; do
+    [[ -e "${here}/${p}" ]] && { mv "${here}/${p}" "${here}/${p}.pre-restore-${stamp}"; ok "moved existing ${p} aside as ${p}.pre-restore-${stamp}"; }
+  done
+  tar -C "$here" -xzf "$in"
+  chmod 700 "${here}/data/ssh" 2>/dev/null || true
+  chmod 600 "${here}/config/servers.json" "${here}/.env" 2>/dev/null || true
+  ok "restored from ${in}; run ./setup.sh --host <orchestrator> … next (re-pins the host key, checks the sudo rule), then docker compose up -d"
+}
+
+docker_daemon_quiet() {
+  dcmd="docker"
+  docker info >/dev/null 2>&1 && return 0
+  if [[ $EUID -ne 0 ]] && sudo -n docker info >/dev/null 2>&1; then dcmd="sudo docker"; return 0; fi
+  return 1
 }
 
 set_env_kv() {
@@ -603,6 +690,11 @@ final_test() {
 # ---- main --------------------------------------------------------------------
 cd "$here"
 echo "${c_bold}orchestrator-acme-cert-manager — host setup${c_off}"
+if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "${ALLOW_ROOT:-0}" != "1" ]]; then
+  die "run ./setup.sh as your own user (${SUDO_USER}), not with sudo: it would create root-owned secrets and directories the unprivileged container cannot use, and record uid 0 as the service user. The script calls sudo itself only for the Docker install and sudoers steps. (ALLOW_ROOT=1 overrides.)"
+fi
+if [[ -n "$backup_file" ]]; then do_backup "$backup_file"; exit 0; fi
+if [[ -n "$restore_file" ]]; then do_restore "$restore_file"; exit 0; fi
 ensure_docker
 ensure_dirs
 ensure_key
@@ -617,7 +709,15 @@ fi
 [[ -n "$ORCH_DOMAIN" ]] || ORCH_DOMAIN="$ORCH_HOST"
 
 ensure_env
-if [[ $with_ca -eq 1 ]]; then ensure_lab_ca; fi
+if [[ $with_ca -eq 1 ]]; then
+  ensure_lab_ca
+  # A rebuilt ./data/pki is invisible to a running cert manager (its bind mount follows the
+  # old directory inode), so recreate the container when one is up.
+  if [[ $rotate_root -eq 1 ]] && docker_daemon_quiet && [[ -n "$($dcmd ps -q -f name='^orchestrator-acme-cert-manager$' 2>/dev/null)" ]]; then
+    step "Recreating the cert manager so it sees the new lab CA root"
+    $dcmd compose up -d --force-recreate orchestrator-acme-cert-manager && ok "cert manager recreated" || warn "could not recreate the cert manager; run: docker compose up -d --force-recreate orchestrator-acme-cert-manager"
+  fi
+fi
 remote_ok=1
 if [[ -z "$ORCH_HOST" ]]; then
   warn "no Orchestrator host given — skipping config generation and remote steps (re-run with --host)"
@@ -641,7 +741,7 @@ fi
 step "Next steps"
 cat <<EOF
   1. Put the Cloudflare DNS token and Orchestrator API key in .env (or per server in the web UI).
-  2. Start:            docker compose up -d --build
+  2. Start:            docker compose up -d          (pulls the published image; --build builds from this checkout)
   3. Preflight:        docker compose exec -T orchestrator-acme-cert-manager python -m app.cli check
   4. SSH test:         docker compose exec -T orchestrator-acme-cert-manager python -m app.cli ssh-test ${ORCH_SERVER_ID}
   5. Tunnel to the UI: ssh -L 8090:localhost:8090 <user>@<this-host>  →  http://localhost:8090
@@ -657,6 +757,7 @@ fi
 if [[ $start_stack -eq 1 ]]; then
   step "Starting the stack"
   [[ $docker_ready -eq 1 ]] || die "cannot start: the docker daemon is not reachable"
-  if docker compose version >/dev/null 2>&1; then docker compose up -d --build
-  else sudo_cmd docker compose up -d --build; fi
+  up=(compose up -d); [[ ${build_image:-0} -eq 1 ]] && up+=(--build)
+  if docker compose version >/dev/null 2>&1; then docker "${up[@]}"
+  else sudo_cmd docker "${up[@]}"; fi
 fi

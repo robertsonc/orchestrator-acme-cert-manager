@@ -2,9 +2,9 @@
 
 Automated TLS certificate lifecycle management for **HPE Aruba Networking EdgeConnect SD‑WAN Orchestrator**.
 
-This tool issues, deploys, activates, and renews a publicly trusted HTTPS certificate for an Orchestrator appliance. It obtains certificates from [Let's Encrypt](https://letsencrypt.org/) over the ACME protocol using a Cloudflare DNS‑01 challenge, uploads them through the Orchestrator REST API, activates them with a graceful service reload, and **verifies the appliance is actually serving the new certificate**, rolling back to the last known good certificate if anything goes wrong. Everything runs in a single Docker container and is managed from a browser dashboard.
+This tool issues, deploys, activates, and renews a publicly trusted HTTPS certificate for an Orchestrator appliance, and, since 1.3, for anything else a **deploy-target driver** knows how to reach. It obtains certificates from [Let's Encrypt](https://letsencrypt.org/) (or the bundled lab CA) over the ACME protocol using a DNS‑01 challenge, uploads them through the target's API or over SSH, activates them, and **verifies the target is actually serving the new certificate**, rolling back to the last known good certificate if anything goes wrong. Everything runs in a single unprivileged Docker container and is managed from a browser dashboard.
 
-It is the Orchestrator counterpart to the [ClearPass ACME Certificate Manager](https://github.com/sinemad/cppm-acme-cert-manager); the two tools share a design and can run side by side on the same host.
+It started as the Orchestrator counterpart to the [ClearPass ACME Certificate Manager](https://github.com/sinemad/cppm-acme-cert-manager); that tool's deploy path is now a driver here (see [Deploy targets and drivers](#deploy-targets-and-drivers)).
 
 > **Scope / status:** built and validated in a lab against Let's Encrypt staging and production. It is intended for internal/lab use behind a trusted network boundary. Read the [Security Considerations](#security-considerations) before running it anywhere less private.
 
@@ -20,6 +20,7 @@ It is the Orchestrator counterpart to the [ClearPass ACME Certificate Manager](h
 - [Configuration persistence](#configuration-persistence)
 - [How It Works](#how-it-works)
 - [Staging to production](#staging-to-production)
+- [Deploy targets and drivers](#deploy-targets-and-drivers)
 - [Bundled lab CA](#bundled-lab-ca)
 - [Configuration Reference](#configuration-reference)
 - [Web UI](#web-ui)
@@ -36,10 +37,12 @@ It is the Orchestrator counterpart to the [ClearPass ACME Certificate Manager](h
 
 ## Features
 
-- **Full lifecycle, unattended**: issue → deploy → activate, on a schedule (twice daily by default) or on demand.
+- **Full lifecycle, unattended**: issue once → deploy + activate on every target, on a schedule (twice daily by default) or on demand. A certificate is renewed when a third of its own lifetime remains (30 days of 90), so shorter Let's Encrypt lifetimes need no retuning.
+- **Deploy targets with drivers**: one certificate, any number of targets. Drivers for **EdgeConnect Orchestrator** (REST + SSH activation), **generic SSH/SCP** (copy files, run a command, verify on host:port), **ClearPass Policy Manager** (REST, per cluster node) and **EdgeConnect appliances via Orchestrator** (read-only until confirmed on hardware). Each driver owns its settings, preflight, probe, deploy, activation, verification and rollback.
 - **DNS‑01 via Cloudflare**: works for appliances with no public inbound reachability; supports private hosts.
 - **Verified activation**: after reloading the web service, the tool reads the certificate the appliance is *actually serving* and confirms its serial matches what was installed. "Port is up" is not treated as success.
-- **Automatic rollback**: if activation can't be verified, the previous working certificate is re‑deployed and re‑verified, so a bad renewal never takes the appliance offline.
+- **Automatic rollback**: if activation can't be verified, the previous working certificate is re‑deployed and re‑verified, so a bad renewal never takes the appliance offline. The snapshot records which CA issued it; a failed production activation never silently restores a staging or lab certificate (per-target policy).
+- **One run per certificate at a time**: the scheduler and the dashboard share a lock, so a cron pass and a Force renew cannot collide; the dashboard shows a cron run as *working* and says who holds the lock. Every run records who started it and from where (`scheduler · cron`, `alice · web`).
 - **Rate‑limit‑safe re‑deploy**: a **Force deploy** action re‑pushes the certificate already on disk without contacting the CA, so you can recover a deployment without spending a Let's Encrypt issuance.
 - **Bundled lab CA (optional)**: a name-constrained `step-ca` in the same Compose stack issues browser-trustable certificates for every management interface in the lab over ACME (DNS-01 via Cloudflare), with a CRL and a root you distribute once. Picked per server like staging or production.
 - **Guided host setup**: `setup.sh` installs Docker if needed, generates a dedicated SSH key, pins the Orchestrator host key, installs the public key, checks the `sudo` rule, and verifies the whole SSH path before the container ever starts.
@@ -48,8 +51,10 @@ It is the Orchestrator counterpart to the [ClearPass ACME Certificate Manager](h
 - **Lifecycle visibility**: the dashboard shows the **issued** certificate (local), the **served** certificate (what clients get on `:443`), whether each is **staging** or **production**, and an **activation** state (live / pending / unknown).
 - **Ops-console dashboard**: a fleet overview with a per-server health roll-up and a detail page per Orchestrator (pipeline timeline, diagnostics, SSH/API state, history); dark-first with a light theme; live refresh without a build step or external assets.
 - **Per‑server secrets with env fallback**: the Cloudflare token and Orchestrator API key can be stored per server (never echoed back to the browser) or supplied via environment variables.
-- **Authentication**: a first‑run Setup flow and a login gate protect the dashboard and settings.
+- **Authentication**: a first‑run Setup flow and a login gate protect the dashboard and settings; every button carries a CSRF token, sign-in locks after repeated failures, the container runs unprivileged.
 - **Failure alerts**: a webhook (email, Slack, etc.) fires when a renewal fails.
+- **Backup and restore**: one command for config, certificates, SSH material and the lab CA state; restore refuses to overwrite a newer configuration and runs preflight.
+- **Health that means something**: `/healthz` turns unhealthy when scheduled runs stop happening, and the container restarts when either of its processes dies.
 
 ---
 
@@ -57,7 +62,7 @@ It is the Orchestrator counterpart to the [ClearPass ACME Certificate Manager](h
 
 - A **Linux host** (Ubuntu/Debian or a RHEL‑family distribution) that can reach the internet and the Orchestrator. `setup.sh` installs **Docker Engine + Compose plugin** from Docker's official repository if they are missing.
 - A **domain in Cloudflare** for the appliance's hostname, plus a **Cloudflare API token** scoped to *Edit zone DNS* for that zone.
-- An **EdgeConnect Orchestrator** with:
+- For an **EdgeConnect Orchestrator** target:
   - a **Read‑Write API key** (Orchestrator → *Users & Authentication → API Keys*), and
   - an account you can **SSH into with a public key**, with passwordless `sudo` scoped to the service restart and the `nginx` reload (see [Configure SSH key authentication](#configure-ssh-key-authentication)).
 - A **DNS A record** for the appliance hostname pointing at the Orchestrator (DNS‑only, not proxied).
@@ -70,18 +75,27 @@ It is the Orchestrator counterpart to the [ClearPass ACME Certificate Manager](h
 ```
 orchestrator-acme-cert-manager/
 ├── app/
-│   ├── cli.py                 # CLI: list / check / ssh-test / issue / deploy / restart / renew / redeploy
-│   ├── config.py              # load/save servers.json; path resolution; secret resolution (inline → env)
-│   ├── preflight.py           # startup checks: config persistence, legacy files, SSH settings, credentials
+│   ├── cli.py                 # CLI: list / check / probe / issue / deploy / restart / renew / redeploy / backup / restore
+│   ├── config.py              # load/save servers.json (v1 migrated in memory, v2 written); secrets (inline → env)
+│   ├── models.py              # Certificate, Target, ServerConfig (legacy view), StepResult, RenewalRecord
+│   ├── drivers/               # deploy-target drivers behind one contract (base.py)
+│   │   ├── orchestrator.py    #   EdgeConnect Orchestrator: deploy.py + restart.py + sshcheck.py, unchanged
+│   │   ├── ssh.py             #   generic SSH/SCP: SFTP upload, activation command, verify on host:port
+│   │   ├── clearpass.py       #   ClearPass: OAuth2, per-node PUT of a PKCS#12 served by a callback listener
+│   │   └── edgeconnect.py     #   EdgeConnect appliance via Orchestrator: read-only + experimental passthrough
+│   ├── preflight.py           # startup checks: config persistence, permissions, per-target driver preflight
 │   ├── sshcheck.py            # SSH settings validation, pinned-host-key client, sudo authorization probe
-│   ├── issue.py               # stage 1 — Lego ACME issuance (DNS-01 / Cloudflare)
-│   ├── deploy.py              # stage 2 — upload via Orchestrator httpsCertificate API (retries, diagnostics)
-│   ├── restart.py             # stage 3 — SSH restart + served-cert verify + rollback
-│   ├── renew.py               # orchestrates the three stages; records history; alerts
-│   ├── store.py               # renewal history persistence (history.json)
+│   ├── issue.py               # stage 1 — Lego ACME issuance (DNS-01); renewal window from the cert's lifetime
+│   ├── deploy.py              # Orchestrator httpsCertificate API upload (retries, diagnostics)
+│   ├── restart.py             # Orchestrator SSH restart + served-cert verify + rollback (environment guard)
+│   ├── renew.py               # issue once, then deploy + activate per target; locks; history; alerts
+│   ├── locks.py               # per-certificate flock shared by the scheduler and the web UI
+│   ├── certs.py               # certificate parsing, served-cert probe, renewal-window rule
+│   ├── backup.py              # backup / restore archives (optionally encrypted)
+│   ├── store.py               # renewal history (history.json) and scheduler state (scheduler.json)
 │   ├── notify.py              # webhook failure alerts
-│   ├── models.py              # ServerConfig, StepResult, RenewalRecord
-│   ├── entrypoint.sh          # runs preflight, then supercronic + the web server
+│   ├── sysinfo.py             # System page data: environment, scheduler, SSH material, lab CA
+│   ├── entrypoint.sh          # preflight, then the web server and supercronic, supervised
 │   └── webui/
 │       ├── server.py          # Flask app: fleet + server pages, live fragments, settings CRUD, Test SSH, auth
 │       ├── auth.py            # PBKDF2 login + HMAC-signed sessions
@@ -92,6 +106,8 @@ orchestrator-acme-cert-manager/
 │   ├── servers.example.json   # template for servers.json
 │   ├── servers.json           # the live server list (created by setup.sh or the web UI)
 │   ├── history.json           # renewal history
+│   ├── scheduler.json         # last scheduled pass (read by /healthz)
+│   ├── locks/                 # per-certificate run locks
 │   ├── admin.json             # web UI admin credential
 │   └── session.secret         # cookie signing key
 ├── data/                      # runtime state (gitignored)
@@ -110,8 +126,9 @@ orchestrator-acme-cert-manager/
 ├── docker-compose.override.yml.example
 ├── .env.example               # copy → .env (setup.sh does this)
 ├── requirements.txt / requirements-dev.txt
-├── setup.sh                   # host preparation (Docker, key, host key, sudo check, lab CA init)
+├── setup.sh                   # host preparation (Docker, key, host key, sudo check, lab CA init, backup/restore)
 ├── upgrade-check.sh           # read-only host readiness report before an upgrade or lab CA enablement
+├── CHANGELOG.md
 └── UPGRADING.md               # version-to-version upgrade steps and lab CA enablement on an existing host
 ```
 
@@ -141,13 +158,13 @@ The script is idempotent and safe to re‑run. In order it:
 | Docker | Installs Docker Engine + the Compose plugin from Docker's official repository if `docker compose` is missing (Ubuntu/Debian/RHEL‑family), enables the service, adds you to the `docker` group. | No |
 | Directories | Creates `data/{certs,logs,ssh}` and `config/` with restrictive permissions. | No |
 | SSH key | Generates `data/ssh/orch_restart` (RSA‑4096, no passphrase) if absent. | No |
-| `.env` / `servers.json` | Creates both from the examples with your host, user, port and email. The CA starts as **staging**. | No |
+| `.env` / `servers.json` | Creates both from the examples with your host, user, port and email. The CA starts as **staging**. Writes `OACM_UID`/`OACM_GID` (your own ids) so the unprivileged container can write `config/` and `data/`. | No |
 | Host key | Runs `ssh-keyscan`, **shows the fingerprints and asks you to confirm** them against a trusted reference, then pins them in `data/ssh/known_hosts`. | Read only |
 | Public key | If key auth does not work yet, offers to install the public key via `ssh-copy-id` (the appliance prompts for the account password once). | Appends one line to `~/.ssh/authorized_keys` |
 | `sudo` rule | Probes `sudo -n -l` for both activation commands. If not permitted, prints the exact `sudoers` line an administrator must add. With `--install-sudoers` it offers to write that drop‑in itself, after confirmation and `visudo` validation. | Only with `--install-sudoers` |
 | Final test | Key authentication + `sudo -n -l` for both commands. Nothing is restarted. | Read only |
 
-Useful flags: `--non-interactive` (no prompts; anything that needs a human is reported and skipped), `--trust-host-key` (pin without the prompt, only after you verified the fingerprint), `--skip-docker`, `--skip-remote` (print the manual steps instead), `--start` (run `docker compose up -d --build` at the end), `--ssh-port`, `--server-id`, `--key-type ed25519`. Run `./setup.sh --help` for the full list. Every option also has an environment variable (`ORCH_HOST`, `ORCH_SSH_USER`, `ACME_EMAIL`, …) for scripted use.
+Useful flags: `--non-interactive` (no prompts; anything that needs a human is reported and skipped), `--trust-host-key` (pin without the prompt, only after you verified the fingerprint), `--skip-docker`, `--skip-remote` (print the manual steps instead), `--start` (run `docker compose up -d` at the end; add `--build` to build the image from the checkout), `--ssh-port`, `--server-id`, `--key-type ed25519`. Run `./setup.sh --help` for the full list. Every option also has an environment variable (`ORCH_HOST`, `ORCH_SSH_USER`, `ACME_EMAIL`, …) for scripted use.
 
 If you prefer to do the SSH steps by hand, follow [Configure SSH key authentication](#configure-ssh-key-authentication) and run `./setup.sh --skip-remote`.
 
@@ -155,12 +172,14 @@ If you prefer to do the SSH steps by hand, follow [Configure SSH key authenticat
 
 Edit `.env` and set `CF_DNS_API_TOKEN` and `ORCH_API_KEY`, **or** leave them blank and enter them per server in the web UI later (the inline value wins; the env var is the fallback). Keep values unquoted; if you edited the file on Windows, strip carriage returns with `sed -i 's/\r$//' .env`.
 
-### 4. Build and start
+### 4. Start
 
 ```bash
-docker compose up -d --build
+docker compose up -d            # pulls ghcr.io/robertsonc/orchestrator-acme-cert-manager:<version>
 docker compose logs --tail 50
 ```
+
+Every tagged release publishes a multi-arch image (linux/amd64, linux/arm64) to GHCR; `docker-compose.yml` pins the exact version, never `:latest`. If that tag is not published (you are running an unreleased checkout) Compose builds the image from the checkout instead; `docker compose up -d --build` always builds locally. See [Releases and the published image](#releases-and-the-published-image) to verify an image before running it.
 
 The container runs a **preflight** on start and exits with an explanation if the configuration path is not persistently mounted or a legacy `/data/servers.json` would be ignored (see [Configuration persistence](#configuration-persistence)). Confirm the checks and the SSH path from inside the container:
 
@@ -338,7 +357,7 @@ chmod 600 config/servers.json
 rm config/servers.from-container.json
 
 # 4. Recreate with the new image (the preflight now verifies the path is persistent).
-docker compose down && docker compose up -d --build
+docker compose down && docker compose up -d
 docker compose exec -T orchestrator-acme-cert-manager python -m app.cli check
 ```
 
@@ -360,11 +379,13 @@ Each renewal runs three stages in order and **stops on the first failure**, so a
    - Nothing in this stage talks to the ACME CA, so retries never consume an issuance.
 3. **Activate + verify** (`restart.py`) — validates the SSH settings (`sshcheck.validate`), connects with the pinned host key, runs the restart and `nginx` reload, then polls the appliance on `:443` and compares the **served certificate's serial** to the one just deployed. On success the certificate is snapshotted as the new known‑good; on failure the tool re‑deploys the previous known‑good certificate and re‑verifies.
 
-`renew.py` coordinates the stages, writes a record of every run (including the failed step's full diagnostic detail) to the history store, and sends a failure alert. It also exposes **`redeploy_server()`** (the *Force deploy* path) which runs **deploy → activate only**.
+`renew.py` coordinates the stages: **issue once per certificate**, then **deploy → activate for each of its targets** in order, stopping at the first failure. Every run is recorded (with the failed step's full diagnostic detail, the target it failed on, and who started it) and a failure alert is sent. **Force deploy** runs deploy → activate for one target from the certificate already on disk. The stages above describe the Orchestrator driver; other drivers implement the same steps their own way (see [Deploy targets and drivers](#deploy-targets-and-drivers)).
+
+A run holds the certificate's **lock** (`config/locks/<id>.lock`, an `flock` the kernel releases if the process dies) for its whole duration. The scheduler skips a locked certificate and says so; the dashboard refuses to start a second run and shows who holds the lock; the CLI exits 3.
 
 ### Scheduled renewal
 
-`supercronic` reads `config/crontab` and triggers a renewal at **02:00 and 14:00**. Each scheduled run only renews a certificate that is within its renewal window (≈30 days of expiry); otherwise it does nothing.
+`supercronic` reads `config/crontab` and triggers a renewal at **02:00 and 14:00**. Each scheduled run only renews a certificate that is due: by default when **a third of the certificate's own lifetime** remains (30 days for a 90-day certificate, 15 for 45, 2 for 6). Set `RENEW_WINDOW_DAYS` for an absolute window instead. When nothing is due, Lego is not run at all. Each pass records its outcome in `config/scheduler.json`; `/healthz` reports 503 once no pass has finished within twice the cron interval, and the System page shows the same.
 
 ### Authentication
 
@@ -405,11 +426,52 @@ and the run is recorded as **failed**, never as a successful renewal. **Force de
 
 If the Issued badge says **staging** while the server is configured for production (or vice versa), the card says so; run **Force renew** to issue from the configured CA.
 
+**Rollback never crosses environments by default.** The last-known-good snapshot records which CA issued it. If a *production* activation fails and the only snapshot is a *staging* (or lab) certificate, the run fails with that reason and the appliance keeps whatever it serves, instead of quietly going back to a browser-untrusted certificate. Tick **Allow rollback across CA environments** on the target to change that; the result then says a cross-environment rollback happened. The server page shows the rollback target (serial, environment, when it was taken).
+
+---
+
+## Deploy targets and drivers
+
+Since 1.3 the unit of configuration is a **certificate** (name, ACME CA, DNS provider) with one or more **targets**. A target is a driver plus its settings; the driver owns everything product-specific:
+
+| Step | What the driver does |
+|---|---|
+| `preflight` | static checks of the settings and credentials, no side effects (Settings form, `cli check`, System page) |
+| `probe` | live, non-disruptive connectivity and authorization test (the **Test SSH / Test API** button, `cli probe`) |
+| `deploy` | put the certificate where the product takes it; safe to repeat |
+| `activate` | the disruptive step (service restart, PUT that restarts a service) |
+| `verify` | what clients actually get: the served certificate on host:port, or the certificate the product's API reports |
+| `snapshot` / `rollback` | last-known-good handling with the environment guard above |
+
+A pre-1.3 `servers.json` entry becomes one certificate with one Orchestrator target of the same id, automatically; the file is rewritten in the new shape when something is saved. Fleet rows are targets; a certificate shared by several targets shows the same **Issued** certificate on each row with its own **Served** and **Activation** state. **Force renew** issues once and deploys to every target of that certificate; **Force deploy** re-pushes to the one target. Add a target to an existing certificate from **Settings → + Target**.
+
+### EdgeConnect Orchestrator
+
+What this tool has always done: REST validate/install, SSH restart + nginx reload, served-serial check on :443, rollback. Settings and behaviour are unchanged; see the sections above.
+
+### Generic SSH/SCP
+
+For anything with an SSH management plane and no product API. Settings: host, SSH user/port/key/known_hosts (the same pinned-host-key client as the Orchestrator driver), remote paths for the certificate, private key (written mode 600) and optionally the chain, a **full-chain** switch for daemons that want leaf + chain in one file, an optional **activation command** (`sudo /bin/systemctl reload nginx`), and the host:port whose served certificate is verified. Files are uploaded over SFTP to a temporary name and renamed into place. **Test SSH** checks authentication, that the remote directories are writable, and `sudo -n -l` for the activation command.
+
+### ClearPass Policy Manager
+
+Ported from the ClearPass ACME tool and rebuilt on what the API documents (identical in 6.11, 6.12 and 6.14): `PUT /api/server-cert/name/{server_uuid}/{service_name}` with a **PKCS#12 URL and passphrase**. ClearPass fetches the file itself, so the driver runs a short-lived **callback listener** on `callback_host:callback_port` (publish the port on the cert manager service: `ports: ["8765:8765"]` in `docker-compose.override.yml`, reachable from every node) that serves one random path to the cluster's addresses only and stops when the run ends. Authentication is OAuth2 client credentials (`POST /api/oauth`; create the API client under *Administration → API Services → API Clients* with an operator profile that has API access and Certificates read/write, plus Server Manager read for the node list; the secret can come from `CPPM_CLIENT_SECRET`).
+
+Nodes come from `GET /api/cluster/server` (all, or a list); subscribers are updated first and the entry node last, one at a time, each verified (API-reported certificate, and the certificate served on the node's :443 with the certificate name as SNI) before the next. Installing *is* the activation: ClearPass restarts the service on that node when the PUT lands (web UI/guest portal for HTTPS, RADIUS for RADIUS/RadSec). If a node fails, the nodes already updated in that run are rolled back from the snapshot.
+
+**Slots and key types.** ClearPass 6.10+ has two HTTPS slots, **HTTPS(RSA)** and **HTTPS(ECC)**; ECC-capable clients get the ECC certificate when that slot is enabled, and the ECC slot rejects RSA keys. A target selects its slots (HTTPS(RSA), HTTPS(ECC), RADIUS, RadSec). This tool issues one key type per certificate, so to serve both slots create **two certificates** (one `rsa2048`, one `ec256`) each with its own ClearPass target. When only one HTTPS slot is in scope and the other is enabled with a different certificate, the default policy **blocks** the run and explains why; `warn` and `ignore` are available.
+
+Confirm on your cluster before the first production run: that the nodes can reach the callback port, that an `http://` callback is accepted on your release, and the PUT timing (the driver reports each in its diagnostics). Trust-list management (adding the issuing CA to *Certificates → Trust List*) is not automated yet.
+
+### EdgeConnect appliance via Orchestrator
+
+What is documented: Orchestrator reports an appliance's certificate (`GET /gms/rest/httpsCertificate?nePk=`) and proxies appliance REST calls (`/gms/rest/appliance/rest?nePk=&url=`). The appliance's own install endpoint "must restart nodejs manually" and HPE documents direct uploads as overwritten by Orchestrator synchronization; the supported paths are the **HTTPS Certificate template** (schema not public) or **EST end-entity profiles** (9.4.3+, the appliance generates its own key). So this driver ships the read-only parts for real (version, appliance state, reachability, the reported certificate; **Test Orchestrator API**) and keeps the write path behind an explicit **experimental passthrough write** switch with a configurable process to restart. Enable it only after confirming on a lab appliance; until then the target is monitor-only.
+
 ---
 
 ## Bundled lab CA
 
-Public CAs will happily issue for a public DNS name that resolves to a private address (DNS-01 proves zone control, not reachability), and that is still the right choice for anything that should be trusted by default. The bundled CA is for the cases a public CA does not fit: names you don't want in certificate transparency logs, issuance you want governed locally with your own root, and devices that enroll over EST rather than ACME (phase 2). Issuance through this tool still uses DNS-01 against Cloudflare, so the runner needs to reach the Cloudflare API and the CA must be able to validate the challenge in public DNS; hosts may be privately addressed, but an air-gapped lab or a purely private DNS zone cannot use the automatic ACME path as shipped (other DNS providers are a separate epic). ClearPass's EST cannot issue server certificates, which is what started this. It is a `step-ca` container next to the cert manager, issuing over ACME with the same Cloudflare DNS-01 flow this tool already uses. Install its root where you choose and lab-CA hosts get a clean padlock there. Decide which names are lab-only before distributing a trusted root; the name constraint should cover exactly those.
+Public CAs will happily issue for a public DNS name that resolves to a private address (DNS-01 proves zone control, not reachability), and that is still the right choice for anything that should be trusted by default. The bundled CA is for the cases a public CA does not fit: names you don't want in certificate transparency logs, issuance you want governed locally with your own root, and devices that enroll over EST rather than ACME (phase 2; step-ca has no native EST, so that phase is an EST gateway in front of it). Issuance through this tool still uses DNS-01 against Cloudflare, so the runner needs to reach the Cloudflare API and the CA must be able to validate the challenge in public DNS; hosts may be privately addressed, but an air-gapped lab or a purely private DNS zone cannot use the automatic ACME path as shipped (other DNS providers are a separate epic). ClearPass's EST cannot issue server certificates, which is what started this. It is a `step-ca` container next to the cert manager, issuing over ACME with the same Cloudflare DNS-01 flow this tool already uses. Install its root where you choose and lab-CA hosts get a clean padlock there. Decide which names are lab-only before distributing a trusted root; the name constraint should cover exactly those.
 
 ### What it is, and what keeps it lab-safe
 
@@ -420,7 +482,7 @@ Public CAs will happily issue for a public DNS name that resolves to a private a
 - **Its own name is constrained too.** The CA serves at `https://<LAB_CA_HOST>:<LAB_CA_PORT>` (port 9000 unless changed, the same inside and outside the container) with a certificate from its own intermediate, so `LAB_CA_HOST` must be a name under `LAB_CA_DOMAIN` with a DNS record (Cloudflare, DNS-only) pointing at the runner's private address. That record is the one piece of DNS the lab CA needs; inside the container the name maps to loopback so the health check can use it.
 - **Identity is pinned.** `setup.sh` records the CA's host, domain, port and name at init and refuses a later run that asks for different values, instead of advertising a CA that doesn't exist. Rebuilding is explicit: stop the service, move the directories aside, re-run, re-distribute the root.
 
-Not provided yet: EST enrollment for devices (AOS-CX, EdgeConnect). That is the next phase and builds on this CA.
+Not provided yet: EST enrollment for devices (AOS-CX, EdgeConnect). step-ca itself has no EST provisioner in any released version (only draft pull requests), so the next phase is an EST (RFC 7030) gateway next to the CA that authenticates devices with one-time passwords and signs through a step-ca provisioner; AOS-CX and EdgeConnect both speak EST (EdgeConnect through Orchestrator end-entity profiles since 9.4.3). See `docs/ROADMAP.md`.
 
 ### Set it up
 
@@ -493,56 +555,73 @@ An interrupted root generation is safe: the root is built in a staging directory
 
 ### `config/servers.json`
 
+Written in the `version: 2` shape since 1.3 (a pre-1.3 `servers` list is read as one certificate + one Orchestrator target per entry and rewritten on the next save):
+
 ```json
 {
-  "servers": [
+  "version": 2,
+  "certificates": [
     {
       "id": "orch-lab",
       "name": "Lab Orchestrator",
-      "orchestrator_host": "orchestrator.example.com",
       "domain": "orchestrator.example.com",
-      "verify_ssl": false,
-      "ca_bundle": "",
       "acme": { "ca": "letsencrypt_test", "email": "you@example.com", "key_type": "rsa2048" },
-      "dns": { "provider": "cloudflare", "api_token": "" },
-      "ssh": {
-        "user": "admin",
-        "key_path": "/data/ssh/orch_restart",
-        "known_hosts": "/data/ssh/known_hosts",
-        "port": 22,
-        "restart_command": "sudo /bin/systemctl restart --no-block gms.service",
-        "nginx_reload_command": "sudo /bin/systemctl reload nginx"
-      },
-      "api_key_env": "ORCH_API_KEY",
-      "api_key": ""
+      "dns": { "provider": "cloudflare", "api_token": "", "env": {} },
+      "targets": [
+        {
+          "id": "orch-lab",
+          "driver": "orchestrator",
+          "name": "",
+          "settings": {
+            "orchestrator_host": "orchestrator.example.com",
+            "verify_ssl": false, "ca_bundle": "", "ca_bundle_mode": "exclusive",
+            "api_key_env": "ORCH_API_KEY", "api_key": "",
+            "allow_cross_env_rollback": false,
+            "ssh": {
+              "user": "admin",
+              "key_path": "/data/ssh/orch_restart",
+              "known_hosts": "/data/ssh/known_hosts",
+              "port": 22,
+              "restart_command": "sudo /bin/systemctl restart --no-block gms.service",
+              "nginx_reload_command": "sudo /bin/systemctl reload nginx"
+            }
+          }
+        }
+      ]
     }
   ]
 }
 ```
 
+Certificate fields:
+
 | Field               | Meaning                                                                                                   |
 |---------------------|-----------------------------------------------------------------------------------------------------------|
-| `id`                | Unique slug (letters, numbers, `-`, `_`). Permanent, can't be renamed.                                    |
+| `id`                | Unique slug (letters, numbers, `-`, `_`). Permanent, can't be renamed. The first target uses the same id. |
 | `name`              | Display name shown in the dashboard.                                                                      |
-| `orchestrator_host` | Hostname used for the API, SSH, and the served‑certificate check. Use the FQDN on the certificate when `verify_ssl` is on. |
-| `domain`            | Hostname the certificate is issued for (defaults to the host).                                            |
-| `verify_ssl`        | Verify the Orchestrator's own TLS cert on API calls. Leave `false` only while the appliance still serves its factory self‑signed certificate; enable once production is live. |
-| `ca_bundle`         | Optional PEM bundle (path inside the container) used for API verification when the appliance chains to a private CA. If the file disappears, verified deploys fail rather than fall back. |
-| `ca_bundle_mode`    | `exclusive` (default): the bundle is the only trusted CA. `additive`: bundle + system roots + lab CA root, for private-CA appliances that also migrate across public or lab CAs. |
+| `domain`            | Hostname the certificate is issued for (defaults to the first target's host).                            |
 | `acme.ca`           | `letsencrypt` (production), `letsencrypt_test` (staging), or `lab` (the [bundled lab CA](#bundled-lab-ca)). A full ACME directory URL is also accepted. |
 | `acme.email`        | Account email for Let's Encrypt (required).                                                               |
-| `acme.key_type`     | `rsa2048`, `rsa3072`, or `rsa4096`. Orchestrator serves a single RSA cert.                                |
-| `dns.provider`      | Only `cloudflare` is wired up today.                                                                      |
+| `acme.key_type`     | `rsa2048`, `rsa3072`, `rsa4096`, `ec256`, `ec384`. Orchestrator has been validated with RSA only; ClearPass HTTPS(ECC) needs `ec256`/`ec384`. |
+| `dns.provider`      | A [Lego DNS provider code](https://go-acme.github.io/lego/dns/). `cloudflare` uses `dns.api_token`; any other provider takes its variables from `dns.env`. |
 | `dns.api_token`     | Inline Cloudflare token. Blank → fall back to `CF_DNS_API_TOKEN`.                                         |
-| `ssh.user`          | Orchestrator account used for activation (required).                                                      |
-| `ssh.key_path`      | Private key path inside the container (required; validated on save and before activation).                |
-| `ssh.known_hosts`   | Pinned host keys (default `/data/ssh/known_hosts`); must contain an entry for the host (and port).         |
-| `ssh.port`          | SSH port (default 22).                                                                                    |
-| `ssh.restart_command`, `ssh.nginx_reload_command` | Commands run to activate. Their `sudo` authorization is what **Test SSH** probes. |
-| `api_key_env`       | Name of the env var holding the Orchestrator API key when `api_key` is blank.                             |
-| `api_key`           | Inline Orchestrator API key. Blank → fall back to the env var above.                                      |
+| `dns.env`           | Provider variables passed to Lego's environment (`{"AWS_ACCESS_KEY_ID": "…"}`); stored like other inline secrets, never echoed. |
 
-> Secrets (`dns.api_token`, `api_key`) are optional. Set them in the web UI or here; either way the file is written `chmod 600`. **`config/servers.json` is gitignored** and must never be committed.
+DNS providers other than Cloudflare take their variables from `dns.env` (the form's *Provider variables* box; one `KEY=value` per line). The names are Lego's, documented per provider at <https://go-acme.github.io/lego/dns/>; the four most common:
+
+| Provider | `dns.provider` | Required variables | Useful tuning |
+|---|---|---|---|
+| Cloudflare | `cloudflare` | `CF_DNS_API_TOKEN` (the token field, or `.env`) | `CLOUDFLARE_PROPAGATION_TIMEOUT`, `CLOUDFLARE_TTL` |
+| Amazon Route 53 | `route53` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (plus `AWS_REGION`; `AWS_HOSTED_ZONE_ID` to skip zone lookup) | `AWS_PROPAGATION_TIMEOUT`, `AWS_TTL`, `AWS_ASSUME_ROLE_ARN` |
+| Azure DNS | `azuredns` | `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_RESOURCE_GROUP` | `AZURE_ZONE_NAME`, `AZURE_ENVIRONMENT`, `AZURE_PROPAGATION_TIMEOUT` |
+| Infoblox | `infoblox` | `INFOBLOX_HOST`, `INFOBLOX_USERNAME`, `INFOBLOX_PASSWORD` | `INFOBLOX_DNS_VIEW`, `INFOBLOX_WAPI_VERSION`, `INFOBLOX_SSL_VERIFY`, `INFOBLOX_CA_CERTIFICATE` |
+| RFC 2136 dynamic update | `dnsupdate` (`rfc2136` is an alias) | `DNSUPDATE_NAMESERVER`, `DNSUPDATE_TSIG_KEY`, `DNSUPDATE_TSIG_SECRET`, `DNSUPDATE_TSIG_ALGORITHM` | `DNSUPDATE_TTL`, `DNSUPDATE_PROPAGATION_TIMEOUT` |
+
+Lego's `VAR_FILE=/path` convention works for any of them (the plain variable wins when both are set). Lego's `exec` provider runs an arbitrary program, so this tool passes Lego an allow-listed environment (never the container's own API keys); `manual` cannot run unattended. Issuance always uses a fixed `--dns.propagation.wait` (`DNS_PROPAGATION_WAIT`, default `60s`), so the provider's own `*_PROPAGATION_TIMEOUT` is not consulted; raise the wait for slow zones (Route 53 and Azure often need more than 60 s).
+
+Target fields: `id` (global slug), `driver` (`orchestrator`, `ssh`, `clearpass`, `edgeconnect`), `name`, and `settings` as the driver's form shows them (the **System** page lists the drivers; the form shows each field's meaning and, for anything configured on the host, the command that sets it up). Orchestrator settings are the ones above: `orchestrator_host`, `verify_ssl`, `ca_bundle`, `ca_bundle_mode` (`exclusive` / `additive`), `api_key_env`, `api_key`, `allow_cross_env_rollback`, and the `ssh` block (`user`, `key_path`, `known_hosts`, `port`, `restart_command`, `nginx_reload_command`, all validated on save and before every activation).
+
+> Secrets (`dns.api_token`, `dns.env`, `api_key`, `client_secret`) are optional. Set them in the web UI or here; either way the file is written `chmod 600`. **`config/servers.json` is gitignored** and must never be committed.
 
 ### Environment (`.env` and Compose)
 
@@ -555,7 +634,11 @@ An interrupted root generation is safe: the root is built in a staging directory
 | `CF_DNS_API_TOKEN`           | Cloudflare token fallback (used when a server has no inline token).                         |
 | `ORCH_API_KEY`               | Orchestrator API key fallback.                                                              |
 | `NOTIFY_WEBHOOK_URL`, `NOTIFY_ON` | Optional Slack‑compatible webhook for alerts; `failed` (default) or `all`.             |
-| `RENEW_WINDOW_DAYS`          | Days‑before‑expiry to renew on the scheduled path (default 30).                             |
+| `RENEW_WINDOW_DAYS`          | Absolute days‑before‑expiry window for scheduled renewals. Unset (default): renew when a third of the certificate's lifetime remains. |
+| `OACM_UID`, `OACM_GID`       | uid/gid the cert manager container runs as (image default 10001). `setup.sh` writes your own ids so `config/` and `data/` need no chown. |
+| `CPPM_CLIENT_SECRET`         | ClearPass API client secret fallback for ClearPass targets (the env var name is configurable per target). |
+| `ACTIVATE_POLL_TIMEOUT`, `ROLLBACK_POLL_TIMEOUT` | Seconds a driver waits for the served certificate after activation / rollback (default 300 / 120). |
+| `LOGIN_MAX_FAILURES`, `LOGIN_LOCKOUT_SECONDS` | Sign-in lockout threshold and duration (default 5 / 900).                                  |
 | `DEPLOY_VALIDATION_ATTEMPTS` | Attempts for the validation call on transient failures (default 3).                         |
 | `DEPLOY_RETRY_BACKOFF`       | Base backoff in seconds between validation attempts, doubled each time (default 5).         |
 | `DEPLOY_HTTP_TIMEOUT`        | Per‑request timeout for the Orchestrator API (default 30).                                  |
@@ -571,8 +654,10 @@ An interrupted root generation is safe: the root is built in a staging directory
       CONFIG_DIR: /config
       SERVERS_FILE: /config/servers.json
       DATA_DIR: /data
+    user: "${OACM_UID:-10001}:${OACM_GID:-10001}"   # unprivileged; setup.sh writes your ids to .env
     ports:
       - "127.0.0.1:8090:8080"   # localhost only; reach via SSH tunnel
+      # - "8765:8765"           # only for ClearPass targets: the PKCS#12 callback the nodes fetch from
     volumes:
       - ./config:/config        # writable directory mount — servers.json, history.json, admin.json, session.secret
       - ./data/certs:/data/certs
@@ -586,13 +671,13 @@ An interrupted root generation is safe: the root is built in a staging directory
 
 Reached at `http://localhost:8090` over the SSH tunnel. Dark theme by default, light theme via the toggle in the top bar (remembered per browser). No build step, no external assets: the pages work with no internet access from the browser.
 
-- **Fleet** (`/`) — the overview. Five tiles (servers, healthy, need attention, expiring ≤ 30 days, soonest expiry), the preflight findings, and one row per server sorted worst-first by a **health** roll-up (`attention` / `warning` / `healthy` / `unverified` / `working`, always shown as glyph + label with the top reason). Each row shows the configured CA, the **Issued** and **Served** certificate serials with staging/production badges, the **Activation** state, the last run and its kind, and the **Force renew** / **Force deploy** actions. Recent activity and the active configuration path sit below.
-- **Server** (`/server/<id>`) — everything about one Orchestrator: Issued / Served / Activation cards (with the issued certificate's remaining lifetime), the last run as a three-step pipeline (issue → deploy → restart) with elapsed time per step and a **Diagnostics** disclosure on the failed step (phase, HTTP status, attempt, elapsed, redacted response, next action), the SSH activation settings with their validation state, API TLS / secrets / CA summary, and the per-server history. Actions: Force renew (asks for confirmation because it spends an issuance), Force deploy, **Test SSH**, Edit.
+- **Fleet** (`/`) — the overview. Five tiles (targets, healthy, need attention, in the renewal window, soonest expiry), the preflight findings, and one row per **target** sorted worst-first by a **health** roll-up (`attention` / `warning` / `healthy` / `unverified` / `working`, always shown as glyph + label with the top reason). Each row shows the driver, the configured CA, the **Issued** and **Served** certificate serials with staging/production/lab badges, the **Activation** state, the last run with its kind and who started it, and the **Force renew** / **Force deploy** actions. A cron run shows as *working* with the lock holder. Recent activity and the active configuration path sit below.
+- **Target** (`/server/<id>`) — everything about one target: Issued / Served / Activation / **Rollback target** cards (with the issued certificate's lifetime meter and the snapshot's environment and policy), the last run as a pipeline (issue → deploy → restart or activate) with elapsed time per step, the target each step ran on, and a **Diagnostics** disclosure on the failed step, the driver's activation settings with their validation state and warnings, API TLS / secrets / CA summary, and the certificate's history. Actions: Force renew (asks for confirmation because it spends an issuance; deploys to every target of the certificate), Force deploy (this target only), the driver's probe (**Test SSH** / **Test API**), Edit.
 - **Live refresh** — the Fleet and Server pages re-fetch a server-rendered fragment every 8 s while a run is in progress and every 45 s otherwise (paused in background tabs), so a Force renew's outcome appears without reloading. The top-bar stamp shows the last refresh.
-- **Settings** (`/settings`) — list, add, edit, delete servers; Test SSH per server. The edit form validates the SSH block on save (empty user/key path, missing/unreadable/unparseable/passphrase-protected key, missing `known_hosts` entry) and never echoes stored secrets. The CA bundle mode (exclusive / additive) and the lab CA's availability are shown inline.
+- **Settings** (`/settings`) — certificates with their targets; add a server (certificate + first target), add a target to an existing certificate, edit, delete, probe. The form is built from the driver's schema: pick the driver, fill its section. Everything is validated on save (the SSH block as before, driver-specific rules such as absolute remote paths or slot/key-type consistency) and stored secrets are never echoed. The CA bundle mode (exclusive / additive) and the lab CA's availability are shown inline.
 - **System** (`/system`) — the deployment as the container sees it, read-only: version, the full preflight report, every documented environment variable with its state (secrets as set / unset, never the value), the scheduler with its next run, the SSH key and pinned host keys per server, and the lab CA (identity, URLs, root fingerprint, live health probe, **Download root**). Everything that is configured on the Docker host rather than in the UI carries an **ⓘ** indicator naming the exact `setup.sh` flag, `.env` key or command, and a table at the bottom lists all host-side operations. Host-level readiness (Docker, Compose, `.env` drift, ownership) is `./upgrade-check.sh` on the host, because the container cannot see the host.
 - **CLI-dependency indicators** — the same **ⓘ** appears in the server form and on the server page next to every field whose value depends on host configuration: key path, known hosts, sudoers-bound commands, CA bundle location, environment-variable fallbacks for secrets, the lab CA option. Hover or focus shows what it depends on and the command that sets it up.
-- **Setup / Login** — first-run admin creation, then a login gate on everything else.
+- **Setup / Login** — first-run admin creation, then a login gate on everything else. Every form carries a CSRF token tied to a `csrf` cookie (a POST without it is a 403); five failed sign-ins per user and address lock the account for 15 minutes (logged); the session cookie is `SameSite=Strict`.
 - JSON: `/api/servers`, `/api/server/<id>`, `/api/history`, `/api/status` (the System snapshot; `?probe=1` adds the lab CA health probe), `/ca/root.pem` and `/ca/intermediate.pem` (behind the login); `/healthz` is open.
 
 Configuration is read on every request, so UI changes take effect on the next run with no restart.
@@ -606,13 +691,15 @@ All commands run inside the container: `docker compose exec -T orchestrator-acme
 | Command | Purpose |
 |---|---|
 | `list` | Configured servers, their CA and last outcome, plus the active configuration path. |
-| `check [--json] [--lenient]` | Preflight: configuration path and persistence, legacy‑file detection, per‑server SSH validation, credential presence. Exit 1 on fatal findings. |
-| `ssh-test <id>` | Connect with the pinned host key and probe `sudo -n -l` for both activation commands. Restarts nothing. |
+| `check [--json] [--lenient]` | Preflight: configuration path and persistence, permissions of the service user, legacy‑file detection, per‑target driver preflight, credential presence. Exit 1 on fatal findings. |
+| `probe <target-id>` (alias `ssh-test`) | The driver's live, non-disruptive check: SSH auth + `sudo -n -l` for Orchestrator/SSH targets, OAuth2 + node list + slots for ClearPass, version/appliance/reported certificate for EdgeConnect. Restarts nothing. |
 | `ca-info` | Bundled lab CA endpoints, root fingerprint and issuer names (the System page shows the same, plus a live health probe). |
 | `issue <id>` / `deploy <id>` / `restart <id>` | Run a single stage. |
-| `renew <id> [--force]` | Full pipeline for one server (contacts the CA). |
-| `redeploy <id>` | Deploy → activate from the certificate already on disk (no CA contact). |
-| `renew-all [--force]` | What the scheduler runs. |
+| `renew <id> [--force] [--source cli\|cron\|web] [--actor NAME]` | Full pipeline for one certificate, every target (contacts the CA). Exit 3 when another run holds the certificate's lock. |
+| `redeploy <id>` | Deploy → activate from the certificate already on disk, every target (no CA contact). |
+| `renew-all [--force] [--source cron]` | What the scheduler runs (`--source cron` records the pass for `/healthz`). Locked certificates are skipped and reported. |
+| `backup <file> [--include-root] [--encrypt]` | Archive config, certificates, SSH material and the visible lab CA state (logs excluded). `--encrypt` uses `BACKUP_PASSPHRASE` (AES-256-GCM). |
+| `restore <file> [--force] [--passphrase-env VAR]` | Restore an archive; refuses to overwrite a newer `servers.json` without `--force`; runs preflight afterwards. |
 
 ---
 
@@ -637,19 +724,43 @@ Use the dashboard buttons or the CLI. **Force deploy** / `redeploy` is the right
 
 Once the dashboard shows **Activation: live** with a production certificate, edit the server, make sure `orchestrator_host` is a name on that certificate, tick **Verify the Orchestrator's TLS cert**, save, and press **Force deploy** to confirm the API still answers. For a private CA, set the **CA bundle** path (mount it under `./data/ssh` or another mounted directory). SSH host‑key verification is independent of this setting and is always strict.
 
+### Back up and restore
+
+```bash
+./setup.sh --backup ../oacm-$(date +%Y%m%d).tgz            # host side: .env, config/, data/ minus logs (and minus the offline root)
+./setup.sh --restore ../oacm-20261022.tgz                   # on a new host, before setup.sh --host … and compose up
+docker compose exec -T orchestrator-acme-cert-manager python -m app.cli backup /config/backup.tgz   # from inside the container
+```
+
+The host-side archive sees everything including the lab CA online state; the in-container one covers what the container can see (config, certificates, SSH material). Both preserve permissions; the offline root (`data/pki-root`) is included only with `--include-root`. Acceptance: backup on host A, restore on host B, `check` passes and **Force deploy** works without re-issuing.
+
 ### Reset the admin account
 
 ```bash
 rm config/admin.json
 ```
 
-### Rebuild the image (state preserved)
+### Update the image (state preserved)
 
 ```bash
-docker compose up -d --build
+git pull                        # brings the new pinned tag in docker-compose.yml
+docker compose pull && docker compose up -d
+# or, to build from this checkout instead of pulling: docker compose up -d --build
 ```
 
 Certificates, history, and config live in the mounted volumes. A volume, `.env` or Compose change requires `docker compose down && docker compose up -d`.
+
+### Releases and the published image
+
+A release is a git tag `vX.Y.Z` on `main`. The `release` workflow refuses the tag unless `__version__` in `app/__init__.py`, the image tag in `docker-compose.yml` and the dated `CHANGELOG.md` heading all agree (`python3 scripts/check-version.py --tag vX.Y.Z` runs the same check locally), then runs the full CI, builds `linux/amd64` and `linux/arm64`, pushes `ghcr.io/robertsonc/orchestrator-acme-cert-manager:X.Y.Z` and `:X.Y`, attaches a BuildKit SBOM and provenance to the image index, signs a build-provenance attestation and creates the GitHub Release from the CHANGELOG section. There is no `:latest` tag by design: an upgrade is a reviewed change to the pinned tag.
+
+Verify an image before you run it (needs the `gh` CLI):
+
+```bash
+gh attestation verify oci://ghcr.io/robertsonc/orchestrator-acme-cert-manager:1.3.0 -R robertsonc/orchestrator-acme-cert-manager
+```
+
+Cutting a release: bump `__version__`, the compose tag and the CHANGELOG heading in one commit on `main`, then `git tag -a v1.3.0 -m 'v1.3.0' && git push origin v1.3.0`.
 
 ---
 
@@ -713,6 +824,8 @@ The cert manager cannot find the lab root. `./data/pki/certs` must be mounted at
 
 Read the `[FATAL]` lines:
 
+- `perm-config-dir` — the container runs unprivileged (uid shown in the message) and cannot write `/config`. Either set `OACM_UID`/`OACM_GID` in `.env` to the owner of `config/` and `data/` (`./setup.sh` writes your own ids) or `chown` those directories to the uid named in the message, then `docker compose down && docker compose up -d`.
+
 - `config-not-mounted` — `SERVERS_FILE` points somewhere that is not a bind mount or volume. Use the shipped `docker-compose.yml` (mounts `./config:/config`) and do not override `SERVERS_FILE` in `.env` with another path.
 - `legacy-config-only` — a server list exists at `/data/servers.json` but not at `/config/servers.json`. Follow [Migrating from `/data/servers.json`](#migrating-from-dataserversjson).
 
@@ -750,6 +863,34 @@ Unchanged from earlier releases: Lego writes some errors to stdout (captured); `
 
 Expected — the API is behind auth. Use `/healthz`, or log in first with a cookie jar.
 
+### A POST returns 403 "Request rejected" / "form token is missing or stale"
+
+Every state-changing request needs the CSRF token the page carries (tied to the `csrf` cookie). Reload the page and retry; a script should use the CLI inside the container instead.
+
+### Sign-in says "Too many failed sign-in attempts"
+
+Five failures for that username from that address lock sign-in for 15 minutes (`LOGIN_MAX_FAILURES`, `LOGIN_LOCKOUT_SECONDS`). Each attempt is logged with the address. A container restart clears the counters.
+
+### `/healthz` returns 503 `scheduler-stale`; `docker compose ps` shows unhealthy
+
+No scheduled pass finished within twice the cron interval (24 h with the shipped crontab). Check `docker compose logs` for supercronic and `tail data/logs/renew.log`; the System page shows the last pass and any certificate that was skipped because it was locked. The entrypoint also exits when supercronic or the web UI dies, so a restart loop points at a crashing process.
+
+### Run refused: "a renew is already running (pid …, since …, started by …)"
+
+The certificate is locked by another run (a cron pass, or a Force renew from the UI). Wait for it; the lock is released with the process, so a crashed run never leaves a stale lock. If a lock file under `config/locks/` is held by a pid that no longer exists, something else holds the same file: `docker compose restart` clears it.
+
+### `refusing to roll back across CA environments`
+
+A production activation failed and the only snapshot is a staging or lab certificate. The appliance keeps what it serves. Fix the cause (the message above it says which step failed) and press **Force deploy**, or allow cross-environment rollback on the target if a staging certificate is acceptable meanwhile.
+
+### ClearPass: `HTTP 422 … Could not fetch certificate. URL not trusted or Cert File is empty`
+
+ClearPass could not download the PKCS#12 from the callback URL. Check that `callback_host` is an address the nodes can reach, the callback port is published on the cert manager service and open on the host firewall, and look at the step diagnostics: `fetches` counts the downloads that happened and `callback_rejected` lists addresses that connected but are not known cluster nodes (a NAT or a node address missing from `GET /api/cluster/server`). An `https://` callback additionally needs the listener's CA in the ClearPass trust list with usage *Others*.
+
+### The System page says `config-v1`
+
+`config/servers.json` is still in the pre-1.3 shape. It is read correctly; it is rewritten in the `certificates` shape the next time anything is saved. Nothing to do.
+
 ---
 
 ## Security Considerations
@@ -760,9 +901,11 @@ Expected — the API is behind auth. Use `/healthz`, or log in first with a cook
 - **Scoped `sudo`**: the `sudoers` rule grants exactly two commands. `Test SSH` and `ssh-test` only ever run `sudo -n -l`, which checks authorization and runs nothing.
 - **API TLS verification**: `verify_ssl` is off by default because the appliance serves a self‑signed certificate until the first deployment succeeds. The dashboard and the logs say so on every run; enable it once production is live.
 - **Diagnostics redaction**: response excerpts stored in history have PEM blocks, data URIs, long base64 runs and credential‑looking JSON fields removed. API keys are sent only in request headers and are never logged.
-- **Network exposure**: The UI binds to `127.0.0.1` and is intended to be reached over an SSH tunnel. Do not publish port 8090.
+- **Network exposure**: The UI binds to `127.0.0.1` and is intended to be reached over an SSH tunnel. Do not publish port 8090. The ClearPass callback port, when published, serves one random path for the duration of a run to the cluster's addresses only; the PKCS#12 is protected by a per-run passphrase sent over the authenticated API call, not over the callback. Prefer a firewall rule limiting the port to the ClearPass nodes.
+- **Unprivileged container**: the image runs as `OACM_UID:OACM_GID` (default 10001); `setup.sh` sets your own ids so no `chown` of the bind mounts is needed. Preflight refuses to start when the service user cannot write `/config`.
+- **Forms**: every non-GET route checks a CSRF token tied to the `csrf` cookie; the session cookie is `SameSite=Strict` and `HttpOnly`; sign-in is throttled per user and address.
 - **Least privilege**: Scope the Cloudflare token to *Edit zone DNS* on the single zone. Use an Orchestrator API key with the minimum role that can install a certificate.
-- **Private key handling**: Certificate keys are generated on the automation host and pushed to the appliance. For stricter environments, prefer on‑appliance key generation and per‑renewal key rotation.
+- **Private key handling**: Certificate keys are generated on the automation host and pushed to the target. For stricter environments, prefer on‑target key generation (EST, the next phase) and per‑renewal key rotation. Backups made with `backup` contain private keys and the SSH key: encrypt them (`--encrypt`) and keep them off the host.
 
 ---
 
@@ -776,6 +919,8 @@ The deploy stage uses the Orchestrator `httpsCertificate` REST API, authenticati
 | `POST …/gms/rest/gms/httpsCertificate`            | Install the validated certificate.                         | Never    |
 
 The payload is a JSON object carrying the leaf certificate, private key, and intermediate chain as base64 `data:` URIs (`certificateData`, `keyData`, `intermediateCertFileContent`). Activation is **not** an API call, it's an SSH service restart plus `nginx` reload, followed by a served‑certificate check on `:443`.
+
+Other drivers: ClearPass uses `POST /api/oauth` (client credentials), `GET /api/cluster/server`, `GET`/`PUT /api/server-cert/name/{server_uuid}/{service_name}` ([developer.arubanetworks.com/cppm](https://developer.arubanetworks.com/cppm/reference/servercertnamebyserver_uuidbyservice_nameput)); EdgeConnect-via-Orchestrator uses `GET /gms/rest/gms/versions`, `GET /gms/rest/appliance?nePk=`, `GET /gms/rest/reachability/appliance?nePk=`, `GET /gms/rest/httpsCertificate?nePk=` and, when the experimental write path is on, `POST /gms/rest/appliance/rest?nePk=&url=httpsCertificate/validation|config` and `…url=cnprocess/restart/<name>` (HPE Postman collections 9.3–9.6).
 
 ---
 
@@ -792,7 +937,7 @@ shellcheck -S warning setup.sh upgrade-check.sh
 
 The lab CA tests run `pki/lab-ca-init.sh` against a real `step` binary when one is on `PATH` (download the pinned release from the smallstep/cli GitHub releases; CI installs it and fails if the tests would skip). CI also runs a Docker smoke job that initialises the CA in the pinned image on a non-default port, starts the `lab-ca` service, waits for a healthy container and queries the ACME directory, root and CRL by the CA's constrained name.
 
-The test suite covers configuration path resolution and legacy detection, every SSH misconfiguration class (empty/missing/unreadable/invalid/passphrase‑protected key, missing `known_hosts` entry, port syntax), the sudo probe, deployment retry/no‑retry behaviour for 502/503/504, 400, transport errors and install, the "Force deploy never contacts the CA" guarantee, lifecycle state derivation, and the web UI's save‑time validation.
+The test suite covers configuration path resolution, v1→v2 migration and legacy detection, every SSH misconfiguration class (empty/missing/unreadable/invalid/passphrase‑protected key, missing `known_hosts` entry, port syntax), the sudo probe, deployment retry/no‑retry behaviour for 502/503/504, 400, TLS and transport errors and install, the "Force deploy never contacts the CA" guarantee, the per-certificate lock (in-process and across processes), the lifetime-fraction renewal window at 90/45/6 days, the rollback environment guard on both the Orchestrator path and the generic driver path, multi-target runs with a fake driver, the SSH driver's SFTP upload, the ClearPass driver against a fake cluster that really fetches the PKCS#12 from the callback listener (including rollback of already-updated nodes and the client allow-list), the EdgeConnect driver's read-only and experimental paths, backup/restore round-trips with encryption, CSRF, login throttling, `/healthz` staleness, lifecycle state derivation, and the web UI's save‑time validation.
 
 ---
 

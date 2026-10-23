@@ -90,6 +90,30 @@ def test_rerun_with_different_identity_is_refused(tmp_path):
     assert port.returncode != 0 and "--ca-port" in port.stdout + port.stderr
 
 
+def test_partial_offline_root_is_refused_but_a_moved_root_is_a_noop(tmp_path):
+    """Re-run with a partial data/pki-root next to the initialised CA: setup.sh fails with the init
+    script's instructions and leaves the CA alone; the root moved off the host entirely (the documented
+    steady state; setup.sh recreates the empty directory) is still the usual no-op."""
+    first = _setup(tmp_path, "--lab-domain", "lab.example.net", "--ca-port", "9443")
+    assert first.returncode == 0, first.stdout + first.stderr
+    repo = tmp_path / "repo"
+    offline = repo / "data" / "pki-root"
+    (offline / "root_ca_key").unlink()
+    bad = _setup(tmp_path)
+    out = bad.stdout + bad.stderr
+    assert bad.returncode != 0 and "lab CA initialisation failed" in out, out
+    assert "missing or empty: root_ca_key" in out and "Restore the missing file" in out and "must be rebuilt" in out
+    assert "nothing to do" not in out
+    assert (repo / "data" / "pki" / "config" / "lab-ca.meta").is_file()
+    assert (offline / "root_ca.crt").is_file() and not (offline / "root_ca_key").exists()
+    assert _env(tmp_path)["LAB_CA_PORT"] == "9443" and _env(tmp_path)["COMPOSE_PROFILES"] == "lab-ca"
+    (offline / "root_ca.crt").unlink()
+    (offline / "root_password").unlink()
+    ok = _setup(tmp_path)
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    assert "nothing to do" in ok.stdout and _env(tmp_path)["LAB_CA_PORT"] == "9443"
+
+
 def test_rotate_root_keeps_identity_and_retires_old_root(tmp_path):
     first = _setup(tmp_path, "--lab-domain", "lab.example.net", "--ca-port", "9443")
     assert first.returncode == 0, first.stdout + first.stderr

@@ -105,16 +105,47 @@ def test_interrupted_offline_root_generation_after_create_is_recoverable(tmp_pat
 
 
 def test_incomplete_offline_root_with_existing_ca_fails_with_instructions(tmp_path):
+    """A partial offline root next to an initialised CA is refused, naming the gap and the way out.
+
+    An empty offline directory is the documented steady state (the root was moved off the host)
+    and stays a no-op; only a partial set (one or two files, or an empty one) fails closed.
+    """
     assert _run(tmp_path).returncode == 0
-    (tmp_path / "offline" / "root_password").unlink()
-    # re-run with the CA present: identity check passes (no init needed) -> noop
-    assert _run(tmp_path).returncode == 0
-    # a rebuild of the online half with a broken offline root must fail closed, not regenerate
-    import shutil as _sh
-    _sh.rmtree(tmp_path / "online")
+    online, offline = tmp_path / "online", tmp_path / "offline"
+    password, old_root = (offline / "root_password").read_bytes(), (offline / "root_ca.crt").read_bytes()
+    (offline / "root_password").unlink()
     r = _run(tmp_path)
-    assert r.returncode == 0  # no ca.json online -> incomplete material is discarded and a new root is generated
-    assert (tmp_path / "offline" / "root_password").is_file()
+    assert r.returncode == 6, r.stderr + r.stdout
+    assert "nothing to do" not in r.stdout
+    assert "2 of 3" in r.stderr and "missing or empty: root_password" in r.stderr
+    for step in ("Restore the missing file", "move the remaining file(s) off", "must be rebuilt"):
+        assert step in r.stderr, step                       # the recovery steps, not only the diagnosis
+    # nothing on either side was touched
+    assert (online / "config" / "lab-ca.meta").is_file() and not (online / "config" / ".init-in-progress").exists()
+    assert (offline / "root_ca_key").is_file() and (offline / "root_ca.crt").read_bytes() == old_root
+    assert not (offline / "root_password").exists() and not (offline / ".staging").exists()
+    # an empty file counts as missing
+    (offline / "root_password").write_bytes(b"")
+    assert _run(tmp_path).returncode == 6
+    # restoring the file makes the re-run the usual no-op again
+    (offline / "root_password").write_bytes(password)
+    ok = _run(tmp_path)
+    assert ok.returncode == 0 and "nothing to do" in ok.stdout, ok.stderr + ok.stdout
+    # the whole root moved off the host is the documented steady state, not an error
+    moved = tmp_path / "usb"
+    moved.mkdir()
+    for f in ("root_ca.crt", "root_ca_key", "root_password"):
+        (offline / f).rename(moved / f)
+    ok = _run(tmp_path)
+    assert ok.returncode == 0 and "nothing to do" in ok.stdout, ok.stderr + ok.stdout
+    # with NO CA online a partial set is abandoned material: discarded, and a new root is generated
+    for f in ("root_ca.crt", "root_ca_key"):
+        (moved / f).rename(offline / f)
+    shutil.rmtree(online)
+    r = _run(tmp_path)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "discarding it and generating a new root" in r.stdout
+    assert (offline / "root_password").is_file() and (offline / "root_ca.crt").read_bytes() != old_root
 
 
 def test_acme_leaf_template_is_server_auth_only(tmp_path):

@@ -5,10 +5,9 @@ import datetime as dt
 
 from app import config, store, sysinfo
 from app.models import RenewalRecord
-from app.webui import server as web
 from tests.conftest import make_server
 from tests.test_config_persistence import _lab_pki
-from tests.test_webui import _client
+from tests.test_webui import _client, _post
 
 
 def test_system_page_renders_and_marks_host_configuration(layout, server, monkeypatch):
@@ -34,7 +33,7 @@ def test_secrets_are_reported_as_present_but_never_echoed(layout, monkeypatch):
     env = {e["name"]: e for e in j["environment"]}
     assert env["CF_DNS_API_TOKEN"]["state"] == "set" and env["CF_DNS_API_TOKEN"]["value"] == ""
     assert env["ORCH_API_KEY"]["state"] == "set"
-    assert env["RENEW_WINDOW_DAYS"]["state"] == "default" and env["RENEW_WINDOW_DAYS"]["value"] == "30"
+    assert env["RENEW_WINDOW_DAYS"]["state"] == "default" and env["RENEW_WINDOW_DAYS"]["value"] == "1/3 of lifetime"
     for key in ("version", "scheduler", "ssh", "lab_ca", "host_operations", "findings", "paths"):
         assert key in j
     assert all(e["via"] for e in j["environment"])     # every variable says where it is set
@@ -89,7 +88,7 @@ def test_form_shows_lab_ca_state_and_persists_bundle_mode(layout, rsa_key, known
     assert "not initialised on this host" in html
     assert 'name="ca_bundle_mode"' in html
     assert "./setup.sh --with-ca" in html               # the CA field points at the host step
-    r = c.post("/settings/save", data={
+    r = _post(c, "/settings/save", {
         "id": "m1", "orchestrator_host": "orch.example.test", "acme_email": "a@b.c",
         "acme_ca": "letsencrypt_test", "key_type": "rsa2048", "ssh_user": "admin",
         "ssh_key_path": str(rsa_key[0]), "ssh_known_hosts": str(known_hosts), "ssh_port": "22",
